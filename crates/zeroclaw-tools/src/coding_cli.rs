@@ -6,6 +6,40 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 
+/// Environment variables coding CLI subprocesses may inherit after the
+/// executor clears the ambient environment.
+///
+/// Keep these lists shared so every adapter reconstructs the same base
+/// environment without propagating variables that are irrelevant to the host
+/// platform.
+#[cfg(not(target_os = "windows"))]
+const SAFE_ENV_VARS: &[&str] = &[
+    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+];
+
+/// Windows process-startup variables plus the profile locations where coding
+/// CLIs discover authentication and user configuration.
+#[cfg(target_os = "windows")]
+const SAFE_ENV_VARS: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+    "TERM",
+    "LANG",
+    "USERNAME",
+];
+
 #[derive(Debug, Clone)]
 pub struct CodingCliCommand {
     pub program: OsString,
@@ -172,6 +206,12 @@ pub fn add_safe_env(command: &mut CodingCliCommand, safe_vars: &[&str], passthro
     }
 }
 
+/// Add the canonical base environment plus operator-configured passthrough
+/// variables to a coding CLI command.
+pub(crate) fn add_coding_cli_env(command: &mut CodingCliCommand, passthrough: &[String]) {
+    add_safe_env(command, SAFE_ENV_VARS, passthrough);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +292,46 @@ mod tests {
         assert_eq!(
             command.runtime_env_keys,
             vec![OsString::from("OPENAI_API_KEY")]
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn safe_env_vars_match_the_unix_allowlist() {
+        assert_eq!(
+            SAFE_ENV_VARS,
+            &[
+                "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+            ],
+            "coding CLI subprocess inheritance must remain an explicit security allowlist"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn safe_env_vars_match_the_windows_allowlist() {
+        assert_eq!(
+            SAFE_ENV_VARS,
+            &[
+                "PATH",
+                "PATHEXT",
+                "HOME",
+                "USERPROFILE",
+                "HOMEDRIVE",
+                "HOMEPATH",
+                "APPDATA",
+                "LOCALAPPDATA",
+                "SYSTEMROOT",
+                "SYSTEMDRIVE",
+                "WINDIR",
+                "COMSPEC",
+                "TEMP",
+                "TMP",
+                "TERM",
+                "LANG",
+                "USERNAME",
+            ],
+            "coding CLI subprocess inheritance must remain an explicit security allowlist"
         );
     }
 }
