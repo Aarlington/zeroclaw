@@ -487,19 +487,16 @@ impl Chat {
         // the daemon-retained session, its persisted history, and its cwd.
         let resume = self.resume_session_id.take();
         // A resume must not re-point the session at the TUI's launch directory:
-        // pass no cwd so the daemon keeps the retained session's own cwd. Only
-        // a fresh session derives a cwd from the transport / caller.
+        // pass no cwd so the daemon keeps the retained session's own cwd.
+        //
+        // A fresh session also passes no cwd unless the user explicitly picked
+        // one (the remote ACP CWD picker). That lets the daemon resolve the
+        // selected agent's configured workspace instead of forcing the TUI's
+        // launch directory — for Local and WSS alike. An explicit
+        // caller-supplied cwd still wins over that default.
         let cwd_str: Option<String> = if resume.is_some() {
             None
-        } else if self.rpc.transport() == crate::client::Transport::Local {
-            // Over Unix socket, pass local CWD so the agent works in the
-            // directory the TUI was launched from.
-            std::env::current_dir()
-                .ok()
-                .and_then(|p| p.to_str().map(str::to_string))
         } else {
-            // Over WSS the server uses the agent's workspace dir unless the
-            // user supplies one.
             cwd_override
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string)
@@ -603,16 +600,14 @@ impl Chat {
             });
         }
 
-        let local_cwd = if rpc.transport() == crate::client::Transport::Local {
-            std::env::current_dir().ok()
-        } else {
-            None
-        };
-        let cwd_str = local_cwd.as_deref().and_then(|p| p.to_str());
+        // A restart mints a fresh session: pass no cwd so the daemon resolves
+        // the selected agent's configured workspace rather than the TUI's
+        // launch directory. The remote ACP path above re-prompts via the CWD
+        // picker, so only that explicit choice overrides the agent workspace.
         let new_session = if pane_kind == PaneKind::Acp {
-            rpc.session_new_acp(&alias, cwd_str, None).await
+            rpc.session_new_acp(&alias, None, None).await
         } else {
-            rpc.session_new(&alias, cwd_str).await
+            rpc.session_new(&alias, None).await
         };
         match new_session {
             Ok(s) => {
@@ -9788,6 +9783,129 @@ mod tests {
         };
         assert_eq!(state.session_id, "sess-fresh");
         assert_eq!(state.agent_alias, "alpha");
+    }
+
+    #[tokio::test]
+    async fn fresh_local_chat_session_omits_cwd_so_agent_workspace_wins() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        // `with_rpc` defaults to Local transport — the path that used to leak
+        // the TUI's launch directory into `session/new`.
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                ]
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "fresh chat should start a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        let params = &request["params"];
+        assert_eq!(params["agent_alias"], "alpha");
+        assert!(params["session_id"].is_null());
+        // Regression guard: a fresh local session must not send the TUI's
+        // launch directory as cwd. Omitting it lets the daemon resolve the
+        // selected agent's configured workspace.
+        assert!(params["cwd"].is_null());
+
+        init.abort();
+    }
+
+    #[tokio::test]
+    async fn fresh_local_acp_session_omits_cwd_so_agent_workspace_wins() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                ]
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "ACP init should list recent sessions").await;
+        assert_eq!(request["method"], method::SESSION_LIST_ACP);
+        respond_ok(&rpc, &request, serde_json::json!({ "sessions": [] }));
+
+        let request = next_rpc_request(&mut rx, "fresh ACP should start a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        let params = &request["params"];
+        assert_eq!(params["agent_alias"], "alpha");
+        assert!(params["session_id"].is_null());
+        assert_eq!(params["chat_mode"], "acp");
+        assert!(params["cwd"].is_null());
+
+        init.abort();
+    }
+
+    #[tokio::test]
+    async fn restart_local_chat_session_omits_cwd_so_agent_workspace_wins() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut state = ChatState::new(
+            "sess-old".to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        let restart = tokio::spawn(async move {
+            Chat::restart_session_for_state(&client, PaneKind::Chat, &mut state).await
+        });
+
+        let request = next_rpc_request(&mut rx, "restart should start a fresh session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        let params = &request["params"];
+        assert_eq!(params["agent_alias"], "alpha");
+        assert!(params["session_id"].is_null());
+        // Regression guard: restart must not re-point the session at the TUI's
+        // launch directory either.
+        assert!(params["cwd"].is_null());
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "session_id": "sess-fresh", "workspace_dir": "/tmp/alpha" }),
+        );
+
+        let request = next_rpc_request(&mut rx, "restart should close the old session").await;
+        assert_eq!(request["method"], method::SESSION_CLOSE);
+        assert_eq!(request["params"]["session_id"], "sess-old");
+        respond_ok(&rpc, &request, serde_json::json!({}));
+
+        let request = next_rpc_request(&mut rx, "restart should refresh model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let phase = tokio::time::timeout(Duration::from_secs(2), restart)
+            .await
+            .expect("restart should finish")
+            .unwrap();
+        assert!(phase.is_none());
     }
 
     #[tokio::test]
