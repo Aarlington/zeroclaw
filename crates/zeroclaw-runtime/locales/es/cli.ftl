@@ -1025,6 +1025,9 @@ channel-approval-opt-allow-once = Permitir una vez
 channel-approval-opt-allow-always = Permitir siempre
 channel-approval-opt-reject = Rechazar
 channel-approval-opt-reject-with-edit = Rechazar con edición
+# ── Agent vision capability errors ──
+cli-agent-vision-unsupported-by-fallback = Se recibieron {$marker_count} marcadores de imagen, pero el model_provider alternativo={$fallback_name} no admite entrada de visión
+cli-agent-vision-unsupported-by-provider = Se recibieron {$marker_count} marcadores de imagen, pero este model_provider no admite entrada de visión
 cli-agent-error-provider-context-window = La solicitud es demasiado grande para el modelo seleccionado. Reduce la conversación o elige un modelo con una ventana de contexto mayor.
 cli-agent-error-provider-credentials-missing = El proveedor de modelo seleccionado no tiene credenciales configuradas. Añade su clave de API o elige otro proveedor.
 cli-agent-error-provider-credentials-missing-named = El proveedor de modelo {$provider} no tiene credenciales configuradas. Añade su clave de API o elige otro proveedor.

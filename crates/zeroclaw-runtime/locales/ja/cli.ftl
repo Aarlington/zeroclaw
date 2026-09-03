@@ -1025,6 +1025,9 @@ channel-approval-opt-allow-once = 今回のみ許可
 channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
+# ── Agent vision capability errors ──
+cli-agent-vision-unsupported-by-fallback = {$marker_count} 個の画像マーカーを受信しましたが、フォールバック model_provider={$fallback_name} は画像入力をサポートしていません
+cli-agent-vision-unsupported-by-provider = {$marker_count} 個の画像マーカーを受信しましたが、この model_provider は画像入力をサポートしていません
 cli-agent-error-provider-context-window = リクエストが選択したモデルのコンテキストウィンドウを超えています。会話を短くするか、より大きなコンテキストウィンドウを持つモデルを選択してください。
 cli-agent-error-provider-credentials-missing = 選択したモデルプロバイダーの認証情報が設定されていません。API キーを追加するか、別のプロバイダーを選択してください。
 cli-agent-error-provider-credentials-missing-named = モデルプロバイダー {$provider} の認証情報が設定されていません。API キーを追加するか、別のプロバイダーを選択してください。

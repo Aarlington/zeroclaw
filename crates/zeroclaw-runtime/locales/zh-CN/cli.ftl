@@ -1024,6 +1024,9 @@ channel-approval-opt-allow-once = 仅本次允许
 channel-approval-opt-allow-always = 始终允许
 channel-approval-opt-reject = 拒绝
 channel-approval-opt-reject-with-edit = 编辑后拒绝
+# ── Agent vision capability errors ──
+cli-agent-vision-unsupported-by-fallback = 收到 {$marker_count} 个图像标记，但回退 model_provider={$fallback_name} 不支持视觉输入
+cli-agent-vision-unsupported-by-provider = 收到 {$marker_count} 个图像标记，但此 model_provider 不支持视觉输入
 cli-agent-error-provider-context-window = 请求超过了所选模型的上下文窗口。请缩短对话或选择上下文窗口更大的模型。
 cli-agent-error-provider-credentials-missing = 所选模型提供商未配置凭据。请添加其 API 密钥或选择其他提供商。
 cli-agent-error-provider-credentials-missing-named = 模型提供商 {$provider} 未配置凭据。请添加其 API 密钥或选择其他提供商。
