@@ -11387,6 +11387,7 @@ mod tests {
             revision_base: 0,
             initiating_agent: None,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         let pr = PersistedRun::new(
             run.clone(),
