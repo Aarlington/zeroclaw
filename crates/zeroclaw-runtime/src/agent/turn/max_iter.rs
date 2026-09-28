@@ -79,6 +79,7 @@ pub(crate) async fn finish_after_max_iterations(
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
     config: Option<&Config>,
     multimodal_config: &MultimodalConfig,
+    security: Option<&crate::security::SecurityPolicy>,
     hooks: Option<&crate::hooks::HookRunner>,
     mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
     context_limits_for_route: impl Fn(&str, &str) -> ResolvedContextLimits + Send + Sync,
@@ -142,7 +143,9 @@ pub(crate) async fn finish_after_max_iterations(
         provider_name,
         model,
         dispatch_model,
-    )?;
+        security,
+    )
+    .await?;
     let (model_provider, provider_name, model, dispatch_model) = match vision_provider.as_ref() {
         Some(route) => (
             route.provider.as_ref(),
@@ -577,6 +580,7 @@ mod graceful_summary_metering_tests {
             &multimodal_config,
             None,
             None,
+            None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             None,
@@ -890,6 +894,7 @@ mod graceful_summary_metering_tests {
                 None,
                 None,
                 &MultimodalConfig::default(),
+                None,
                 Some(&hooks),
                 None,
                 |provider, model| {
@@ -970,6 +975,7 @@ mod graceful_summary_metering_tests {
                 None,
                 None,
                 &MultimodalConfig::default(),
+                None,
                 None,
                 None,
                 |_, _| ResolvedContextLimits {
@@ -1066,6 +1072,7 @@ mod graceful_summary_metering_tests {
             &multimodal_config,
             None,
             None,
+            None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             None,
@@ -1141,6 +1148,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             &multimodal_config,
+            None,
             None,
             None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
@@ -1228,6 +1236,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             &multimodal_config,
+            None,
             None,
             None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
@@ -1319,6 +1328,7 @@ mod graceful_summary_metering_tests {
             &multimodal_config,
             None,
             None,
+            None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             None,
@@ -1404,6 +1414,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             &multimodal_config,
+            None,
             None,
             None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
