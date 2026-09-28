@@ -9504,19 +9504,19 @@ impl RpcDispatcher {
     /// engine, this path keeps the fail-closed posture the session selector
     /// used to carry.
     ///
-    /// A wildcard selector passes: the principal may already name any tool, so
-    /// the engine assembling the agent's own set is not an escalation past it.
+    /// Only a principal that [`principal_tool_ceiling`] leaves unnarrowed
+    /// passes. That is the same ceiling its own session gets, so the engine
+    /// assembling the agent's own tool set does not exceed that ceiling. A
+    /// wildcard selector alone is not enough; without the coarse
+    /// `tools:execute` grant the same principal gets a tool-less session.
+    /// This guard does not withhold the nested execution tools that a session
+    /// also removes for a principal without the `"*"` agent selector (see
+    /// [`Self::apply_principal_grants_to_agent`]).
     fn refuse_constrained_tool_selector_for_sop(&self, method: Method) -> Result<(), JsonRpcError> {
         let Some(auth) = self.auth.as_ref() else {
             return Ok(());
         };
-        if auth.grants.admin
-            || auth
-                .grants
-                .allowed_tools
-                .iter()
-                .any(|tool| tool == zeroclaw_api::grants::WILDCARD)
-        {
+        if principal_tool_ceiling(&auth.grants).is_none() {
             return Ok(());
         }
         let denied = rpc_err(
@@ -14529,6 +14529,7 @@ mod tests {
             .get_mut("cron-alpha")
             .expect("the fixture profile exists");
         profile.allowed_tools = vec![zeroclaw_api::grants::WILDCARD.into()];
+        profile.grants.insert(Resource::Tools, vec![Verb::Execute]);
         profile.grants.insert(
             Resource::Sops,
             vec![
@@ -14569,6 +14570,21 @@ mod tests {
             panic!("a supervised execute step parks for approval: {action:?}");
         };
         run_id
+    }
+
+    /// `sops/run` got past authorization. This context has no SOP audit log,
+    /// and that check follows authorization, so an admitted run stops there.
+    fn assert_sop_run_admitted(response: &Value) {
+        assert_eq!(
+            response["error"]["code"],
+            json!(INTERNAL_ERROR),
+            "{response}"
+        );
+        assert_eq!(
+            response["error"]["message"],
+            json!("SOP subsystem not enabled"),
+            "{response}"
+        );
     }
 
     #[tokio::test]
@@ -14617,7 +14633,7 @@ mod tests {
             json!({"name": "alpha-sop"}),
         )
         .await;
-        assert_ne!(admitted["error"]["code"], json!(FORBIDDEN), "{admitted}");
+        assert_sop_run_admitted(&admitted);
     }
 
     #[tokio::test]
@@ -14644,6 +14660,127 @@ mod tests {
         )
         .await;
         assert_eq!(run["error"]["code"], json!(FORBIDDEN), "{run}");
+    }
+
+    #[tokio::test]
+    async fn sop_run_and_decide_refuse_a_wildcard_selector_without_tools_execute() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        let alpha_run = park_sop_run(&engine, "alpha-sop");
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let mut without_tools = ctx.config.read().clone();
+        without_tools
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists")
+            .grants
+            .remove(&zeroclaw_api::grants::Resource::Tools);
+        ctx.auth
+            .refresh_from_config(&without_tools)
+            .expect("the policy without tools:execute compiles");
+
+        let run = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "sops/run",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_eq!(run["error"]["code"], json!(FORBIDDEN), "{run}");
+
+        let decided = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "sops/decide",
+            json!({"name": "alpha-sop", "run_id": alpha_run, "decision": "approve"}),
+        )
+        .await;
+        assert_eq!(decided["error"]["code"], json!(FORBIDDEN), "{decided}");
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock")
+                .get_run(&alpha_run)
+                .map(|run| run.status),
+            Some(crate::sop::SopRunStatus::WaitingApproval),
+            "a refused approval must leave the run parked"
+        );
+
+        // The trusted local operator holds admin grants and is never narrowed,
+        // so the same procedure is admitted for it.
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        let admitted = rpc(
+            &mut operator,
+            &mut op_rx,
+            3,
+            "sops/run",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_sop_run_admitted(&admitted);
+    }
+
+    #[tokio::test]
+    async fn sop_run_is_refused_once_tools_execute_is_revoked() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        let alpha_run = park_sop_run(&engine, "alpha-sop");
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        // Admitted on both methods while tools:execute is held. The decision
+        // is a denial so that it does not resume the run into a headless driver.
+        let admitted = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "sops/run",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_sop_run_admitted(&admitted);
+        let decided = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "sops/decide",
+            json!({"name": "alpha-sop", "run_id": alpha_run, "decision": {"deny": {}}}),
+        )
+        .await;
+        assert!(decided.get("error").is_none(), "{decided}");
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock")
+                .get_run(&alpha_run)
+                .map(|run| run.status),
+            Some(crate::sop::SopRunStatus::Cancelled),
+            "an admitted denial must reach the run"
+        );
+
+        // Revoke only tools:execute; the wildcard selector and the SOP grants
+        // stay, and the same connection is refused on its next run.
+        let mut revoked = ctx.config.read().clone();
+        revoked
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists")
+            .grants
+            .remove(&zeroclaw_api::grants::Resource::Tools);
+        ctx.auth
+            .refresh_from_config(&revoked)
+            .expect("the revoked policy compiles");
+
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            3,
+            "sops/run",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
     }
 
     #[tokio::test]
