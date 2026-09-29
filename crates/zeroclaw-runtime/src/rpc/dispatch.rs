@@ -1906,6 +1906,33 @@ impl RpcDispatcher {
         Ok(())
     }
 
+    /// Judge the live incarnation `session/new` is about to rebind, under the
+    /// store lock that guards the rebind. The caller's authority is resolved
+    /// once, now, and the session's owner, agent and workspace binding, and
+    /// retained environment are all held to it. Ownership is judged by the
+    /// scope those grants give rather than by the connection's stamp, so a
+    /// principal that lost the administrator bypass is refused another
+    /// principal's session with the uniform denial.
+    fn authorize_resumed_incarnation(
+        &self,
+        agent_alias: &str,
+        workspace_dir: &str,
+        retained_environment: Option<&crate::tools::ForwardedEnvironment>,
+        owner: Option<&str>,
+    ) -> Result<(), JsonRpcError> {
+        let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
+        if let Some(mine) = self.scoped_principal_id_from(grants.as_ref())
+            && owner != Some(mine.as_str())
+        {
+            return Err(rpc_err(
+                FORBIDDEN,
+                "Session not found or not owned by this principal",
+            ));
+        }
+        self.authorize_resumed_session(grants.as_ref(), agent_alias, workspace_dir)?;
+        self.authorize_resumed_environment(grants.as_ref(), retained_environment)
+    }
+
     /// Apply a principal's posture to an agent: narrow its tool surface to the
     /// selector, and, for a principal without operator reach, disable nested
     /// tools that cannot carry the principal through. A handler that
@@ -1967,9 +1994,26 @@ impl RpcDispatcher {
     /// `None` is the bypass: the shared operator and administrators pass
     /// every ownership check. This is deliberately not the identity sessions
     /// are stamped with; see [`Self::owner_principal_id`].
+    ///
+    /// This judges the grants stamped by the last gate, which is current for
+    /// a check made before the handler waits. After waiting for admission or
+    /// a lock, derive the scope with [`Self::scoped_principal_id_from`].
     fn scoped_principal_id(&self) -> Option<String> {
+        self.scoped_principal_id_from(self.stamped_grants())
+    }
+
+    /// [`Self::scoped_principal_id`] judged by `grants`: after a wait, the
+    /// grants [`Self::recheck_authority_after_admission`] resolved at the
+    /// admission boundary, so a principal that lost `admin` while it waited
+    /// no longer holds the bypass. Grants are absent only for an unbound
+    /// dispatcher, which has no scope either; a bound principal without
+    /// grants is held to its own sessions rather than given the bypass.
+    fn scoped_principal_id_from(
+        &self,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+    ) -> Option<String> {
         let auth = self.auth.as_ref()?;
-        if auth.grants.admin || !auth.principal.is_authenticated() {
+        if grants.is_some_and(|grants| grants.admin) || !auth.principal.is_authenticated() {
             return None;
         }
         Some(auth.principal.id.as_str().to_owned())
@@ -2063,11 +2107,16 @@ impl RpcDispatcher {
     /// rows have the same owner. Among chat keys the RPC-prefixed key wins,
     /// then the gateway prefix, then the raw id.
     ///
+    /// `scope` is the caller's ownership scope (see
+    /// [`Self::scoped_principal_id_from`]); it only chooses how an ambiguous
+    /// id is refused, so a scoped caller gets the uniform ownership denial.
+    ///
     /// Returns `Ok(None)` when the id names nothing anywhere.
     async fn resolve_session_record_for_mode(
         &self,
         session_id: &str,
         selected_mode: Option<&ChatMode>,
+        scope: Option<&str>,
     ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
         use super::session::{DurableSession, SessionRecord};
         let mut owners: Vec<Option<String>> = Vec::new();
@@ -2122,7 +2171,7 @@ impl RpcDispatcher {
             return Ok(None);
         };
         if owners.iter().any(|owner| *owner != first) {
-            if self.scoped_principal_id().is_some() {
+            if scope.is_some() {
                 return Err(rpc_err(
                     FORBIDDEN,
                     "Session not found or not owned by this principal",
@@ -2156,10 +2205,7 @@ impl RpcDispatcher {
             (Some(ChatMode::Acp), false, _) => None,
             (Some(ChatMode::Chat), _, chat) | (None, false, chat) => chat,
             (None, true, Some(_)) => {
-                if self
-                    .scoped_principal_id()
-                    .is_some_and(|mine| first.as_deref() != Some(mine.as_str()))
-                {
+                if scope.is_some_and(|mine| first.as_deref() != Some(mine)) {
                     return Err(rpc_err(
                         FORBIDDEN,
                         "Session not found or not owned by this principal",
@@ -2188,27 +2234,39 @@ impl RpcDispatcher {
     /// principal emits the cross-principal audit event. Operations that wait
     /// for a lock or a queue permit afterwards must call
     /// [`Self::revalidate_admitted_session`] with the returned record.
+    ///
+    /// This is the check made before any wait, so it judges the connection's
+    /// stamped scope, which the gate refreshed for this request.
     async fn authorize_session_owner(
         &self,
         session_id: &str,
         method: Method,
     ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
-        self.authorize_session_owner_for_mode(session_id, method, None)
-            .await
+        self.authorize_session_owner_for_mode(
+            session_id,
+            method,
+            None,
+            self.scoped_principal_id().as_deref(),
+        )
+        .await
     }
 
+    /// [`Self::authorize_session_owner`] for a selected chat mode, judged by
+    /// `scope`: the stamped scope before a wait, or the scope derived from
+    /// re-resolved grants after one.
     async fn authorize_session_owner_for_mode(
         &self,
         session_id: &str,
         method: Method,
         selected_mode: Option<&ChatMode>,
+        scope: Option<&str>,
     ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
         let record = self
-            .resolve_session_record_for_mode(session_id, selected_mode)
+            .resolve_session_record_for_mode(session_id, selected_mode, scope)
             .await?;
-        match self.scoped_principal_id() {
+        match scope {
             Some(mine) => match &record {
-                Some(rec) if rec.owner.as_deref() == Some(mine.as_str()) => Ok(record),
+                Some(rec) if rec.owner.as_deref() == Some(mine) => Ok(record),
                 _ => Err(rpc_err(
                     FORBIDDEN,
                     "Session not found or not owned by this principal",
@@ -2256,10 +2314,16 @@ impl RpcDispatcher {
     /// record at all (an id known nowhere) is left to its own not-found
     /// handling, unless a record has appeared meanwhile that a scoped caller
     /// does not own.
+    ///
+    /// `scope` is the caller's ownership scope as of this boundary: derived by
+    /// [`Self::scoped_principal_id_from`] from the grants the handler resolved
+    /// after its wait, not from the connection's stamp, so an administrator
+    /// demoted while it waited is held to its own sessions here.
     async fn revalidate_admitted_session(
         &self,
         session_id: &str,
         authorized: Option<&super::session::SessionRecord>,
+        scope: Option<&str>,
     ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
         let selected_mode = authorized
             .filter(|record| record.live_generation.is_some())
@@ -2269,10 +2333,9 @@ impl RpcDispatcher {
                 None => None,
             });
         let current = self
-            .resolve_session_record_for_mode(session_id, selected_mode.as_ref())
+            .resolve_session_record_for_mode(session_id, selected_mode.as_ref(), scope)
             .await?;
-        let scope = self.scoped_principal_id();
-        if let Some(mine) = scope.as_deref()
+        if let Some(mine) = scope
             && current
                 .as_ref()
                 .is_some_and(|rec| rec.owner.as_deref() != Some(mine))
@@ -3524,8 +3587,9 @@ impl RpcDispatcher {
             // uniform not-found-or-not-owned denial; a brand-new id passes
             // because it exists nowhere yet). The live rebind below repeats
             // the check under the store lock against the exact incarnation.
+            let scope = self.scoped_principal_id();
             if self
-                .resolve_session_record_for_mode(existing, Some(&chat_mode))
+                .resolve_session_record_for_mode(existing, Some(&chat_mode), scope.as_deref())
                 .await?
                 .is_some()
             {
@@ -3533,6 +3597,7 @@ impl RpcDispatcher {
                     existing,
                     Method::SessionNew,
                     Some(&chat_mode),
+                    scope.as_deref(),
                 )
                 .await?;
             }
@@ -3560,7 +3625,10 @@ impl RpcDispatcher {
         // Ownership of the live incarnation is decided inside `resume_existing`,
         // under the store lock, against the record being rebound: the read
         // above authorized whatever existed then, this authorizes what exists
-        // now. A scoped mismatch surfaces as the uniform ownership denial.
+        // now. A scoped mismatch surfaces as the uniform ownership denial. The
+        // owner is judged again with the binding, by the authority resolved
+        // under that lock, so a stamp that still carries a revoked
+        // administrator bypass cannot rebind another principal's session.
         let resume_scope = self.scoped_principal_id();
         if resuming {
             match self
@@ -3573,10 +3641,13 @@ impl RpcDispatcher {
                     resolved_interaction_surface,
                     self.tui_id.clone(),
                     resume_scope.as_deref(),
-                    |alias, workspace, retained_environment| {
-                        let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
-                        self.authorize_resumed_session(grants.as_ref(), alias, workspace)?;
-                        self.authorize_resumed_environment(grants.as_ref(), retained_environment)
+                    |alias, workspace, retained_environment, owner| {
+                        self.authorize_resumed_incarnation(
+                            alias,
+                            workspace,
+                            retained_environment,
+                            owner,
+                        )
                     },
                 )
                 .await
@@ -3620,19 +3691,6 @@ impl RpcDispatcher {
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
-        // A durable row can appear while admission is queued. Resolve its
-        // owner again before building or stamping a replacement session.
-        let admitted_record = if self
-            .resolve_session_record_for_mode(&session_id, Some(&chat_mode))
-            .await?
-            .is_some()
-        {
-            self.authorize_session_owner_for_mode(&session_id, Method::SessionNew, Some(&chat_mode))
-                .await?
-        } else {
-            None
-        };
-
         // The wait for admission is unbounded, so the principal's profile,
         // credential, or pairing may have changed while this request was
         // parked. Every selector below is judged by the grants resolved now,
@@ -3647,6 +3705,28 @@ impl RpcDispatcher {
             // another principal could reach by ID.
             self.selector_session_agent_with_grants(Method::SessionNew, grants, &req.agent_alias)?;
         }
+        // Ownership from here on is judged by these grants as well: the stamp
+        // predates the wait, and a caller that lost the administrator bypass
+        // while parked is held to its own sessions.
+        let resume_scope = self.scoped_principal_id_from(grants.as_ref());
+
+        // A durable row can appear while admission is queued. Resolve its
+        // owner again before building or stamping a replacement session.
+        let admitted_record = if self
+            .resolve_session_record_for_mode(&session_id, Some(&chat_mode), resume_scope.as_deref())
+            .await?
+            .is_some()
+        {
+            self.authorize_session_owner_for_mode(
+                &session_id,
+                Method::SessionNew,
+                Some(&chat_mode),
+                resume_scope.as_deref(),
+            )
+            .await?
+        } else {
+            None
+        };
 
         // The mode may have changed while this request waited for admission.
         // Re-read under the permit so concurrent replacements cannot remove a
@@ -3664,10 +3744,13 @@ impl RpcDispatcher {
                     resolved_interaction_surface,
                     self.tui_id.clone(),
                     resume_scope.as_deref(),
-                    |alias, workspace, retained_environment| {
-                        let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
-                        self.authorize_resumed_session(grants.as_ref(), alias, workspace)?;
-                        self.authorize_resumed_environment(grants.as_ref(), retained_environment)
+                    |alias, workspace, retained_environment, owner| {
+                        self.authorize_resumed_incarnation(
+                            alias,
+                            workspace,
+                            retained_environment,
+                            owner,
+                        )
                     },
                 )
                 .await
@@ -3723,8 +3806,7 @@ impl RpcDispatcher {
                 .await
             {
                 Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(data))) => {
-                    if self
-                        .scoped_principal_id()
+                    if resume_scope
                         .as_deref()
                         .is_some_and(|mine| data.principal_id.as_deref() != Some(mine))
                     {
@@ -3881,6 +3963,27 @@ impl RpcDispatcher {
         let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
         if let Some(grants) = grants.as_ref() {
             self.selector_session_agent_with_grants(Method::SessionNew, grants, &req.agent_alias)?;
+        }
+        // The same edit can remove the administrator bypass, so ownership is
+        // judged by these grants again: a restore keeps the durable owner and a
+        // cross-mode replacement swaps out the live owner's incarnation, and
+        // either proceeds only for a record this caller owns now.
+        let resume_scope = self.scoped_principal_id_from(grants.as_ref());
+        if let Some(mine) = resume_scope.as_deref()
+            && preloaded_acp
+                .as_ref()
+                .map(|data| data.principal_id.as_deref())
+                .or_else(|| {
+                    admitted_record
+                        .as_ref()
+                        .map(|record| record.owner.as_deref())
+                })
+                .is_some_and(|owner| owner != Some(mine))
+        {
+            return Err(rpc_err(
+                FORBIDDEN,
+                "Session not found or not owned by this principal",
+            ));
         }
 
         // The session cwd: caller-supplied wins, then a resumed ACP session's
@@ -4117,9 +4220,10 @@ impl RpcDispatcher {
                     };
                     match loaded {
                         Ok(Ok(AcpSessionNewLoad::Restored(data))) => {
-                            if self.scoped_principal_id().as_deref().is_some_and(|mine| {
-                                data.principal_id.as_deref() != Some(mine)
-                            }) {
+                            if resume_scope
+                                .as_deref()
+                                .is_some_and(|mine| data.principal_id.as_deref() != Some(mine))
+                            {
                                 return Err(rpc_err(
                                     FORBIDDEN,
                                     "Session not found or not owned by this principal",
@@ -4350,13 +4454,14 @@ impl RpcDispatcher {
         // it, or fails to, fails the creation and the live entry is unwound,
         // so a session never reports success and then reappears after a
         // restart as nobody's. An unscoped creator's stamp is attribution
-        // only, so its failure is logged and creation proceeds.
+        // only, so its failure is logged and creation proceeds. Whether the
+        // creator is scoped follows the grants resolved under the writer gate.
         if let (Some(owner), Some(backend)) =
             (effective_owner.clone(), self.ctx.session_backend.as_ref())
             && !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             && let Err(error) = backend.set_session_principal(&format!("rpc_{session_id}"), &owner)
         {
-            if self.scoped_principal_id().is_some() {
+            if resume_scope.is_some() {
                 self.ctx.sessions.remove(&session_id).await;
                 return Err(rpc_err(
                     INTERNAL_ERROR,
@@ -4479,6 +4584,10 @@ impl RpcDispatcher {
             .acquire(&req.session_id)
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        // The wait can outlast the caller's authority: judge it, and the
+        // ownership scope it gives, as it stands now.
+        let grants = self.recheck_authority_after_admission(Method::SessionClose)?;
+        let scope = self.scoped_principal_id_from(grants.as_ref());
         let current_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
         if current_identity != requested_identity {
             if current_identity.is_none() && requested_identity.is_some() {
@@ -4489,7 +4598,7 @@ impl RpcDispatcher {
                     closed: true,
                 });
             }
-            return Err(if self.scoped_principal_id().is_some() {
+            return Err(if scope.is_some() {
                 rpc_err(
                     FORBIDDEN,
                     "Session not found or not owned by this principal",
@@ -4502,7 +4611,7 @@ impl RpcDispatcher {
         // installed under this id while the permit was awaited is not ours to
         // remove.
         let admitted = self
-            .revalidate_admitted_session(&req.session_id, authorized.as_ref())
+            .revalidate_admitted_session(&req.session_id, authorized.as_ref(), scope.as_deref())
             .await?;
         let Some(live_generation) = admitted.as_ref().and_then(|r| r.live_generation) else {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
@@ -4617,20 +4726,28 @@ impl RpcDispatcher {
             .acquire(sid)
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        // The wait can outlast the caller's authority: judge it, and the
+        // ownership scope it gives, as it stands now.
+        let grants = self.recheck_authority_after_admission(Method::SessionKill)?;
+        let scope = self.scoped_principal_id_from(grants.as_ref());
         let admitted = match self
-            .revalidate_admitted_session(sid, authorized.as_ref())
+            .revalidate_admitted_session(sid, authorized.as_ref(), scope.as_deref())
             .await
         {
             Ok(record) => record,
             Err(error) if requested_generation.is_some() => {
                 // A hard-cancelled turn may already have dropped its live
                 // generation. Keep the durable target only if its owner and
-                // storage domain still match the authorized record.
+                // storage domain still match the authorized record, and the
+                // caller still owns it under the current scope.
                 let current = self
-                    .resolve_session_record_for_mode(sid, requested_mode.as_ref())
+                    .resolve_session_record_for_mode(sid, requested_mode.as_ref(), scope.as_deref())
                     .await?;
                 if current.as_ref().is_some_and(|record| {
                     record.live_generation.is_none()
+                        && scope
+                            .as_deref()
+                            .is_none_or(|mine| record.owner.as_deref() == Some(mine))
                         && authorized.as_ref().is_some_and(|authorized| {
                             record.owner == authorized.owner && record.durable == authorized.durable
                         })
@@ -4771,7 +4888,10 @@ impl RpcDispatcher {
     /// agent/workspace binding.
     ///
     /// Rehydrate a durable ACP session while the caller holds `session_queue`
-    /// for `sid`, covering the owner check through insertion.
+    /// for `sid`, covering the owner check through insertion. The owner is
+    /// judged by the scope `grants` give, which the prompt path resolves after
+    /// admission, so a caller that lost the administrator bypass while it
+    /// waited cannot recover or revive another principal's session.
     async fn rehydrate_reaped_session_under_guard(
         &self,
         sid: &str,
@@ -4841,7 +4961,7 @@ impl RpcDispatcher {
         };
 
         if self
-            .scoped_principal_id()
+            .scoped_principal_id_from(grants)
             .as_deref()
             .is_some_and(|mine| data.principal_id.as_deref() != Some(mine))
         {
@@ -5419,14 +5539,19 @@ impl RpcDispatcher {
                 None,
             )
             .await;
-            return Err(if self.scoped_principal_id().is_some() {
-                rpc_err(
-                    FORBIDDEN,
-                    "Session not found or not owned by this principal",
-                )
-            } else {
-                rpc_err(SESSION_NOT_FOUND, "Session not found")
-            });
+            // The refusal follows the authority in force now, not the stamp.
+            return Err(
+                match self.recheck_authority_after_admission(Method::SessionPrompt) {
+                    Err(denied) => denied,
+                    Ok(grants) if self.scoped_principal_id_from(grants.as_ref()).is_some() => {
+                        rpc_err(
+                            FORBIDDEN,
+                            "Session not found or not owned by this principal",
+                        )
+                    }
+                    Ok(_) => rpc_err(SESSION_NOT_FOUND, "Session not found"),
+                },
+            );
         }
 
         let agent = match self.ctx.sessions.get_agent(sid).await {
@@ -5495,15 +5620,10 @@ impl RpcDispatcher {
             ));
         }
 
-        // The queue wait was unbounded: the incarnation authorized before it
-        // may have been replaced under the same id. Bind this prompt to the
-        // exact record present now, under the permit, or refuse it.
-        self.revalidate_admitted_session(sid, authorized.as_ref())
-            .await?;
         // Admission can wait behind an active turn for as long as that turn
         // runs, and the grants resolved before the lookup predate that wait.
         // Re-resolve against the accepted policy now, so every decision from
-        // here on is made with a post-admission view.
+        // here on, ownership included, is made with a post-admission view.
         let grants = match self.recheck_authority_after_admission(Method::SessionPrompt) {
             Ok(grants) => grants,
             Err(denied) => {
@@ -5512,6 +5632,23 @@ impl RpcDispatcher {
                     .await);
             }
         };
+        // The queue wait was unbounded: the incarnation authorized before it
+        // may have been replaced under the same id, and the caller may have
+        // lost the administrator bypass. Bind this prompt to the exact record
+        // present now, under the permit and the scope these grants give, or
+        // refuse it.
+        if let Err(denied) = self
+            .revalidate_admitted_session(
+                sid,
+                authorized.as_ref(),
+                self.scoped_principal_id_from(grants.as_ref()).as_deref(),
+            )
+            .await
+        {
+            return Err(self
+                .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                .await);
+        }
 
         // Session/new authorizes a binding only when it creates or reattaches
         // a session. Reused and rehydrated sessions enter through
@@ -5696,10 +5833,13 @@ impl RpcDispatcher {
             }
         };
 
-        // Provider reconciliation can wait after admission. Re-resolve before
-        // executing so an environment-bearing session cannot use pre-wait grants.
-        let environment_grants = match self.recheck_authority_after_admission(Method::SessionPrompt)
-        {
+        // The two waits above can each hold this prompt after admission, and
+        // policy can change meanwhile. Re-resolve before executing: the turn
+        // runs under this resolution, so ownership, the forwarded environment
+        // and the tool ceiling below are all judged by it rather than by the
+        // grants resolved before these waits. The permit keeps the incarnation
+        // fixed, so its live owner is the one to compare.
+        let grants = match self.recheck_authority_after_admission(Method::SessionPrompt) {
             Ok(grants) => grants,
             Err(denied) => {
                 return Err(self
@@ -5707,9 +5847,26 @@ impl RpcDispatcher {
                     .await);
             }
         };
+        if let Some(mine) = self.scoped_principal_id_from(grants.as_ref())
+            && self
+                .ctx
+                .sessions
+                .session_owner_principal(sid)
+                .await
+                .flatten()
+                != Some(mine)
+        {
+            let denied = rpc_err(
+                FORBIDDEN,
+                "Session not found or not owned by this principal",
+            );
+            return Err(self
+                .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                .await);
+        }
         if let Err(denied) = self.authorize_session_environment(
             Method::SessionPrompt,
-            environment_grants.as_ref(),
+            grants.as_ref(),
             has_environment,
         ) {
             return Err(self
@@ -5726,7 +5883,7 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
-        // The grants were re-resolved after admission, so apply that posture
+        // The grants were re-resolved after every wait, so apply that posture
         // to this session's static and already-activated deferred tools. It is
         // judged by those fresh grants rather than the connection's stamped
         // copy, so a prompt that queued before its principal was narrowed
@@ -6399,9 +6556,16 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
-        // Re-verify the exact incarnation and its owner under the lock.
-        self.revalidate_admitted_session(&req.session_id, authorized.as_ref())
-            .await?;
+        // Both waits above can outlast the caller's authority. Re-verify the
+        // exact incarnation and its owner under the lock, judged by the
+        // authority and ownership scope in force now.
+        let grants = self.recheck_authority_after_admission(Method::SessionConfigure)?;
+        self.revalidate_admitted_session(
+            &req.session_id,
+            authorized.as_ref(),
+            self.scoped_principal_id_from(grants.as_ref()).as_deref(),
+        )
+        .await?;
 
         let merged = self
             .ctx
@@ -6735,8 +6899,15 @@ impl RpcDispatcher {
             live_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
         }
         let record = if session_guard.is_some() {
-            self.revalidate_admitted_session(&req.session_id, authorized.as_ref())
-                .await?
+            // Admission can outlast the caller's authority: judge the record
+            // by the authority and ownership scope in force now.
+            let grants = self.recheck_authority_after_admission(Method::SessionMessages)?;
+            self.revalidate_admitted_session(
+                &req.session_id,
+                authorized.as_ref(),
+                self.scoped_principal_id_from(grants.as_ref()).as_deref(),
+            )
+            .await?
         } else {
             authorized
         };
@@ -7020,24 +7191,33 @@ impl RpcDispatcher {
             .acquire(&req.session_id)
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        // The wait can outlast the caller's authority: judge it, and the
+        // ownership scope it gives, as it stands now.
+        let grants = self.recheck_authority_after_admission(Method::SessionDelete)?;
+        let scope = self.scoped_principal_id_from(grants.as_ref());
 
         let record = match self
-            .revalidate_admitted_session(&req.session_id, authorized.as_ref())
+            .revalidate_admitted_session(&req.session_id, authorized.as_ref(), scope.as_deref())
             .await
         {
             Ok(record) => record,
             Err(error) if requested_generation.is_some() => {
                 // Hard cancellation can remove the captured live generation
                 // before admission. Its durable row is still the authorized
-                // target only if the owner and storage domain are unchanged.
+                // target only if the owner and storage domain are unchanged,
+                // and the caller still owns it under the current scope.
                 let current = self
                     .resolve_session_record_for_mode(
                         &req.session_id,
                         requested_identity.as_ref().map(|(_, mode)| mode),
+                        scope.as_deref(),
                     )
                     .await?;
                 if current.as_ref().is_some_and(|record| {
                     record.live_generation.is_none()
+                        && scope
+                            .as_deref()
+                            .is_none_or(|mine| record.owner.as_deref() == Some(mine))
                         && authorized.as_ref().is_some_and(|authorized| {
                             record.owner == authorized.owner && record.durable == authorized.durable
                         })
@@ -17519,6 +17699,541 @@ mod tests {
         }
     }
 
+    /// [`two_user_config`] with alice also holding an `administrator`
+    /// profile, which [`set_alice_administrator`] grants and revokes. Her
+    /// `member` grants stay in force either way, so the edit changes only the
+    /// administrator bypass, never her method or agent permissions.
+    fn two_user_config_with_administrator_alice(
+        tmp: &tempfile::TempDir,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = two_user_config(tmp);
+        config.permission_profiles.insert(
+            "administrator".into(),
+            zeroclaw_config::schema::PermissionProfileConfig {
+                admin: true,
+                ..zeroclaw_config::schema::PermissionProfileConfig::default()
+            },
+        );
+        config
+            .users
+            .get_mut("alice")
+            .expect("the fixture defines alice")
+            .permission_profiles
+            .push("administrator".into());
+        config
+    }
+
+    /// Grant or revoke alice's administrator profile and publish the policy,
+    /// as an accepted permission-profile edit does.
+    fn set_alice_administrator(ctx: &Arc<RpcContext>, admin: bool) {
+        let mut config = ctx.config.write();
+        config
+            .permission_profiles
+            .get_mut("administrator")
+            .expect("the fixture defines the administrator profile")
+            .admin = admin;
+        ctx.auth
+            .refresh_from_config(&config)
+            .expect("the edited policy compiles");
+    }
+
+    /// A queued operation judges the administrator bypass by the authority in
+    /// force when it is admitted, not by the grants stamped before it waited.
+    /// An administrator demoted while its operation on another principal's
+    /// session waits (for admission, or for configure the provider-update
+    /// lock) gets the uniform denial, and that session is left as it was: not
+    /// prompted, closed, deleted, killed, configured, read or rehydrated, its
+    /// live incarnation and durable row intact. That holds when the live
+    /// incarnation is reaped during the wait too, where delete and kill fall
+    /// back to the durable record. The demoted principal still deletes its
+    /// own session.
+    #[tokio::test]
+    async fn queued_operations_lose_the_admin_bypass_when_the_administrator_is_demoted() {
+        use zeroclaw_infra::acp_session_store::AcpSessionRestore;
+
+        /// The victim's state when the operation is requested, and whether
+        /// its live incarnation is reaped while the operation waits.
+        #[derive(Clone, Copy, Debug)]
+        enum Victim {
+            Live,
+            ReapedDuringWait,
+            Reaped,
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config_with_administrator_alice(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&fixture.ctx);
+        let bob = scoped_dispatcher(&ctx, 4343).await;
+        let victim =
+            json!({"agent_alias": "test-agent", "session_id": "victim", "chat_mode": "acp"});
+        bob.handle_session_new_for_test(&victim)
+            .await
+            .expect("bob creates his session");
+        let baseline_messages = acp_store
+            .load_session("victim")
+            .unwrap()
+            .expect("bob's durable row")
+            .messages
+            .len();
+        scoped_dispatcher(&ctx, 4242)
+            .await
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "alice-own",
+                "chat_mode": "acp",
+            }))
+            .await
+            .expect("alice creates her own session while an administrator");
+
+        for (method, state) in [
+            ("session/prompt", Victim::Live),
+            ("session/close", Victim::Live),
+            ("session/delete", Victim::Live),
+            ("session/kill", Victim::Live),
+            ("session/delete", Victim::ReapedDuringWait),
+            ("session/kill", Victim::ReapedDuringWait),
+            ("session/prompt", Victim::Reaped),
+            ("session/messages", Victim::Reaped),
+        ] {
+            let case = format!("{method} ({state:?})");
+            if matches!(state, Victim::Reaped) {
+                sessions.remove("victim").await;
+            } else if sessions.get_generation("victim").await.is_none() {
+                bob.handle_session_new_for_test(&victim)
+                    .await
+                    .expect("bob resumes his session");
+            }
+            let generation = sessions.get_generation("victim").await;
+            assert_eq!(
+                generation.is_some(),
+                !matches!(state, Victim::Reaped),
+                "{case}: bob's session is live exactly when the case needs it"
+            );
+            set_alice_administrator(&ctx, true);
+            let (alice, mut frames) = roster_peer(&ctx, 4242).await;
+            // Hold the admission permit so alice's operation parks after its
+            // pre-check, which her administrator stamp passes.
+            let permit = sessions
+                .session_queue
+                .acquire("victim")
+                .await
+                .expect("permit");
+            let operation = zeroclaw_spawn::spawn!(async move {
+                let params =
+                    json!({"session_id": "victim", "prompt": "hi", "client_turn_generation": 7});
+                match method {
+                    "session/prompt" => alice.handle_session_prompt(&params).await,
+                    "session/close" => alice.handle_session_close(&params).await,
+                    "session/delete" => alice.handle_session_delete(&params).await,
+                    "session/kill" => alice.handle_session_kill(&params).await,
+                    _ => {
+                        alice
+                            .handle_session_messages(&json!({"session_id": "victim"}))
+                            .await
+                    }
+                }
+            });
+            wait_for_session_admission_waiter(&ctx, "victim").await;
+            if matches!(state, Victim::ReapedDuringWait) {
+                assert!(
+                    sessions.remove("victim").await,
+                    "{case}: bob's session was live"
+                );
+            }
+            set_alice_administrator(&ctx, false);
+            drop(permit);
+            let err = tokio::time::timeout(std::time::Duration::from_secs(10), operation)
+                .await
+                .expect("the operation settles")
+                .expect("the operation does not panic")
+                .expect_err(&case);
+            assert_eq!(err.code, FORBIDDEN, "{case}: {}", err.message);
+            assert!(
+                err.message.contains("not found or not owned"),
+                "{case}: uniform denial, got {}",
+                err.message
+            );
+            if method == "session/prompt" {
+                // An admitted prompt's refusal also ends the client's turn.
+                let mut notifications = Vec::new();
+                while let Ok(frame) = frames.try_recv() {
+                    notifications.push(serde_json::from_str::<Value>(&frame).expect("valid frame"));
+                }
+                assert_turn_refused(&notifications, "victim", 7);
+            }
+            assert_eq!(
+                sessions.get_generation("victim").await,
+                if matches!(state, Victim::Live) {
+                    generation
+                } else {
+                    None
+                },
+                "{case}: bob's live incarnation is neither removed nor revived"
+            );
+            assert!(
+                matches!(
+                    acp_store.load_session_for_restore("victim").unwrap(),
+                    AcpSessionRestore::Restorable(data)
+                        if data.principal_id.as_deref() == Some("user:bob")
+                            && data.messages.len() == baseline_messages
+                ),
+                "{case}: bob's durable row is neither deleted, killed nor written"
+            );
+        }
+
+        // Configure parks on the session's provider-update lock instead.
+        bob.handle_session_new_for_test(&victim)
+            .await
+            .expect("bob resumes his session");
+        set_alice_administrator(&ctx, true);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let update = sessions
+            .lock_model_provider_update("victim")
+            .await
+            .expect("the live session has an update lock");
+        let waiting = sessions.model_provider_update_waiting();
+        let configure = zeroclaw_spawn::spawn!(async move {
+            alice
+                .handle_session_configure(
+                    &json!({"session_id": "victim", "overrides": {"temperature": 0.2}}),
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting.notified())
+            .await
+            .expect("configure must park on the provider-update lock");
+        set_alice_administrator(&ctx, false);
+        drop(update);
+        let err = tokio::time::timeout(std::time::Duration::from_secs(10), configure)
+            .await
+            .expect("configure settles")
+            .expect("configure does not panic")
+            .expect_err("a demoted administrator cannot configure bob's session");
+        assert_eq!(err.code, FORBIDDEN, "{}", err.message);
+        assert!(
+            err.message.contains("not found or not owned"),
+            "{}",
+            err.message
+        );
+        assert_eq!(
+            sessions
+                .get_overrides("victim")
+                .await
+                .and_then(|overrides| overrides.temperature),
+            None,
+            "bob's session keeps its own overrides"
+        );
+
+        // The same demotion leaves alice's own session in reach.
+        set_alice_administrator(&ctx, true);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let permit = sessions
+            .session_queue
+            .acquire("alice-own")
+            .await
+            .expect("permit");
+        let deletion = zeroclaw_spawn::spawn!(async move {
+            alice
+                .handle_session_delete(&json!({"session_id": "alice-own"}))
+                .await
+        });
+        wait_for_session_admission_waiter(&ctx, "alice-own").await;
+        set_alice_administrator(&ctx, false);
+        drop(permit);
+        let deleted = tokio::time::timeout(std::time::Duration::from_secs(10), deletion)
+            .await
+            .expect("the deletion settles")
+            .expect("the deletion does not panic")
+            .expect("a demoted principal still deletes its own session");
+        assert_eq!(deleted["deleted"], json!(true));
+        assert!(sessions.get_generation("alice-own").await.is_none());
+        assert!(acp_store.load_session("alice-own").unwrap().is_none());
+    }
+
+    /// After its ownership check, `session/prompt` can still wait for a
+    /// provisional provider binding to be confirmed and for the session's
+    /// provider-update lock. An administrator demoted during either wait is
+    /// refused with the uniform denial before the turn reaches the provider:
+    /// the turn ends failed for the client, and bob's session keeps its
+    /// incarnation and durable history.
+    #[tokio::test]
+    async fn queued_prompt_rechecks_ownership_after_its_provider_waits() {
+        use crate::rpc::types::ChatMode;
+        use zeroclaw_infra::acp_session_store::AcpSessionRestore;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config_with_administrator_alice(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&fixture.ctx);
+        scoped_dispatcher(&ctx, 4343)
+            .await
+            .handle_session_new_for_test(
+                &json!({"agent_alias": "test-agent", "session_id": "victim", "chat_mode": "acp"}),
+            )
+            .await
+            .expect("bob creates his session");
+        let baseline_messages = acp_store
+            .load_session("victim")
+            .unwrap()
+            .expect("bob's durable row")
+            .messages
+            .len();
+
+        for wait in ["provider-update lock", "pending generation"] {
+            // Bob's live incarnation, with a provider that reports any call
+            // and, for the second wait, a binding not yet confirmed.
+            let pending = Arc::new(tokio::sync::Notify::new());
+            let mut incarnation = owned_test_session(Some("user:bob"), ChatMode::Acp);
+            if wait == "pending generation" {
+                incarnation = incarnation.with_pending_generation(Arc::clone(&pending));
+            }
+            sessions.remove("victim").await;
+            sessions
+                .insert("victim".into(), incarnation)
+                .await
+                .expect("bob's incarnation is published");
+            let generation = sessions
+                .get_generation("victim")
+                .await
+                .expect("bob's session is live");
+            let (provider, mut provider_calls, release) = gated_provider();
+            drop(release);
+            sessions
+                .get_agent("victim")
+                .await
+                .expect("bob's session is live")
+                .lock()
+                .await
+                .set_model_provider(Box::new(provider));
+
+            set_alice_administrator(&ctx, true);
+            let (alice, mut frames) = roster_peer(&ctx, 4242).await;
+            let update = if wait == "provider-update lock" {
+                Some(
+                    sessions
+                        .lock_model_provider_update("victim")
+                        .await
+                        .expect("the live session has an update lock"),
+                )
+            } else {
+                None
+            };
+            let waiting = sessions.model_provider_update_waiting();
+            let prompt = zeroclaw_spawn::spawn!(async move {
+                alice
+                    .handle_session_prompt(&json!({
+                        "session_id": "victim",
+                        "prompt": "hi",
+                        "client_turn_generation": 3,
+                    }))
+                    .await
+            });
+            // Both waits come after the post-admission ownership check, which
+            // alice still passes as an administrator.
+            if update.is_some() {
+                tokio::time::timeout(std::time::Duration::from_secs(5), waiting.notified())
+                    .await
+                    .expect("the prompt parks on the provider-update lock");
+            } else {
+                // A parked waiter holds its own handle on the pending marker.
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while Arc::strong_count(&pending) < 3 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the prompt parks on the pending generation");
+            }
+            set_alice_administrator(&ctx, false);
+            drop(update);
+            sessions
+                .clear_pending_generation("victim", generation)
+                .await;
+            let err = tokio::time::timeout(std::time::Duration::from_secs(10), prompt)
+                .await
+                .expect("the prompt settles")
+                .expect("the prompt does not panic")
+                .expect_err(wait);
+            assert_eq!(err.code, FORBIDDEN, "{wait}: {}", err.message);
+            assert!(
+                err.message.contains("not found or not owned"),
+                "{wait}: uniform denial, got {}",
+                err.message
+            );
+            let mut notifications = Vec::new();
+            while let Ok(frame) = frames.try_recv() {
+                notifications.push(serde_json::from_str::<Value>(&frame).expect("valid frame"));
+            }
+            assert_turn_refused(&notifications, "victim", 3);
+            assert!(
+                provider_calls.try_recv().is_err(),
+                "{wait}: the turn never reaches bob's provider"
+            );
+            assert_eq!(
+                sessions.get_generation("victim").await,
+                Some(generation),
+                "{wait}: bob's incarnation is untouched"
+            );
+            assert!(
+                matches!(
+                    acp_store.load_session_for_restore("victim").unwrap(),
+                    AcpSessionRestore::Restorable(data)
+                        if data.principal_id.as_deref() == Some("user:bob")
+                            && data.messages.len() == baseline_messages
+                ),
+                "{wait}: bob's durable row is neither killed nor written"
+            );
+        }
+    }
+
+    /// `session/new` judges the owner of a session it resumes by the
+    /// authority in force when it acts. A stamp that still carries a revoked
+    /// administrator bypass does not rebind another principal's live session,
+    /// and a resume queued behind admission when the demotion lands is
+    /// refused before it restores another principal's reaped ACP or chat
+    /// session. The demoted principal still resumes its own sessions.
+    #[tokio::test]
+    async fn demoted_administrator_cannot_resume_a_foreign_session_with_a_stale_stamp() {
+        use zeroclaw_infra::acp_session_store::AcpSessionRestore;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config_with_administrator_alice(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&fixture.ctx);
+        // Each connection's same-mode `session/new` would otherwise evict its
+        // idle siblings, and these sessions must stay where the test puts them.
+        let open = |sid: &str, mode: &str| {
+            json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+                "chat_mode": mode,
+                "keep_siblings": true,
+            })
+        };
+        let bob = scoped_dispatcher(&ctx, 4343).await;
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        for (owner, sid, mode) in [
+            (&bob, "bob-live", "acp"),
+            (&bob, "bob-acp", "acp"),
+            (&bob, "bob-chat", "chat"),
+            (&alice, "alice-acp", "acp"),
+        ] {
+            owner
+                .handle_session_new_for_test(&open(sid, mode))
+                .await
+                .unwrap_or_else(|err| panic!("{sid}: {err:?}"));
+        }
+        for reaped in ["bob-acp", "bob-chat", "alice-acp"] {
+            assert!(sessions.remove(reaped).await, "{reaped} was live");
+        }
+        // An interrupted turn that restoring bob's ACP session would recover
+        // into its durable history: a refused resume must not write it.
+        acp_store
+            .begin_turn_checkpoint(
+                "bob-acp",
+                "interrupted",
+                &[ConversationMessage::Chat(ChatMessage::user("unfinished"))],
+            )
+            .unwrap();
+        let bob_acp_messages = acp_store
+            .load_session("bob-acp")
+            .unwrap()
+            .expect("bob's durable row")
+            .messages
+            .len();
+
+        // `handle_session_new_for_test` skips the gate, so alice's connection
+        // keeps its administrator stamp after the demotion.
+        set_alice_administrator(&ctx, false);
+        scoped_dispatcher(&ctx, 4242)
+            .await
+            .handle_session_new_for_test(&open("alice-live", "acp"))
+            .await
+            .expect("the demoted principal creates a session of her own");
+        let generation = sessions
+            .get_generation("bob-live")
+            .await
+            .expect("bob's session is live");
+        let err = alice
+            .handle_session_new_for_test(&open("bob-live", "acp"))
+            .await
+            .expect_err("a stale administrator stamp must not rebind bob's session");
+        assert_eq!(err.code, FORBIDDEN, "{}", err.message);
+        assert!(
+            err.message.contains("not found or not owned"),
+            "{}",
+            err.message
+        );
+        assert_eq!(sessions.get_generation("bob-live").await, Some(generation));
+        alice
+            .handle_session_new_for_test(&open("alice-live", "acp"))
+            .await
+            .expect("the same stale stamp still rebinds her own session");
+
+        // A resume queued behind admission when the demotion lands.
+        for (sid, mode, own) in [
+            ("bob-acp", "acp", false),
+            ("bob-chat", "chat", false),
+            ("alice-acp", "acp", true),
+        ] {
+            set_alice_administrator(&ctx, true);
+            let queued = scoped_dispatcher(&ctx, 4242).await;
+            let permit = sessions.session_queue.acquire(sid).await.expect("permit");
+            let params = open(sid, mode);
+            let resume =
+                zeroclaw_spawn::spawn!(
+                    async move { queued.handle_session_new_for_test(&params).await }
+                );
+            wait_for_session_admission_waiter(&ctx, sid).await;
+            set_alice_administrator(&ctx, false);
+            drop(permit);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), resume)
+                .await
+                .expect("the resume settles")
+                .expect("the resume does not panic");
+            if own {
+                result
+                    .unwrap_or_else(|err| panic!("{sid}: alice resumes her own session: {err:?}"));
+                assert!(
+                    sessions.get_agent(sid).await.is_some(),
+                    "{sid} is live again"
+                );
+                continue;
+            }
+            let err = result.expect_err(sid);
+            assert_eq!(err.code, FORBIDDEN, "{sid}: {}", err.message);
+            assert!(
+                err.message.contains("not found or not owned"),
+                "{sid}: uniform denial, got {}",
+                err.message
+            );
+            assert!(
+                sessions.get_agent(sid).await.is_none(),
+                "{sid}: bob's session is not restored"
+            );
+        }
+        assert!(
+            matches!(
+                acp_store.load_session_for_restore("bob-acp").unwrap(),
+                AcpSessionRestore::Restorable(data)
+                    if data.principal_id.as_deref() == Some("user:bob")
+                        && data.messages.len() == bob_acp_messages
+            ),
+            "bob's reaped ACP row keeps its owner and unrecovered history"
+        );
+        assert_eq!(
+            chat_backend
+                .get_session_metadata("rpc_bob-chat")
+                .and_then(|meta| meta.principal_id),
+            Some("user:bob".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn delete_does_not_capture_a_session_created_after_its_initial_lookup() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -17623,7 +18338,7 @@ mod tests {
                 None,
                 None,
                 Some("user:alice"),
-                |_, _, _| Ok::<(), JsonRpcError>(()),
+                |_, _, _, _| Ok::<(), JsonRpcError>(()),
             )
             .await;
         assert!(
@@ -17642,7 +18357,7 @@ mod tests {
                     None,
                     None,
                     Some("user:bob"),
-                    |_, _, _| Ok::<(), JsonRpcError>(()),
+                    |_, _, _, _| Ok::<(), JsonRpcError>(()),
                 )
                 .await
                 .unwrap()
@@ -17658,7 +18373,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    |_, _, _| Ok::<(), JsonRpcError>(()),
+                    |_, _, _, _| Ok::<(), JsonRpcError>(()),
                 )
                 .await
                 .unwrap()

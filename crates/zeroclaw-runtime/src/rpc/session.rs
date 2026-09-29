@@ -535,13 +535,15 @@ impl SessionStore {
     /// be adopted. A scoped mismatch is reported as absent, never as a
     /// distinguishable denial.
     ///
-    /// `authorize` then judges the record's agent alias, workspace and
-    /// forwarded environment before
-    /// anything changes, under the same lock that guards the claim, so a
-    /// caller it refuses neither takes ownership nor observes a session that
-    /// was swapped in after the check. Its refusal comes back as `Ok(Some(Err))`.
-    /// Ownership and binding are both required: one says the session is the
-    /// caller's, the other that the caller may still run it.
+    /// `authorize` then judges the record's agent alias, workspace, forwarded
+    /// environment and owning principal before anything changes, under the
+    /// same lock that guards the claim, so a caller it refuses neither takes
+    /// ownership nor observes a session that was swapped in after the check.
+    /// Its refusal comes back as `Ok(Some(Err))`. Ownership and binding are
+    /// both required: one says the session is the caller's, the other that
+    /// the caller may still run it. Receiving the owner lets a caller that
+    /// resolves its authority inside `authorize` judge ownership by that same
+    /// resolution, not only by an `expected_owner` computed before the lock.
     pub async fn resume_existing<E>(
         &self,
         id: &str,
@@ -550,7 +552,12 @@ impl SessionStore {
         interaction_surface: Option<crate::agent::prompt::InteractionSurface>,
         owner_tui_id: Option<String>,
         expected_owner: Option<&str>,
-        authorize: impl FnOnce(&str, &str, Option<&crate::tools::ForwardedEnvironment>) -> Result<(), E>,
+        authorize: impl FnOnce(
+            &str,
+            &str,
+            Option<&crate::tools::ForwardedEnvironment>,
+            Option<&str>,
+        ) -> Result<(), E>,
     ) -> Result<Option<Result<ResumedRpcSession, E>>, &'static str> {
         let mut sessions = self.sessions.lock().await;
         let Some(session) = sessions.get_mut(id) else {
@@ -574,6 +581,7 @@ impl SessionStore {
             &session.agent_alias,
             &session.workspace_dir,
             session.forwarded_environment.as_ref(),
+            session.owner_principal_id.as_deref(),
         ) {
             return Ok(Some(Err(refused)));
         }
