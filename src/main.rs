@@ -989,11 +989,15 @@ enum EstopLevelArg {
     ToolFreeze,
 }
 
+/// Package version and `git describe` build id stamped by `build.rs`, so
+/// `--version` and `status` name the commit this binary was built from.
+const VERSION: &str = env!("ZEROCLAW_VERSION");
+
 /// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.
 #[derive(Parser, Debug)]
 #[command(name = "zeroclaw")]
 #[command(author = "theonlyhennygod")]
-#[command(version)]
+#[command(version = VERSION)]
 // i18n-exempt: clap derive help — framework requires a compile-time literal
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
 struct Cli {
@@ -7845,14 +7849,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             }
             println!("{}", t("cli-status-title", "🦀 ZeroClaw Status"));
             println!();
-            println!(
-                "{}",
-                ta(
-                    "cli-status-version",
-                    &[("v", env!("CARGO_PKG_VERSION"))],
-                    "Version"
-                )
-            );
+            println!("{}", ta("cli-status-version", &[("v", VERSION)], "Version"));
             println!(
                 "{}",
                 ta(
@@ -12529,7 +12526,7 @@ async fn run_gateway_if_enabled(
     host: &str,
     port: u16,
     config: zeroclaw::config::Config,
-    tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    event_bus: Option<zeroclaw_runtime::observability::EventBus>,
 ) -> anyhow::Result<()> {
     let default_host = config.gateway.host.clone();
     let default_port = config.gateway.port;
@@ -12553,7 +12550,7 @@ async fn run_gateway_if_enabled(
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None, None, None, readiness,
+        host, port, config, event_bus, None, None, None, None, None, None, None, readiness,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade
@@ -12578,7 +12575,7 @@ async fn run_gateway_if_enabled(
     _host: &str,
     _port: u16,
     _config: zeroclaw::config::Config,
-    _tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    _event_bus: Option<zeroclaw_runtime::observability::EventBus>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("Gateway feature is not enabled. Rebuild with --features gateway")
 }
