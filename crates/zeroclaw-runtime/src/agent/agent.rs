@@ -1976,7 +1976,6 @@ impl Agent {
             Arc::clone(&self.memory),
             scope.clone(),
         ));
-        self.memory = Arc::clone(&routed);
         // The memory-backed tools each captured a clone of the shared handle at
         // assembly. Swapping only `self.memory` would leave those tools writing
         // and reading the shared plane while the agent reports its memory as
@@ -1984,7 +1983,8 @@ impl Agent {
         // exercises them. This never adds a tool name: memory tools already
         // withdrawn by policy narrowing stay withdrawn.
         self.tools
-            .rebind_memory_tools(routed, Arc::clone(&self.memory_security));
+            .rebind_memory_tools(Arc::clone(&routed), Arc::clone(&self.memory_security))?;
+        self.memory = routed;
         self.memory_principal = Some(scope);
         Ok(())
     }
@@ -5403,6 +5403,15 @@ mod tests {
     /// BEHAVIOUR, not merely the `memory_principal()` marker.
     #[tokio::test]
     async fn routing_rebinds_the_memory_tools_to_the_owners_private_plane() {
+        assert_routing_rebinds_memory_tools(false).await;
+    }
+
+    #[tokio::test]
+    async fn routing_rebinds_memory_skill_aliases_to_the_owners_private_plane() {
+        assert_routing_rebinds_memory_tools(true).await;
+    }
+
+    async fn assert_routing_rebinds_memory_tools(aliased: bool) {
         use zeroclaw_api::memory_traits::PrincipalScope;
         use zeroclaw_tools::memory_recall::MemoryRecallTool;
         use zeroclaw_tools::memory_store::MemoryStoreTool;
@@ -5429,7 +5438,7 @@ mod tests {
             None,
             Arc::clone(&security),
         ));
-        let raw_tools: Vec<Box<dyn Tool>> = vec![
+        let mut raw_tools: Vec<Box<dyn Tool>> = vec![
             Box::new(MemoryStoreTool::new(
                 Arc::clone(&shared),
                 Arc::clone(&security),
@@ -5437,6 +5446,42 @@ mod tests {
             Box::new(MemoryRecallTool::new(Arc::clone(&shared))),
             Box::new(crate::tools::ArcToolRef(delegate.clone() as Arc<dyn Tool>)),
         ];
+        if aliased {
+            raw_tools.extend([
+                Box::new(zeroclaw_tools::memory_export::MemoryExportTool::new(
+                    Arc::clone(&shared),
+                )) as Box<dyn Tool>,
+                Box::new(zeroclaw_tools::memory_forget::MemoryForgetTool::new(
+                    Arc::clone(&shared),
+                    Arc::clone(&security),
+                )),
+                Box::new(zeroclaw_tools::memory_purge::MemoryPurgeTool::new(
+                    Arc::clone(&shared),
+                    Arc::clone(&security),
+                )),
+            ]);
+            raw_tools = raw_tools.into_iter().map(|tool| {
+                if tool.name() == "delegate" { return tool; }
+                let definition: crate::skills::SkillTool = serde_json::from_value(serde_json::json!({
+                    "name": tool.name(), "description": "private memory alias", "kind": "builtin"
+                })).unwrap();
+                let locked = if tool.name() == "memory_store" {
+                    HashMap::from([("category".to_string(), "core".to_string())])
+                } else {
+                    HashMap::new()
+                };
+                Box::new(crate::tools::skill_tool::SkillBuiltinTool::new(
+                    "notes", &definition, Arc::from(tool), locked,
+                )) as Box<dyn Tool>
+            }).collect();
+        }
+        let tool_name = |name: &str| {
+            if aliased {
+                format!("notes__{name}")
+            } else {
+                name.to_string()
+            }
+        };
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(Box::new(MockModelProvider {
@@ -5469,10 +5514,12 @@ mod tests {
         let store = agent
             .tools
             .iter()
-            .find(|t| t.name() == "memory_store")
+            .find(|t| t.name() == tool_name("memory_store"))
             .expect("memory_store present");
         store
-            .execute(serde_json::json!({"key": "note", "content": "alice-note"}))
+            .execute(
+                serde_json::json!({"key": "note", "content": "alice-note", "category": "daily"}),
+            )
             .await
             .unwrap();
 
@@ -5488,13 +5535,25 @@ mod tests {
             .unwrap()
             .expect("alice's private plane holds the note");
         assert_eq!(on_alice.content, "alice-note");
+        if aliased {
+            assert_eq!(
+                on_alice.category,
+                MemoryCategory::Core,
+                "locked arguments survive routing"
+            );
+            assert!(
+                store.parameters_schema()["properties"]
+                    .get("category")
+                    .is_none()
+            );
+        }
 
         // The recall tool must read ONLY alice's plane: neither the shared
         // sentinel nor mallory's sentinel is reachable through the tool.
         let recall = agent
             .tools
             .iter()
-            .find(|t| t.name() == "memory_recall")
+            .find(|t| t.name() == tool_name("memory_recall"))
             .expect("memory_recall present");
         let result = recall
             .execute(serde_json::json!({"query": "secret"}))
@@ -5509,6 +5568,90 @@ mod tests {
             !text.contains("mallory-secret"),
             "recall leaked another owner's plane: {text}"
         );
+        agent
+            .route_memory_to_principal(PrincipalScope::new("user:alice"))
+            .unwrap();
+        assert!(
+            agent
+                .route_memory_to_principal(PrincipalScope::new("user:mallory"))
+                .is_err()
+        );
+        if aliased {
+            assert_eq!(
+                agent.tools.len(),
+                6,
+                "routing must preserve the admitted names"
+            );
+            assert!(!agent.tools.iter().any(|tool| tool.name() == "memory_store"));
+            let export = agent
+                .tools
+                .iter()
+                .find(|t| t.name() == tool_name("memory_export"))
+                .unwrap()
+                .execute(serde_json::json!({}))
+                .await
+                .unwrap();
+            assert!(export.success, "{export:?}");
+            assert!(export.output.contains("alice-note"));
+            assert!(!export.output.contains("shared-secret"));
+            assert!(!export.output.contains("mallory-secret"));
+            let forget = agent
+                .tools
+                .iter()
+                .find(|t| t.name() == tool_name("memory_forget"))
+                .unwrap()
+                .execute(serde_json::json!({"key": "note"}))
+                .await
+                .unwrap();
+            assert!(forget.success, "{forget:?}");
+            assert!(
+                shared
+                    .get_for_principal(&PrincipalScope::new("user:alice"), "note")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            for scope in [PrincipalScope::new("user:alice"), mallory.clone()] {
+                shared
+                    .store_for_principal(
+                        &scope,
+                        "purge",
+                        "private row",
+                        MemoryCategory::Core,
+                        Some("session"),
+                    )
+                    .await
+                    .unwrap();
+            }
+            shared
+                .store("purge", "shared row", MemoryCategory::Core, Some("session"))
+                .await
+                .unwrap();
+            let purge = agent
+                .tools
+                .iter()
+                .find(|t| t.name() == tool_name("memory_purge"))
+                .unwrap()
+                .execute(serde_json::json!({"session_id": "session"}))
+                .await
+                .unwrap();
+            assert!(purge.success, "{purge:?}");
+            assert!(
+                shared
+                    .get_for_principal(&PrincipalScope::new("user:alice"), "purge")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                shared
+                    .get_for_principal(&mallory, "purge")
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(shared.get("purge").await.unwrap().is_some());
+        }
     }
 
     /// An owned session must not route while its registry holds a delegate
