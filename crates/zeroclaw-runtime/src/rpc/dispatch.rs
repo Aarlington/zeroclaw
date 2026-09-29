@@ -1877,7 +1877,8 @@ impl RpcDispatcher {
 
     /// Apply a principal's posture to an agent: narrow its tool surface to the
     /// selector, and, for a principal without operator reach, disable nested
-    /// tools that cannot carry the principal through. A handler that
+    /// tools that cannot carry the principal through and withhold the
+    /// session-data tools that have no principal-aware view. A handler that
     /// re-resolved its principal after waiting for admission passes the fresh
     /// grants here: the stamped copy is only as current as the last gate, and
     /// a prompt that queued before its principal was narrowed must execute
@@ -1906,6 +1907,11 @@ impl RpcDispatcher {
                 .any(|alias| alias.as_str() == zeroclaw_api::grants::WILDCARD)
         {
             agent.disable_principal_unaware_nested_tools();
+        }
+        // Wildcard selectors included: a tool grant is not a grant over every
+        // principal's session records.
+        if !grants.admin {
+            agent.withhold_principal_unaware_session_tools();
         }
     }
 
@@ -24134,6 +24140,222 @@ mod tests {
         assert!(!chat_list.output.contains(current));
         assert!(!chat_list.output.contains(previous));
         assert!(!chat_list.output.contains(foreign));
+    }
+
+    async fn assert_session_data_tools_withheld(
+        agent: &Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
+        foreign_session_key: &str,
+    ) {
+        let agent = agent.lock().await;
+        for name in zeroclaw_tools::PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES {
+            assert!(
+                agent.execute_tool_for_test(name, json!({})).await.is_none(),
+                "{name} must be withheld"
+            );
+        }
+        let send = agent
+            .dispatch_tool_for_test(
+                "sessions_send",
+                json!({"session_id": foreign_session_key, "message": "harmless probe"}),
+            )
+            .await;
+        assert!(!send.success);
+        assert_eq!(send.output, "Unknown tool: sessions_send");
+        let history = agent
+            .dispatch_tool_for_test(
+                "sessions_history",
+                json!({"session_id": foreign_session_key}),
+            )
+            .await;
+        assert!(!history.success);
+        assert_eq!(history.output, "Unknown tool: sessions_history");
+        let names = agent.tool_names();
+        assert!(names.contains(&"sessions_current"), "{names:?}");
+        assert!(!names.contains(&"spawn_subagent"), "{names:?}");
+        assert!(names.contains(&"delegate"), "{names:?}");
+        assert!(
+            agent
+                .delegate_tool
+                .as_ref()
+                .expect("the registry built a delegate")
+                .withholds_session_data_tools(),
+            "the retained delegate must withhold the tools from its children"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principals_cannot_reach_session_data_tools_even_with_wildcard_selectors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = two_user_config(&tmp);
+        // Hold the coarse `tools:execute` grant so the wildcard tool selector
+        // is in force instead of narrowing every tool away.
+        config
+            .permission_profiles
+            .get_mut("member")
+            .unwrap()
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Tools,
+                vec![zeroclaw_api::grants::Verb::Execute],
+            );
+        let data_dir = config.data_dir.clone();
+        let (operator, sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&operator.ctx);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let bob = scoped_dispatcher(&ctx, 4343).await;
+
+        bob.handle_session_new_for_test(&json!({
+            "agent_alias": "test-agent",
+            "session_id": "bob-chat",
+        }))
+        .await
+        .expect("bob creates his chat session");
+        let bob_key = "rpc_bob-chat";
+        chat_backend
+            .append(bob_key, &ChatMessage::user("bob private marker"))
+            .unwrap();
+        let bob_transcript = serde_json::to_value(chat_backend.load(bob_key)).unwrap();
+
+        for (sid, chat_mode) in [("alice-acp", "acp"), ("alice-chat", "chat")] {
+            alice
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "session_id": sid,
+                    "chat_mode": chat_mode,
+                }))
+                .await
+                .expect("alice creates her session");
+            let agent = sessions
+                .get_agent(sid)
+                .await
+                .expect("alice's session is live");
+            assert_session_data_tools_withheld(&agent, bob_key).await;
+        }
+
+        assert!(sessions.remove("alice-acp").await);
+        let rehydrated = alice
+            .rehydrate_reaped_session("alice-acp", alice.stamped_grants())
+            .await
+            .expect("alice may rehydrate her own session")
+            .expect("the reaped session rehydrates");
+        assert_session_data_tools_withheld(&rehydrated, bob_key).await;
+
+        assert_eq!(
+            serde_json::to_value(chat_backend.load(bob_key)).unwrap(),
+            bob_transcript,
+            "bob's transcript must be unchanged"
+        );
+
+        // The shared operator keeps the tools, and its delegate withholds
+        // nothing from its children.
+        operator
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "operator-acp",
+                "chat_mode": "acp",
+            }))
+            .await
+            .expect("the operator creates a session");
+        let operator_agent = sessions.get_agent("operator-acp").await.unwrap();
+        let operator_agent = operator_agent.lock().await;
+        let names = operator_agent.tool_names();
+        for name in zeroclaw_tools::PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES
+            .iter()
+            .chain(&["sessions_current", "spawn_subagent"])
+        {
+            assert!(names.contains(name), "the operator keeps {name}: {names:?}");
+        }
+        assert!(
+            !operator_agent
+                .delegate_tool
+                .as_ref()
+                .expect("the registry built a delegate")
+                .withholds_session_data_tools()
+        );
+    }
+
+    /// Withholding follows the principal's current grants: an administrator's
+    /// session keeps the session-data tools, and loses them when the
+    /// principal is demoted and its next prompt applies the fresh grants.
+    #[tokio::test]
+    async fn demoted_principal_loses_session_data_tools_at_its_next_prompt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = principal_test_config(&tmp, &["*"], &["*"]);
+        config
+            .risk_profiles
+            .get_mut("test-profile")
+            .unwrap()
+            .allowed_tools
+            .extend(
+                zeroclaw_tools::PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES
+                    .iter()
+                    .chain(&["sessions_current"])
+                    .map(|name| (*name).to_string()),
+            );
+        config
+            .permission_profiles
+            .get_mut("principal-test")
+            .unwrap()
+            .admin = true;
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+        let dispatcher = bind_test_principal(dispatcher).await;
+        dispatcher
+            .handle_session_new_for_test(
+                &json!({"agent_alias":"test-agent","session_id":"principal-demoted"}),
+            )
+            .await
+            .unwrap();
+        let handle = sessions.get_agent("principal-demoted").await.unwrap();
+        {
+            let agent = handle.lock().await;
+            let names = agent.tool_names();
+            for name in zeroclaw_tools::PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES
+                .iter()
+                .chain(&["spawn_subagent"])
+            {
+                assert!(
+                    names.contains(name),
+                    "an administrator keeps {name}: {names:?}"
+                );
+            }
+        }
+
+        {
+            let mut cfg = dispatcher.ctx.config.write();
+            cfg.permission_profiles
+                .get_mut("principal-test")
+                .unwrap()
+                .admin = false;
+            dispatcher.ctx.auth.refresh_from_config(&cfg).unwrap();
+        }
+        let current = dispatcher.current_prompt_authority().unwrap();
+        let grants = current
+            .stamped_grants()
+            .expect("the refreshed handle carries grants")
+            .clone();
+        let mut agent = handle.lock().await;
+        current.apply_principal_grants_to_agent(&grants, &mut agent);
+        let names = agent.tool_names();
+        for name in zeroclaw_tools::PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES
+            .iter()
+            .chain(&["spawn_subagent"])
+        {
+            assert!(
+                !names.contains(name),
+                "a demoted principal keeps {name}: {names:?}"
+            );
+        }
+        for name in ["sessions_current", "calculator", "delegate"] {
+            assert!(names.contains(&name), "{name} stays: {names:?}");
+        }
+        assert!(
+            agent
+                .delegate_tool
+                .as_ref()
+                .expect("the registry built a delegate")
+                .withholds_session_data_tools()
+        );
     }
 
     #[tokio::test]
