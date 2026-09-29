@@ -580,6 +580,11 @@ pub struct AllToolsResult {
     pub reaction_handle: PerToolChannelHandle,
     pub poll_handle: Option<PerToolChannelHandle>,
     pub escalate_handle: Option<PerToolChannelHandle>,
+    /// The session memory route this factory's memory-starting tools share
+    /// (`spawn_subagent` here, and the pipeline `assemble` mints). The sealed
+    /// registry keeps it and pins it when its session is pinned to an owner.
+    /// `None` when the tool set was not built by this factory.
+    pub session_memory: Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
     /// Pre-boxed Arcs of every tool (before policy filter). Used by
     /// skill-scoped builtin elevation to resolve targets at registration.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
@@ -615,6 +620,7 @@ impl AllToolsResult {
             channel_room_handle: None,
             reaction_handle: Arc::new(RwLock::new(HashMap::new())),
             poll_handle: None,
+            session_memory: None,
             escalate_handle: None,
             unfiltered_tool_arcs: Vec::new(),
             #[cfg(test)]
@@ -1327,6 +1333,9 @@ fn all_tools_with_runtime_on_thread(
     // of each taking a full `Config` clone: registry construction (per agent
     // build and per channel-message turn) previously paid three deep copies.
     let root_config_shared = Arc::new(root_config.clone());
+    // One route for the tools here that start memory work of their own; the
+    // sealed registry pins it when its session is pinned to an owner.
+    let session_memory = Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default());
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             shell_tool
@@ -1416,7 +1425,8 @@ fn all_tools_with_runtime_on_thread(
                 security.clone(),
             )
             .with_subagent_caller(is_subagent_caller)
-            .with_execution_capability(execution_capability.clone()),
+            .with_execution_capability(execution_capability.clone())
+            .with_session_memory(Arc::clone(&session_memory)),
         ),
         Arc::new(SendMessageToPeerTool::new_with_live_config_and_capability(
             Arc::clone(&root_config_shared),
@@ -2292,6 +2302,7 @@ fn all_tools_with_runtime_on_thread(
                     channel_room_handle,
                     reaction_handle,
                     poll_handle: Some(poll_handle),
+                    session_memory: Some(session_memory),
                     escalate_handle,
                 };
             }
@@ -2508,6 +2519,7 @@ fn all_tools_with_runtime_on_thread(
         channel_room_handle,
         reaction_handle,
         poll_handle: Some(poll_handle),
+        session_memory: Some(session_memory),
         escalate_handle,
         #[cfg(test)]
         delegate_tool: built_delegate_tool,

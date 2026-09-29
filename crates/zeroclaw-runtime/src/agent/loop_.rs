@@ -1302,6 +1302,20 @@ pub fn apply_text_tool_prompt_policy(
     expose_text_tool_protocol
 }
 
+/// The memory a run's SOP engine uses: the caller-supplied handle when there
+/// is one, so a pinned session's child keeps its SOP audit on the owner's
+/// plane, else the agent's memory as before.
+async fn sop_memory(
+    config: &Config,
+    agent_alias: &str,
+    memory_override: Option<&Arc<dyn Memory>>,
+) -> Result<Arc<dyn Memory>> {
+    match memory_override {
+        Some(memory) => Ok(Arc::clone(memory)),
+        None => zeroclaw_memory::create_memory_for_agent(config, agent_alias, None).await,
+    }
+}
+
 #[derive(Default)]
 pub struct AgentRunOverrides {
     pub security: Option<Arc<SecurityPolicy>>,
@@ -1549,6 +1563,11 @@ pub async fn run(
             .map(|(ty, alias, cfg)| (ty, alias.to_string(), cfg.clone()));
         let agent_model_provider = agent_provider_resolved.as_ref().map(|(_, _, cfg)| cfg);
 
+        // A caller-supplied handle (a pinned session's routed memory, handed to
+        // its subagent child) is the only memory this run may use: the SOP
+        // engine below takes it too rather than building the agent's shared
+        // memory.
+        let memory_override = overrides.memory.clone();
         let mem: Arc<dyn Memory> = if memory_free {
             Arc::new(zeroclaw_memory::NoneMemory::new("none"))
         } else {
@@ -1599,7 +1618,7 @@ pub async fn run(
         // path injects a real channel-delivering adapter.
         let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
-                zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
+                sop_memory(&config, agent_alias, memory_override.as_ref()).await?;
             let (engine, audit) = crate::sop::build_sop_engine_with_capability(
                 config.sop.clone(),
                 &config.decision_models,
@@ -4034,6 +4053,19 @@ async fn process_message_inner(
 
 #[cfg(test)]
 mod tests {
+    /// A run started with a caller's memory (a pinned
+    /// session's child) gives its SOP engine that same handle rather than
+    /// building the agent's shared memory.
+    #[tokio::test]
+    async fn sop_engine_memory_follows_the_callers_memory() {
+        let supplied: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("routed"));
+        let config = Config::default();
+        let used = super::sop_memory(&config, "alpha", Some(&supplied))
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&used, &supplied));
+    }
+
     use super::{
         apply_text_tool_prompt_policy, estimate_history_tokens, load_interactive_session_history,
         make_query_summary, maybe_inject_channel_delivery_defaults,
@@ -15794,6 +15826,7 @@ Let me check the result."#;
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             poll_handle: None,
+            session_memory: None,
             escalate_handle: None,
             channel_room_handle: None,
             unfiltered_tool_arcs: Vec::new(),

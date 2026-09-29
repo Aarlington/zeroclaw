@@ -1983,6 +1983,12 @@ impl Agent {
             Arc::clone(&self.memory),
             scope.clone(),
         ));
+        // Tools that start memory work of their own (a pipeline's memory steps,
+        // a subagent's child run) follow the session through a shared route
+        // rather than the registry entries rebound below. Pinned first, so a
+        // registry that cannot carry the owner refuses before anything moves.
+        self.tools
+            .pin_session_memory(Arc::clone(&routed), Arc::clone(&self.memory_security))?;
         self.memory = Arc::clone(&routed);
         // The memory-backed tools each captured a clone of the shared handle at
         // assembly. Swapping only `self.memory` would leave those tools writing
@@ -5628,6 +5634,213 @@ mod tests {
         assert!(
             !text.contains("mallory-secret"),
             "recall leaked another owner's plane: {text}"
+        );
+    }
+
+    /// An owned session assembled the way production assembles one: the real
+    /// tool factory and `assemble` over a shared SQLite memory, with the
+    /// pipeline allowed to run `memory_store`, then pinned to alice. Returns
+    /// the session and the shared backend both planes live in.
+    async fn factory_assembled_owned_session(tmp: &tempfile::TempDir) -> (Agent, Arc<dyn Memory>) {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+        let mut config = Config::default();
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+        config.agents.insert(
+            "alpha".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.pipeline.enabled = true;
+        config.pipeline.max_steps = 5;
+        config.pipeline.allowed_tools = vec!["memory_store".to_string()];
+        let shared: Arc<dyn Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).expect("sqlite memory"),
+        );
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let built = crate::tools::all_tools(
+            Arc::new(config.clone()),
+            &security,
+            &RiskProfileConfig::default(),
+            "alpha",
+            Arc::clone(&shared),
+            None,
+            None,
+            &zeroclaw_config::schema::BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &config,
+            None,
+            false,
+            None,
+        )
+        .expect("the tool factory builds");
+        let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
+            crate::tools::scoped::ScopedAssembly {
+                config: &config,
+                agent_alias: "alpha",
+                security: &security,
+                built,
+                skills: &[],
+                runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                caller_allowed: None,
+                connect_mcp: false,
+                connect_peripherals: false,
+                exclude_memory: false,
+                acp_delivery: false,
+                list_deferred_mcp_specs: false,
+                emit_assembly_logs: false,
+                mcp_registry: None,
+            },
+        )
+        .await;
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(Vec::new()),
+            }))
+            .tools(assembled.registry)
+            .memory(Arc::clone(&shared))
+            .memory_security(Arc::clone(&security))
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .expect("agent builds");
+        agent
+            .route_memory_to_principal(PrincipalScope::new("user:alice"))
+            .expect("an assembled registry carries its owner");
+        (agent, shared)
+    }
+
+    /// Through production assembly: the pipeline an owned
+    /// session runs writes its memory steps to the owner's private plane, not
+    /// through the `memory_store` it captured before the session was pinned.
+    #[tokio::test]
+    async fn a_pinned_sessions_pipeline_memory_step_lands_on_the_owners_plane() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (agent, shared) = factory_assembled_owned_session(&tmp).await;
+
+        let result = agent
+            .execute_tool_for_test(
+                "execute_pipeline",
+                serde_json::json!({"steps": [
+                    {"tool": "memory_store", "args": {"key": "p-marker", "content": "P-MARKER"}}
+                ]}),
+            )
+            .await
+            .expect("the pipeline is registered")
+            .unwrap();
+        assert!(result.success, "{result:?}");
+        assert!(
+            shared.get("p-marker").await.unwrap().is_none(),
+            "an owned session's pipeline must not write the shared plane"
+        );
+        let owned = shared
+            .get_for_principal(&PrincipalScope::new("user:alice"), "p-marker")
+            .await
+            .unwrap()
+            .expect("the owner's private plane holds the pipeline's row");
+        assert_eq!(owned.content, "P-MARKER");
+    }
+
+    /// Through production assembly: the child an owned
+    /// session's `spawn_subagent` starts is handed the session's routed memory,
+    /// and a write through that handle lands on the owner's plane. Before, the
+    /// child was handed nothing and built the agent's shared memory.
+    #[tokio::test]
+    async fn a_pinned_sessions_subagent_child_runs_on_the_owners_plane() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (agent, shared) = factory_assembled_owned_session(&tmp).await;
+
+        let sink = Arc::new(std::sync::Mutex::new(None));
+        crate::tools::spawn_subagent::CHILD_MEMORY_SINK
+            .scope(
+                Arc::clone(&sink),
+                agent.execute_tool_for_test(
+                    "spawn_subagent",
+                    serde_json::json!({"prompt": "remember C-MARKER"}),
+                ),
+            )
+            .await
+            .expect("spawn_subagent is registered")
+            .unwrap();
+        let handed = sink
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the child run was started")
+            .expect("the child is handed the session's memory, not left to build its own");
+        assert!(
+            Arc::ptr_eq(&handed, &agent.memory),
+            "the child runs over the session's routed memory"
+        );
+        handed
+            .store("c-marker", "C-MARKER", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert!(
+            shared.get("c-marker").await.unwrap().is_none(),
+            "the child's memory must not reach the shared plane"
+        );
+        assert!(
+            shared
+                .get_for_principal(&PrincipalScope::new("user:alice"), "c-marker")
+                .await
+                .unwrap()
+                .is_some(),
+            "the child's memory is the owner's private plane"
+        );
+    }
+
+    /// Fails closed: a registry holding `spawn_subagent` that was not assembled
+    /// from the factory carries no route, so pinning the session is refused
+    /// and nothing about its memory moves.
+    #[tokio::test]
+    async fn a_registry_that_cannot_carry_the_owner_refuses_the_pin() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shared: Arc<dyn Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).expect("sqlite memory"),
+        );
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let raw_tools: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::SpawnSubagentTool::new(
+            Arc::new(Config::default()),
+            "alpha",
+            Arc::clone(&security),
+        ))];
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(Vec::new()),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                raw_tools,
+            ))
+            .memory(Arc::clone(&shared))
+            .memory_security(Arc::clone(&security))
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .expect("agent builds");
+
+        let refused = agent.route_memory_to_principal(PrincipalScope::new("user:alice"));
+        assert!(refused.is_err(), "the pin must be refused");
+        assert!(agent.memory_principal().is_none());
+        assert!(
+            Arc::ptr_eq(&agent.memory, &shared),
+            "the session's memory did not move"
         );
     }
 
