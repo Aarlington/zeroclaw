@@ -9127,7 +9127,7 @@ mod tests {
         let uri = format!("http://{}", listener.local_addr().unwrap());
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let capture = Arc::clone(&captured);
-        let server = tokio::spawn(async move {
+        let server = ::zeroclaw_spawn::spawn!(async move {
             for response in [
                 chat_completion_tool_call(
                     "memory_store",
