@@ -19276,8 +19276,12 @@ pub struct SecurityConfig {
     /// serialized. A legacy table may carry a plaintext `client_secret`, so
     /// keeping it would let `GET /api/config` disclose that credential to a
     /// `config:read` principal (the raw value sits outside the derived
-    /// `mask_secrets`). Discarding it here keeps the dead secret out of both
-    /// the API response and the next on-disk save.
+    /// `mask_secrets`). Discarding it here keeps the dead secret out of the
+    /// loaded configuration, and so out of the API response and the next
+    /// on-disk save. The deserializer still materializes the input before
+    /// dropping it and the file loader holds the raw text, so this is a
+    /// retention boundary, not zeroization. `save_dirty` removes the table
+    /// from the file itself (see `retire_nevis_table_in_doc`).
     #[serde(
         default,
         skip_serializing,
@@ -19310,7 +19314,9 @@ impl Default for SecurityConfig {
 /// discard every value it carries. Only a content-free presence marker
 /// (`Some(Value::Null)`) is returned, so validation can warn once while the
 /// removed integration's fields — including any plaintext `client_secret` —
-/// never reach memory, `GET /api/config`, or the next on-disk save.
+/// are never retained in the loaded configuration, and so never reach
+/// `GET /api/config` or the next on-disk save. (The value is materialized
+/// transiently to be discarded; this is not zeroization.)
 fn deserialize_inert_nevis<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -24724,7 +24730,9 @@ impl Config {
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                 "[security.nevis] is deprecated and ignored: the Nevis integration was \
                  removed. Configure [oidc.<alias>] with [users] / [permission_profiles] \
-                 instead; the table will be dropped on the next config save."
+                 instead; the table is removed from config.toml on the next save \
+                 (full or incremental). Backups of config.toml taken before that save \
+                 still carry the original table and any client_secret in it."
             );
         }
 
@@ -25747,6 +25755,15 @@ impl Config {
             apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table)?;
         }
 
+        // Retire the inert `[security.nevis]` table from the file. The shim
+        // discards its content at load and `skip_serializing` keeps it out of
+        // a full save, but an incremental save reparses the original file and
+        // rewrites only dirty paths, so without this the retired table (and a
+        // plaintext `client_secret` it may carry) would outlive every ordinary
+        // CLI/dashboard edit. Only that one table is touched; comments and
+        // unrelated ciphertext elsewhere in the file are preserved.
+        let retired_nevis = retire_nevis_table_in_doc(doc.as_table_mut());
+
         // Stamp the current schema version. An incremental save writes
         // current-schema-shaped sections (e.g. the dashboard saving a single
         // `agents.<name>.model_provider`) but `schema_version` is never a
@@ -25763,6 +25780,19 @@ impl Config {
         let toml_str = ensure_blank_line_before_sections(&doc.to_string());
 
         write_config_atomically(&config_path, &toml_str).await?;
+        if retired_nevis {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "retired_config": "security.nevis",
+                    })),
+                "Removed the retired [security.nevis] table from config.toml on save; \
+                 the Nevis integration no longer exists. Backups taken before this \
+                 save still carry the original table."
+            );
+        }
         self.clear_dirty();
         Ok(())
     }
@@ -26903,6 +26933,34 @@ fn delete_path_in_doc(root: &mut toml_edit::Table, segs: &[&str]) {
         };
     }
     cursor.remove(last);
+}
+
+/// Remove the retired `[security.nevis]` table from an on-disk document
+/// during an incremental save. Returns whether anything was removed.
+///
+/// The removed Nevis integration's table is tolerated at load (see
+/// `deserialize_inert_nevis`), but the loaded config carries none of its
+/// content, so nothing about it is ever a dirty path and `save_dirty` would
+/// otherwise carry the original bytes forward indefinitely. Both spellings
+/// are handled: a `[security.nevis]` header (a `nevis` key inside the
+/// `security` table) and a dotted or inline `nevis = { ... }` entry. A
+/// `[security]` table left empty by the removal is dropped too, so a file
+/// that only had the retired table does not keep an empty header; a
+/// `[security]` table with other keys keeps them and their comments.
+fn retire_nevis_table_in_doc(root: &mut toml_edit::Table) -> bool {
+    let Some(security) = root
+        .get_mut("security")
+        .and_then(|item| item.as_table_like_mut())
+    else {
+        return false;
+    };
+    if security.remove("nevis").is_none() {
+        return false;
+    }
+    if security.is_empty() {
+        root.remove("security");
+    }
+    true
 }
 
 /// Same `TableLike` traversal as `delete_path_in_doc`, for the same
@@ -40362,6 +40420,238 @@ role_mapping = [{ nevis_role = "admin", zeroclaw_permissions = ["all"] }]
             !serialized_default.contains("nevis"),
             "default configs must not emit the removed table"
         );
+    }
+
+    /// Seed an on-disk config that still carries the retired
+    /// `[security.nevis]` table next to unrelated content an incremental save
+    /// must preserve: a comment, another `[security]` key, and ciphertext in
+    /// an unrelated section. Returns the loaded config, pointed at the file.
+    fn seed_config_with_legacy_nevis_table(dir: &std::path::Path) -> Config {
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"schema_version = 3
+
+# Operator note that must survive the save.
+[security]
+trust_daemon_uid = false
+
+[security.nevis]
+enabled = true
+instance_url = "https://nevis.example.com"
+client_secret = "NEVIS-PLAINTEXT-SECRET"
+role_mapping = [{ nevis_role = "admin", zeroclaw_permissions = ["all"] }]
+
+[observability]
+backend = "none"
+
+[channels.telegram.main]
+bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
+"#,
+        )
+        .unwrap();
+        let mut config: Config = toml::from_str(&std::fs::read_to_string(&config_path).unwrap())
+            .expect("a config carrying the retired table still loads");
+        config.config_path = config_path;
+        config
+    }
+
+    #[test]
+    async fn save_dirty_removes_retired_nevis_table_from_disk() {
+        // The shim discards the table's content at load and `skip_serializing`
+        // keeps it out of a full save, but `save_dirty` reparses the ORIGINAL
+        // file and rewrites only dirty paths. Nothing about the shim is ever
+        // dirty, so without an explicit retirement step an unrelated edit
+        // through the CLI or dashboard would carry the original bytes (secret
+        // included) forward indefinitely, and the load-time warning would fire
+        // on every start despite promising removal on the next save.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = seed_config_with_legacy_nevis_table(tmp.path());
+        assert_eq!(config.security.nevis, Some(serde_json::Value::Null));
+
+        // An unrelated dirty path drives the save.
+        config.observability.backend = ObservabilityBackend::Otel;
+        config.mark_dirty("observability.backend");
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(
+            !written.contains("nevis"),
+            "an incremental save must remove the retired table; got:\n{written}"
+        );
+        assert!(
+            !written.contains("NEVIS-PLAINTEXT-SECRET"),
+            "the retired table's secret must not survive an incremental save; got:\n{written}"
+        );
+        // Unrelated content is untouched: the dirty value lands, the sibling
+        // `[security]` key and its comment stay, and ciphertext elsewhere is
+        // carried through byte-for-byte.
+        assert!(written.contains("backend = \"otel\""), "got:\n{written}");
+        assert!(
+            written.contains("trust_daemon_uid = false"),
+            "got:\n{written}"
+        );
+        assert!(
+            written.contains("# Operator note that must survive the save."),
+            "got:\n{written}"
+        );
+        assert!(
+            written.contains("bot_token = \"enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE\""),
+            "got:\n{written}"
+        );
+
+        // A second load no longer sees the table (so validation stops
+        // warning), and a second incremental save is a clean no-op for it.
+        let mut reloaded: Config = toml::from_str(&written).unwrap();
+        assert_eq!(reloaded.security.nevis, None);
+        reloaded.config_path = tmp.path().join("config.toml");
+        reloaded.observability.backend = ObservabilityBackend::None;
+        reloaded.mark_dirty("observability.backend");
+        reloaded.save_dirty().await.unwrap();
+        let rewritten = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(!rewritten.contains("nevis"), "got:\n{rewritten}");
+        assert!(
+            rewritten.contains("trust_daemon_uid = false"),
+            "got:\n{rewritten}"
+        );
+    }
+
+    #[test]
+    async fn save_dirty_nevis_success_is_logged_only_after_atomic_replace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = seed_config_with_legacy_nevis_table(tmp.path());
+        let original = std::fs::read_to_string(&config.config_path).unwrap();
+        config.observability.backend = ObservabilityBackend::Otel;
+        config.mark_dirty("observability.backend");
+        let dirty = config.dirty_paths.clone();
+
+        // A directory prevents the pre-commit backup copy on every platform,
+        // without relying on permissions that an elevated runner can bypass.
+        let backup_path = tmp.path().join("config.toml.bak");
+        std::fs::create_dir(&backup_path).unwrap();
+        let mut rx = capture_log_events();
+        let test_case = "nevis-atomic-save-boundary";
+        let retirement_events = |rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>| {
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if event
+                    .pointer("/attributes/test_case")
+                    .and_then(|v| v.as_str())
+                    == Some(test_case)
+                    && event
+                        .pointer("/attributes/retired_config")
+                        .and_then(|v| v.as_str())
+                        == Some("security.nevis")
+                {
+                    events.push(event);
+                }
+            }
+            events
+        };
+        let error = ::zeroclaw_log::scope!(test_case: test_case, => config.save_dirty())
+            .await
+            .expect_err("blocked backup must prevent config replacement");
+        assert!(
+            error.to_string().contains("Failed to create config backup"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config.config_path).unwrap(),
+            original
+        );
+        assert_eq!(
+            config.dirty_paths, dirty,
+            "failed save must remain retryable"
+        );
+        assert!(
+            retirement_events(&mut rx).is_empty(),
+            "failed replacement must not announce removal"
+        );
+
+        std::fs::remove_dir(backup_path).unwrap();
+        ::zeroclaw_log::scope!(test_case: test_case, => config.save_dirty())
+            .await
+            .unwrap();
+        let written = std::fs::read_to_string(&config.config_path).unwrap();
+        assert!(!written.contains("nevis"));
+        assert!(!written.contains("NEVIS-PLAINTEXT-SECRET"));
+        assert!(config.dirty_paths.is_empty());
+        let events = retirement_events(&mut rx);
+        assert_eq!(
+            events.len(),
+            1,
+            "successful retry emits one retirement event: {events:?}"
+        );
+        assert_eq!(
+            events[0].pointer("/event/outcome").and_then(|v| v.as_str()),
+            Some("success")
+        );
+
+        ::zeroclaw_log::scope!(test_case: test_case, => config.save_dirty())
+            .await
+            .unwrap();
+        assert!(
+            retirement_events(&mut rx).is_empty(),
+            "a no-op save must not announce another removal"
+        );
+    }
+
+    #[test]
+    async fn save_removes_retired_nevis_table_from_disk() {
+        // The full-save path already omits the field through
+        // `skip_serializing`; pin it against the same fixture so the two save
+        // paths cannot drift apart on the retirement promise.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = seed_config_with_legacy_nevis_table(tmp.path());
+        config.save().await.unwrap();
+        let written = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(!written.contains("nevis"), "got:\n{written}");
+        assert!(
+            !written.contains("NEVIS-PLAINTEXT-SECRET"),
+            "got:\n{written}"
+        );
+        assert!(
+            written.contains("trust_daemon_uid = false"),
+            "got:\n{written}"
+        );
+    }
+
+    #[test]
+    async fn retire_nevis_table_in_doc_handles_every_spelling() {
+        // `[security.nevis]` header form, leaving a sibling key behind.
+        let mut doc: toml_edit::DocumentMut =
+            "[security]\ntrust_daemon_uid = false\n\n[security.nevis]\nenabled = true\n"
+                .parse()
+                .unwrap();
+        assert!(retire_nevis_table_in_doc(doc.as_table_mut()));
+        let out = doc.to_string();
+        assert!(!out.contains("nevis"), "got:\n{out}");
+        assert!(out.contains("trust_daemon_uid = false"), "got:\n{out}");
+
+        // Inline-table form under a dotted key.
+        let mut doc: toml_edit::DocumentMut =
+            "security.nevis = { enabled = true, client_secret = \"x\" }\n"
+                .parse()
+                .unwrap();
+        assert!(retire_nevis_table_in_doc(doc.as_table_mut()));
+        assert!(!doc.to_string().contains("nevis"));
+
+        // A `[security]` table that held only the retired table is dropped
+        // rather than left as an empty header.
+        let mut doc: toml_edit::DocumentMut = "[security.nevis]\nenabled = true\n".parse().unwrap();
+        assert!(retire_nevis_table_in_doc(doc.as_table_mut()));
+        assert!(!doc.to_string().contains("security"), "got:\n{}", doc);
+
+        // Nothing to do: a config without the table is untouched, byte for byte.
+        let original = "[security]\ntrust_daemon_uid = false\n";
+        let mut doc: toml_edit::DocumentMut = original.parse().unwrap();
+        assert!(!retire_nevis_table_in_doc(doc.as_table_mut()));
+        assert_eq!(doc.to_string(), original);
+
+        // No `[security]` table at all.
+        let mut doc: toml_edit::DocumentMut =
+            "[observability]\nbackend = \"none\"\n".parse().unwrap();
+        assert!(!retire_nevis_table_in_doc(doc.as_table_mut()));
     }
 
     #[test]
