@@ -1209,6 +1209,17 @@ impl DelegateTool {
         }))
     }
 
+    fn memory_tool_name_for_target<'a>(&self, tool: &'a dyn Tool) -> &'a str {
+        // Only owned aliases participate in target-memory substitution.
+        // Unowned aliases retain their captured caller handle; canonical
+        // memory tools retain their existing target substitution.
+        if self.principal_scope.read().is_some() {
+            tool.builtin_target_name().unwrap_or_else(|| tool.name())
+        } else {
+            tool.name()
+        }
+    }
+
     fn memory_tools_for_target(
         memory: Arc<dyn Memory>,
         security: Arc<SecurityPolicy>,
@@ -4174,9 +4185,8 @@ impl DelegateTool {
                     let parent_tools = self.parent_tools.read();
                     parent_tools.iter().any(|tool| {
                         self.security.is_tool_allowed(tool.name())
-                            && zeroclaw_tools::MEMORY_TOOL_NAMES.contains(
-                                &tool.builtin_target_name().unwrap_or_else(|| tool.name()),
-                            )
+                            && zeroclaw_tools::MEMORY_TOOL_NAMES
+                                .contains(&self.memory_tool_name_for_target(tool.as_ref()))
                             && Self::delegate_admits_with_mcp(&tool_policy, tool.name())
                     })
                 };
@@ -4304,7 +4314,7 @@ impl DelegateTool {
                 let mut filtered: Vec<Box<dyn Tool>> = bounded_base_tools
                     .iter()
                     .map(|tool| {
-                        let target_name = tool.builtin_target_name().unwrap_or_else(|| tool.name());
+                        let target_name = self.memory_tool_name_for_target(tool.as_ref());
                         let replacement = match target_memory_tools.get(target_name) {
                             Some(target) if tool.builtin_target_name().is_some() => tool
                                 .with_builtin_target(Arc::clone(target))
@@ -8812,6 +8822,121 @@ mod tests {
         assert!(result.success, "agentic delegate failed: {result:?}");
         assert!(result.output.contains("memory workflow done"));
         assert_stored_for_target_only(&fixture, "sync-key").await;
+    }
+
+    #[tokio::test]
+    async fn unowned_bounded_memory_aliases_keep_caller_with_canonical_target_siblings() {
+        for canonical_siblings in [false, true] {
+            let mut fixture = delegate_memory_fixture(None).await;
+            let mut config = fixture.tool.root_config.as_deref().unwrap().clone();
+            let profile = config.risk_profiles.get_mut("agentic_test").unwrap();
+            let alias_names = [
+                "notes__memory_store".to_string(),
+                "notes__memory_recall".to_string(),
+            ];
+            profile.allowed_tools.extend(alias_names.clone());
+            profile.auto_approve.extend(alias_names);
+            fixture.tool.security = Arc::new(SecurityPolicy::for_agent(&config, "caller").unwrap());
+            fixture.tool.risk_profiles = Arc::new(config.risk_profiles.clone());
+            fixture.tool.root_config = Some(Arc::new(config));
+            let canonical = fixture.tool.parent_tools.read().clone();
+            let mut parent: Vec<Arc<dyn Tool>> = canonical
+                .iter()
+                .map(|tool| {
+                    let definition: crate::skills::SkillTool = serde_json::from_value(json!({
+                    "name": tool.name(), "description": "captured memory alias", "kind": "builtin"
+                })).unwrap();
+                    Arc::new(crate::tools::SkillBuiltinTool::new(
+                        "notes",
+                        &definition,
+                        Arc::clone(tool),
+                        HashMap::new(),
+                    )) as Arc<dyn Tool>
+                })
+                .collect();
+            if canonical_siblings {
+                parent.extend(canonical);
+            }
+            fixture.tool.parent_tools = Arc::new(RwLock::new(parent));
+            for (uuid, content) in [
+                (&fixture.caller_uuid, "scopeprobe caller-shared"),
+                (&fixture.target_uuid, "scopeprobe target-shared"),
+            ] {
+                scoped_sqlite_memory(Arc::clone(&fixture.inner_memory), uuid)
+                    .store("sentinel", content, MemoryCategory::Core, None)
+                    .await
+                    .unwrap();
+            }
+            assert!(fixture.tool.principal_scope.read().is_none());
+            for aliased in if canonical_siblings {
+                vec![true, false]
+            } else {
+                vec![true]
+            } {
+                let key = if aliased {
+                    "alias-write"
+                } else {
+                    "canonical-write"
+                };
+                let observed = Arc::new(std::sync::Mutex::new(String::new()));
+                let provider = MemoryStoreRecallThenFinalModelProvider {
+                    aliased,
+                    key,
+                    content: "scopeprobe write",
+                    recall_query: "scopeprobe",
+                    observed_recall: Some(Arc::clone(&observed)),
+                };
+                let result = fixture
+                    .tool
+                    .execute_agentic(
+                        "target",
+                        &fixture.target_config,
+                        "custom",
+                        "delegate-test-model",
+                        &provider,
+                        "store and recall memory",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+                let (expected_uuid, excluded_uuid, expected, excluded) = if aliased {
+                    (
+                        &fixture.caller_uuid,
+                        &fixture.target_uuid,
+                        "caller-shared",
+                        "target-shared",
+                    )
+                } else {
+                    (
+                        &fixture.target_uuid,
+                        &fixture.caller_uuid,
+                        "target-shared",
+                        "caller-shared",
+                    )
+                };
+                assert!(
+                    fixture
+                        .inner_memory
+                        .get_for_agent(key, expected_uuid)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    fixture
+                        .inner_memory
+                        .get_for_agent(key, excluded_uuid)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                let recalled = observed.lock().unwrap().clone();
+                assert!(recalled.contains(expected), "{recalled}");
+                assert!(!recalled.contains(excluded), "{recalled}");
+                assert!(recalled.contains("scopeprobe write"), "{recalled}");
+            }
+        }
     }
 
     #[tokio::test]
