@@ -5988,7 +5988,7 @@ mod tests {
         assert!(Arc::ptr_eq(&handed, &owned));
     }
 
-    /// A one-step manual SOP in `mode`, as a session's `sop_execute` runs it.
+    /// A two-step manual SOP in `mode`, as a session's `sop_execute` runs it.
     fn audit_test_sop(mode: crate::sop::types::SopExecutionMode) -> crate::sop::types::Sop {
         use crate::sop::types::*;
         Sop {
@@ -5998,12 +5998,20 @@ mod tests {
             priority: SopPriority::Normal,
             execution_mode: mode,
             triggers: vec![SopTrigger::Manual],
-            steps: vec![SopStep {
-                number: 1,
-                title: "Step one".into(),
-                body: "Do step one".into(),
-                ..SopStep::default()
-            }],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "Step two".into(),
+                    body: "Do step two".into(),
+                    ..SopStep::default()
+                },
+            ],
             cooldown_secs: 0,
             max_concurrent: 1,
             location: None,
@@ -6159,25 +6167,57 @@ mod tests {
             .next()
             .cloned()
             .expect("the run is active");
-        let advanced = agent
-            .execute_tool_for_test(
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .get_run(&run_id)
+                .and_then(|run| run.memory_owner.clone()),
+            Some(PrincipalScope::new("user:alice")),
+            "the run records the session's owner"
+        );
+        let advance_queue = crate::sop::executor::new_live_action_queue();
+        let advanced = crate::sop::executor::scope_live_action_queue(
+            Arc::clone(&advance_queue),
+            agent.execute_tool_for_test(
                 "sop_advance",
                 serde_json::json!({
                     "run_id": run_id,
                     "status": "completed",
                     "output": "P-SOP-STEP-OUTPUT-MARKER",
                 }),
+            ),
+        )
+        .await
+        .expect("sop_advance is registered")
+        .unwrap();
+        assert!(advanced.success, "{advanced:?}");
+        // The next step `sop_advance` queues carries the owner's logger too.
+        let advance_audit = crate::sop::executor::drain_live_actions(&advance_queue)
+            .first()
+            .and_then(|action| action.audit.clone())
+            .expect("the advanced run queues its next step with an audit logger");
+        advance_audit
+            .log_step_result(
+                &run_id,
+                &crate::sop::types::SopStepResult {
+                    step_number: 9,
+                    status: crate::sop::types::SopStepStatus::Completed,
+                    output: "P-ADVANCE-QUEUED-MARKER".into(),
+                    started_at: "2026-09-30T00:00:00Z".into(),
+                    completed_at: None,
+                    effective_agent: None,
+                    tool_calls: Vec::new(),
+                },
             )
             .await
-            .expect("sop_advance is registered")
             .unwrap();
-        assert!(advanced.success, "{advanced:?}");
 
         queued_audit
             .log_step_result(
                 &run_id,
                 &crate::sop::types::SopStepResult {
-                    step_number: 1,
+                    step_number: 8,
                     status: crate::sop::types::SopStepStatus::Completed,
                     output: "P-QUEUED-STEP-MARKER".into(),
                     started_at: "2026-09-30T00:00:00Z".into(),
@@ -6193,7 +6233,8 @@ mod tests {
         assert!(
             !on_shared.contains("P-SOP-PAYLOAD-MARKER")
                 && !on_shared.contains("P-SOP-STEP-OUTPUT-MARKER")
-                && !on_shared.contains("P-QUEUED-STEP-MARKER"),
+                && !on_shared.contains("P-QUEUED-STEP-MARKER")
+                && !on_shared.contains("P-ADVANCE-QUEUED-MARKER"),
             "an owned session's SOP audit must not reach the shared plane:\n{on_shared}"
         );
         let on_alice = sop_audit_rows(&shared, Some(&PrincipalScope::new("user:alice"))).await;
@@ -6208,6 +6249,10 @@ mod tests {
         assert!(
             on_alice.contains("P-QUEUED-STEP-MARKER"),
             "the queued run's step results are audited on the owner's plane:\n{on_alice}"
+        );
+        assert!(
+            on_alice.contains("P-ADVANCE-QUEUED-MARKER"),
+            "the step `sop_advance` queued is audited on the owner's plane:\n{on_alice}"
         );
     }
 

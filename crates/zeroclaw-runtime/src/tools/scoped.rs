@@ -67,9 +67,10 @@ impl ScopedToolRegistry {
 
     /// Pin the session memory route this registry's memory-starting tools
     /// share to `memory`, the session owner's routed handle. The pipeline's
-    /// memory steps and `spawn_subagent`'s child runs then use it; the memory
-    /// tools the pipeline captured and the memory a child would build for
-    /// itself both point at the agent's shared plane.
+    /// memory steps, `spawn_subagent`'s child runs and the SOP tools' audit
+    /// then use it; the memory tools the pipeline captured, the memory a
+    /// child would build for itself and the SOP audit logger the tools were
+    /// built with all point at the shared plane.
     ///
     /// Skill wrappers that captured either tool at assembly hold the same
     /// instances, so they follow the pin too. Fails closed: a registry that
@@ -87,7 +88,11 @@ impl ScopedToolRegistry {
         let starts_memory_work = self.0.iter().any(|tool| {
             matches!(
                 tool.name(),
-                tools::SpawnSubagentTool::NAME | tools::PipelineTool::NAME
+                tools::SpawnSubagentTool::NAME
+                    | tools::PipelineTool::NAME
+                    | "sop_execute"
+                    | "sop_advance"
+                    | "sop_approve"
             )
         });
         if starts_memory_work {

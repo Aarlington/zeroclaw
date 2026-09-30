@@ -2891,6 +2891,27 @@ impl OwnedAgentExecution {
     }
 }
 
+/// The memory a SOP step agent runs over. A step of an owned session or run
+/// keeps the owner: the step agent's memory is the owner's plane for that
+/// agent, the same plane `memory/*` serves for this owner and agent, and a
+/// registry the factory builds over it is pinned to it. An unowned step gets
+/// the step agent's own memory.
+pub(crate) async fn step_agent_memory(
+    config: &zeroclaw_config::schema::Config,
+    alias: &str,
+    api_key: Option<&str>,
+    owner: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
+) -> Result<Arc<dyn zeroclaw_memory::Memory>> {
+    let memory = zeroclaw_memory::create_memory_for_agent(config, alias, api_key).await?;
+    Ok(match owner {
+        Some(owner) => Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            memory,
+            owner.clone().with_agent(Some(alias.to_string())),
+        )),
+        None => memory,
+    })
+}
+
 /// Re-assemble `alias`'s per-agent execution context the way a fresh agent turn
 /// would: the agent's security policy, memory, gated tool registry (through the
 /// one [`crate::tools::scoped::ScopedToolRegistry::assemble`] seam, connecting
@@ -2968,18 +2989,7 @@ pub(crate) async fn assemble_owned_execution_with_admission(
     let resolved_key = config
         .resolved_model_provider_for_agent(alias)
         .and_then(|(_, _, cfg)| cfg.api_key.clone());
-    let memory =
-        zeroclaw_memory::create_memory_for_agent(config, alias, resolved_key.as_deref()).await?;
-    // A step of an owned session keeps the owner: the step agent's memory is
-    // the owner's plane for that agent, the same plane `memory/*` serves for
-    // this owner and agent. The factory then pins the step registry to it.
-    let memory: Arc<dyn zeroclaw_memory::Memory> = match memory_owner {
-        Some(owner) => Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
-            memory,
-            owner.clone().with_agent(Some(alias.to_string())),
-        )),
-        None => memory,
-    };
+    let memory = step_agent_memory(config, alias, resolved_key.as_deref(), memory_owner).await?;
 
     // Mirror a fresh agent turn: the headless SOP driver reaches this agent's
     // tools via `crate::agent::run`, which builds its runtime from
@@ -3294,19 +3304,52 @@ async fn drive_live_sop_actions(
                     // that agent's execution context; same-agent steps keep the
                     // parent context unchanged.
                     let step_alias = step.agent.as_deref();
+                    // The run's owner, stored on the run, decides where its audit
+                    // rows and its steps' memory go, whichever session resumes
+                    // it. A run owned by someone other than this session's owner
+                    // runs under that owner: its step agent is re-assembled over
+                    // the owner's plane even when it is this loop's own agent.
+                    let run_owner = {
+                        let guard = match queued.engine.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        guard
+                            .get_run(&run_id)
+                            .and_then(|run| run.memory_owner.clone())
+                    };
+                    let run_audit =
+                        crate::sop::audit::audit_for_run(queued.audit.clone(), run_owner.as_ref());
+                    let session_owner = sop_reassembly
+                        .as_ref()
+                        .and_then(|reassembly| reassembly.memory_owner.clone());
+                    let foreign_owner = run_owner.is_some() && run_owner != session_owner;
                     // `agent_alias` is this loop's EFFECTIVE identity: a
                     // re-assembled sub-loop runs with its step agent as its own
                     // alias, so this comparison is correct at every nesting
                     // depth — a depth >= 2 step naming the outer agent compares
                     // against the re-assembled child's alias and re-assembles
                     // instead of inheriting the child's scope.
-                    let needs_reassembly = step_needs_reassembly(agent_alias, step_alias);
+                    let needs_reassembly =
+                        step_needs_reassembly(agent_alias, step_alias) || foreign_owner;
+                    let reassembly_alias = step_alias.or(agent_alias);
+                    // A foreign owner's execution is memoized apart from this
+                    // session's own, so neither is ever served for the other.
+                    let cache_key = reassembly_alias.map(|alias| match &run_owner {
+                        Some(owner) if foreign_owner => {
+                            format!("{alias}\u{0}{}", owner.principal_id)
+                        }
+                        _ => alias.to_string(),
+                    });
                     let mut assembly_error: Option<anyhow::Error> = None;
                     if needs_reassembly {
-                        let alias =
-                            step_alias.expect("needs_reassembly implies a step agent alias");
+                        // A foreign-owned step with no agent to run as (it names
+                        // none and this loop has no identity) gets the empty alias,
+                        // which fails assembly below, so the step is refused.
+                        let alias = reassembly_alias.unwrap_or_default();
+                        let cache_key = cache_key.as_deref().unwrap_or_default();
                         if let Some(reassembly) = sop_reassembly.as_ref() {
-                            let cache_matches = exec_cache.get(alias).is_some_and(|owned| {
+                            let cache_matches = exec_cache.get(cache_key).is_some_and(|owned| {
                                 owned.matches_admission(execution_admission.as_ref())
                             });
                             if !cache_matches {
@@ -3315,15 +3358,15 @@ async fn drive_live_sop_actions(
                                     reassembly.live_config.clone(),
                                     alias,
                                     Arc::clone(&queued.engine),
-                                    queued.audit.clone(),
+                                    run_audit.clone(),
                                     approval,
-                                    reassembly.memory_owner.as_ref(),
+                                    run_owner.as_ref().or(reassembly.memory_owner.as_ref()),
                                     execution_admission.clone(),
                                 )
                                 .await
                                 {
                                     Ok(owned) => {
-                                        exec_cache.insert(alias.to_string(), owned);
+                                        exec_cache.insert(cache_key.to_string(), owned);
                                     }
                                     Err(e) => assembly_error = Some(e),
                                 }
@@ -3373,9 +3416,7 @@ async fn drive_live_sop_actions(
                         // re-assembled step agent when reassembly applied,
                         // otherwise the parent turn's (byte-identical to today).
                         let owned = if needs_reassembly {
-                            exec_cache.get(
-                                step_alias.expect("needs_reassembly implies a step agent alias"),
-                            )
+                            cache_key.as_deref().and_then(|key| exec_cache.get(key))
                         } else {
                             None
                         };
@@ -3725,7 +3766,7 @@ async fn drive_live_sop_actions(
                         step_result.clone(),
                     )?;
                     crate::sop::executor::audit_sop_step(
-                        queued.audit.as_deref(),
+                        run_audit.as_deref(),
                         &run_id,
                         &step_result,
                         finished_run.as_ref(),
@@ -7084,12 +7125,36 @@ mod sop_step_reassembly_tests {
         String,
         crate::sop::types::SopRunAction,
     ) {
-        start_single_step_with_capability(Some(step_agent), None)
+        start_single_step_for(Some(step_agent), None, None)
     }
 
     fn start_single_step_with_capability(
         step_agent: Option<&str>,
         capability: Option<crate::live_config_authority::AgentExecutionCapability>,
+    ) -> (
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        String,
+        crate::sop::types::SopRunAction,
+    ) {
+        start_single_step_for(step_agent, capability, None)
+    }
+
+    /// [`start_single_cross_agent_step`] for a run owned by `owner`.
+    fn start_single_cross_agent_step_for(
+        step_agent: &str,
+        owner: Option<zeroclaw_api::memory_traits::PrincipalScope>,
+    ) -> (
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        String,
+        crate::sop::types::SopRunAction,
+    ) {
+        start_single_step_for(Some(step_agent), None, owner)
+    }
+
+    fn start_single_step_for(
+        step_agent: Option<&str>,
+        capability: Option<crate::live_config_authority::AgentExecutionCapability>,
+        owner: Option<zeroclaw_api::memory_traits::PrincipalScope>,
     ) -> (
         Arc<std::sync::Mutex<crate::sop::SopEngine>>,
         String,
@@ -7135,7 +7200,9 @@ mod sop_step_reassembly_tests {
             payload: None,
             timestamp: "2026-07-16T00:00:00Z".to_string(),
         };
-        let action = engine.start_run("cross-agent", event).expect("run starts");
+        let action = engine
+            .start_run_for("cross-agent", event, None, owner)
+            .expect("run starts");
         let run_id = match &action {
             SopRunAction::ExecuteStep { run_id, step, .. } => {
                 assert_eq!(
@@ -7173,11 +7240,48 @@ mod sop_step_reassembly_tests {
         model_switch_callback: Option<ModelSwitchCallback>,
         exec_cache: &mut std::collections::HashMap<String, OwnedAgentExecution>,
     ) {
+        drive_step_with_audit(
+            engine,
+            action,
+            None,
+            parent_provider,
+            parent_tools,
+            observer,
+            history,
+            history_has_trim_breadcrumb,
+            event_tx,
+            new_messages_out,
+            agent_alias,
+            sop_reassembly,
+            model_switch_callback,
+            exec_cache,
+        )
+        .await;
+    }
+
+    /// [`drive_step`] with the audit logger the queued action carries.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_step_with_audit(
+        engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        action: crate::sop::types::SopRunAction,
+        audit: Option<Arc<crate::sop::SopAuditLogger>>,
+        parent_provider: &dyn ModelProvider,
+        parent_tools: &crate::tools::scoped::ScopedToolRegistry,
+        observer: &dyn crate::observability::Observer,
+        history: &mut Vec<ChatMessage>,
+        history_has_trim_breadcrumb: Option<&mut bool>,
+        event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
+        new_messages_out: Option<&mut Vec<ChatMessage>>,
+        agent_alias: Option<&str>,
+        sop_reassembly: Option<SopStepReassembly<'_>>,
+        model_switch_callback: Option<ModelSwitchCallback>,
+        exec_cache: &mut std::collections::HashMap<String, OwnedAgentExecution>,
+    ) {
         use crate::sop::executor::QueuedSopAction;
 
         let queued = QueuedSopAction {
             engine: Arc::clone(&engine),
-            audit: None,
+            audit,
             action,
         };
         let mut local_history_has_trim_breadcrumb = false;
@@ -7301,6 +7405,98 @@ mod sop_step_reassembly_tests {
                     .as_deref()
                     .is_some_and(|e| e.contains("principal-scoped")),
             "the driven step stores on the owner's plane or refuses for lack of principal scoping: {stored:?}"
+        );
+    }
+
+    /// A run owned by alice, driven in a session that is not hers (an
+    /// unowned one here, as an operator's session approving her run would
+    /// be), runs under alice: its step agent is re-assembled over alice's
+    /// plane even though the step names this loop's own agent, and memoized
+    /// apart from the session's own execution.
+    #[tokio::test]
+    async fn another_sessions_driver_runs_an_owned_run_under_its_owner() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config = memory_step_config(&tmp);
+        let owner = PrincipalScope::new("user:alice").with_agent(Some("stepper".to_string()));
+        let (engine, run_id, action) =
+            start_single_cross_agent_step_for("stepper", Some(owner.clone()));
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+            memory_owner: None,
+        };
+        // The driving session carries the daemon's shared audit logger.
+        let audit_memory: Arc<dyn zeroclaw_memory::Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new("sqlite", &tmp.path().join("audit")).unwrap(),
+        );
+        let shared_audit = Arc::new(crate::sop::SopAuditLogger::new(Arc::clone(&audit_memory)));
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![ChatMessage::system("parent system prompt")];
+        let mut exec_cache = std::collections::HashMap::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            drive_step_with_audit(
+                Arc::clone(&engine),
+                action,
+                Some(shared_audit),
+                &TextProvider,
+                &parent_tools,
+                &crate::observability::NoopObserver {},
+                &mut history,
+                None,
+                None,
+                None,
+                Some("stepper"),
+                Some(handle),
+                None,
+                &mut exec_cache,
+            ),
+        )
+        .await
+        .expect("the driver settles");
+        assert!(
+            !exec_cache.contains_key("stepper"),
+            "the owner's execution is not memoized as the session's own"
+        );
+        let category = zeroclaw_memory::MemoryCategory::Custom("sop".into());
+        let step_key = format!("sop_step_{run_id}_1");
+        let on_shared = audit_memory.list(Some(&category), None).await.unwrap();
+        assert!(
+            on_shared.iter().all(|row| row.key != step_key),
+            "the step is not audited through the session's shared logger"
+        );
+        let on_owner = audit_memory
+            .list_for_principal(&owner, Some(&category), None)
+            .await
+            .unwrap();
+        assert!(
+            on_owner.iter().any(|row| row.key == step_key),
+            "the step is audited on the run owner's plane"
+        );
+        let owned = exec_cache
+            .get("stepper\u{0}user:alice")
+            .expect("the driver re-assembled the step agent under the run's owner");
+        let stored = run_step_tool(
+            owned,
+            "memory_store",
+            serde_json::json!({"key": "f-marker", "content": "F-MARKER"}),
+        )
+        .await;
+        let step_shared = zeroclaw_memory::create_memory_for_agent(&config, "stepper", None)
+            .await
+            .unwrap();
+        assert!(
+            step_shared.get("f-marker").await.unwrap().is_none(),
+            "an owned run driven elsewhere must not write the step agent's shared plane: {stored:?}"
+        );
+        assert!(
+            stored.success
+                || stored
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("principal-scoped")),
+            "{stored:?}"
         );
     }
 

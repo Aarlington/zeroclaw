@@ -126,7 +126,14 @@ impl Tool for SopExecuteTool {
                 anyhow::Error::msg(format!("Engine lock poisoned: {e}"))
             })?;
 
-            match engine.start_run_owned(sop_name, event, self.initiator.as_deref()) {
+            // A run started in a session pinned to its owner belongs to that
+            // owner, and keeps its owner once it leaves this turn.
+            let memory_owner = self
+                .session_memory
+                .as_ref()
+                .and_then(|route| route.routed())
+                .and_then(|routed| routed.memory.principal_scope());
+            match engine.start_run_for(sop_name, event, self.initiator.as_deref(), memory_owner) {
                 Ok(action) => {
                     let run_id = action_run_id(&action);
                     let snapshot = run_id.and_then(|id| engine.get_run(id).cloned());
