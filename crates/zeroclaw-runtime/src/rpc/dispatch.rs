@@ -32110,6 +32110,265 @@ mod tests {
         );
     }
 
+    struct PrincipalHistoryProbe {
+        calls: std::sync::atomic::AtomicUsize,
+        results: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for PrincipalHistoryProbe {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "principal-history-probe"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for PrincipalHistoryProbe {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".into())
+        }
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let first = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            if !first {
+                *self.results.lock().unwrap() = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .filter(|message| message.role == "tool")
+                    .take(4)
+                    .map(|message| message.content.clone())
+                    .collect();
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: (!first).then(|| "probe complete".into()),
+                tool_calls: if first {
+                    [
+                        ("sessions_history", json!({"session_id":"rpc_victim"})),
+                        ("peek__history", json!({"session_id":"rpc_victim"})),
+                        ("calculator", json!({"function":"add", "values":[2,2]})),
+                        ("sessions_current", json!({})),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (name, args))| zeroclaw_providers::ToolCall {
+                        id: format!("probe-{index}"),
+                        name: name.into(),
+                        arguments: args.to_string(),
+                        extra_content: None,
+                    })
+                    .collect()
+                } else {
+                    Vec::new()
+                },
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    async fn install_principal_history_probe(
+        agent: &Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
+    ) -> Arc<std::sync::Mutex<Vec<String>>> {
+        let results = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut guard = agent.lock().await;
+        guard.set_tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher));
+        guard.set_model_provider(Box::new(PrincipalHistoryProbe {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            results: Arc::clone(&results),
+        }));
+        results
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn principal_native_history_uses_final_admission_and_monotonic_withholding() {
+        for boundary in ["provider", "prompt-agent", "prompt-task"] {
+            for demote in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let mut config = two_user_config_with_administrator_alice(&tmp);
+                config
+                    .permission_profiles
+                    .get_mut("member")
+                    .unwrap()
+                    .grants
+                    .insert(
+                        zeroclaw_api::grants::Resource::Tools,
+                        vec![zeroclaw_api::grants::Verb::Execute],
+                    );
+                let risk = config.risk_profiles.get_mut("test-profile").unwrap();
+                risk.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
+                risk.allowed_tools.extend(
+                    [
+                        "sessions_history",
+                        "sessions_current",
+                        "calculator",
+                        "delegate",
+                        "peek__history",
+                    ]
+                    .map(str::to_owned),
+                );
+                let bundle = tmp.path().join("skills");
+                std::fs::create_dir_all(bundle.join("peek")).unwrap();
+                std::fs::write(bundle.join("peek/SKILL.toml"), "[skill]\nname='peek'\ndescription='History boundary fixture'\n[[tools]]\nname='history'\ndescription='Read history'\nkind='builtin'\ncommand=''\ntarget='sessions_history'\n").unwrap();
+                config.skill_bundles.insert(
+                    "probe".into(),
+                    zeroclaw_config::schema::SkillBundleConfig {
+                        directory: Some(bundle.to_string_lossy().into_owned()),
+                        ..Default::default()
+                    },
+                );
+                config.agents.get_mut("test-agent").unwrap().skill_bundles = vec!["probe".into()];
+                let data_dir = config.data_dir.clone();
+                let (fixture, sessions, backend, _) =
+                    make_persistence_test_dispatcher(config, &data_dir);
+                let ctx = Arc::clone(&fixture.ctx);
+                scoped_dispatcher(&ctx, 4343).await.handle_session_new_for_test(&json!({"agent_alias":"test-agent", "session_id":"victim", "chat_mode":"chat"})).await.unwrap();
+                backend
+                    .append(
+                        "rpc_victim",
+                        &ChatMessage::assistant("foreign-history-marker"),
+                    )
+                    .unwrap();
+                let before = backend.load("rpc_victim");
+                let alice = Arc::new(scoped_dispatcher(&ctx, 4242).await);
+                alice.handle_session_new_for_test(&json!({"agent_alias":"test-agent", "session_id":"actor", "chat_mode":"chat"})).await.unwrap();
+                let agent = sessions.get_agent("actor").await.unwrap();
+                assert!(
+                    agent.lock().await.tool_names().contains(&"peek__history"),
+                    "the real registry must install the alias; loaded skills: {:?}",
+                    crate::skills::load_skills_for_agent_from_config(
+                        &ctx.config.read(),
+                        "test-agent"
+                    )
+                );
+                let results = install_principal_history_probe(&agent).await;
+                let provider_guard = if boundary == "provider" {
+                    Some(sessions.lock_model_provider_update("actor").await.unwrap())
+                } else {
+                    None
+                };
+                let provider_wait = sessions.model_provider_update_waiting();
+                let provider_arrived = provider_wait.notified();
+                let pause = if boundary == "provider" {
+                    None
+                } else {
+                    Some(sessions.set_test_effect_pause(boundary))
+                };
+                let call = Arc::clone(&alice);
+                let prompt = zeroclaw_spawn::spawn!(async move {
+                    call.handle_session_prompt(
+                        &json!({"session_id":"actor", "prompt":"probe foreign history"}),
+                    )
+                    .await
+                });
+                if let Some((arrived, _)) = &pause {
+                    tokio::time::timeout(std::time::Duration::from_secs(10), arrived.notified())
+                        .await
+                        .unwrap();
+                } else {
+                    tokio::time::timeout(std::time::Duration::from_secs(10), provider_arrived)
+                        .await
+                        .unwrap();
+                }
+                if demote {
+                    set_alice_administrator(&ctx, false);
+                }
+                drop(provider_guard);
+                if let Some((_, release)) = pause {
+                    release.notify_one();
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(10), prompt)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let output = results.lock().unwrap().clone();
+                assert_eq!(output.len(), 4, "{boundary}: {output:?}");
+                assert_eq!(
+                    output
+                        .iter()
+                        .filter(|text| text.contains("foreign-history-marker"))
+                        .count(),
+                    if demote { 0 } else { 2 },
+                    "{boundary}: {output:?}"
+                );
+                assert!(
+                    output.iter().any(|text| {
+                        let result: serde_json::Value = serde_json::from_str(text).unwrap();
+                        result["tool_call_id"] == "probe-2" && result["content"] == "4"
+                    }),
+                    "calculator remains executable: {output:?}"
+                );
+                assert!(
+                    output.iter().any(|text| text.contains("actor")),
+                    "sessions_current remains executable: {output:?}"
+                );
+                assert_eq!(
+                    serde_json::to_value(backend.load("rpc_victim")).unwrap(),
+                    serde_json::to_value(&before).unwrap()
+                );
+                if demote {
+                    assert_session_data_tools_withheld(&agent, "rpc_victim").await;
+                    set_alice_administrator(&ctx, true);
+                    let regrant = install_principal_history_probe(&agent).await;
+                    alice
+                        .handle_session_prompt(
+                            &json!({"session_id":"actor", "prompt":"regrant stays narrowed"}),
+                        )
+                        .await
+                        .unwrap();
+                    assert!(
+                        !regrant
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|text| text.contains("foreign-history-marker"))
+                    );
+                    assert_session_data_tools_withheld(&agent, "rpc_victim").await;
+                    sessions.remove("actor").await;
+                    alice.handle_session_new_for_test(&json!({"agent_alias":"test-agent", "session_id":"actor", "chat_mode":"chat"})).await.unwrap();
+                    let restored = sessions.get_agent("actor").await.unwrap();
+                    assert!(!Arc::ptr_eq(&agent, &restored));
+                    let promoted = install_principal_history_probe(&restored).await;
+                    alice
+                        .handle_session_prompt(
+                            &json!({"session_id":"actor", "prompt":"rehydrated admin control"}),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        promoted
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|text| text.contains("foreign-history-marker"))
+                            .count(),
+                        2
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn remote_session_lists_only_return_the_callers_live_sessions() {
         use zeroclaw_infra::session_queue::SessionActorQueue;

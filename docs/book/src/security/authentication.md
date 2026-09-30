@@ -400,6 +400,13 @@ demoted mid-session loses the tools at the next prompt. Like selector
 narrowing, it never gives them back to a live session. Admin principals and
 the shared operator keep them.
 
+A queued prompt resolves authority again on the exact Agent that will execute
+the turn, after provider reconciliation and Agent/task waits. The same admission
+applies withholding and protects prompt checkpoint or running-state writes
+after storage contention. A refused admission does not call the provider or
+persist a terminal turn. This is a turn-admission boundary, not continuous
+revocation of a turn that is already running.
+
 The withholding does not reach runs that execute later under the agent's
 own identity with the agent's configured tools: agent jobs created with
 `cron_add`, or given a new prompt with `cron_update` and started with
