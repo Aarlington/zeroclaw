@@ -1336,6 +1336,15 @@ fn all_tools_with_runtime_on_thread(
     // One route for the tools here that start memory work of their own; the
     // sealed registry pins it when its session is pinned to an owner.
     let session_memory = Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default());
+    // A registry built over memory that is already an owner's plane (a
+    // delegated target, a SOP step, or a child run of an owned session)
+    // belongs to that owner from the start. Pin its route now: nothing pins
+    // it later, and an empty route reads as an unowned session, so its
+    // spawner and pipeline would fall back to the agent's shared memory.
+    if memory.principal_scope().is_some() {
+        let pinned = session_memory.pin(Arc::clone(&memory), Arc::clone(security));
+        debug_assert!(pinned.is_ok(), "a fresh route holds no other handle");
+    }
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             shell_tool

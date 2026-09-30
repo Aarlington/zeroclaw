@@ -1302,6 +1302,21 @@ pub fn apply_text_tool_prompt_policy(
     expose_text_tool_protocol
 }
 
+/// The cross-agent SOP step handle for a run over `memory`. A run started
+/// with an owner's plane (a pinned session's subagent child) re-assembles its
+/// steps under that owner, so a step agent's memory is the owner's plane for
+/// that agent rather than its shared plane.
+fn sop_reassembly_over<'a>(
+    config: &'a Config,
+    memory: &Arc<dyn Memory>,
+) -> crate::agent::turn::SopStepReassembly<'a> {
+    crate::agent::turn::SopStepReassembly {
+        config,
+        live_config: None,
+        memory_owner: memory.principal_scope(),
+    }
+}
+
 /// The memory a run's SOP engine uses: the caller-supplied handle when there
 /// is one, so a pinned session's child keeps its SOP audit on the owner's
 /// plane, else the agent's memory as before.
@@ -2333,10 +2348,7 @@ pub async fn run(
                                 parent_agent_alias: None,
                                 turn_id: &turn_id,
                                 served_route_sink: None,
-                                sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
-                                    config: &config,
-                                    live_config: None,
-                                }),
+                                sop_reassembly: Some(sop_reassembly_over(&config, &mem)),
                             }),
                         ),
                     )
@@ -2941,10 +2953,7 @@ pub async fn run(
                                     parent_agent_alias: None,
                                     turn_id: &turn_id,
                                     served_route_sink: None,
-                                    sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
-                                        config: &config,
-                                        live_config: None,
-                                    }),
+                                    sop_reassembly: Some(sop_reassembly_over(&config, &mem)),
                                 }),
                             ),
                         )
@@ -4040,6 +4049,7 @@ async fn process_message_inner(
                     Some(SopStepReassembly {
                         config: &config,
                         live_config,
+                        memory_owner: mem.principal_scope(),
                     }),
                 ),
             )
@@ -4056,6 +4066,29 @@ mod tests {
     /// A run started with a caller's memory (a pinned
     /// session's child) gives its SOP engine that same handle rather than
     /// building the agent's shared memory.
+    /// A run over an owner's plane re-assembles its SOP steps under that
+    /// owner; a run over shared memory carries none.
+    #[test]
+    fn a_runs_sop_steps_reassemble_under_the_owner_of_its_memory() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let config = Config::default();
+        let shared: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        assert!(
+            super::sop_reassembly_over(&config, &shared)
+                .memory_owner
+                .is_none()
+        );
+        let scope = PrincipalScope::new("user:alice").with_agent(Some("alpha".to_string()));
+        let routed: Arc<dyn Memory> = Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            shared,
+            scope.clone(),
+        ));
+        assert_eq!(
+            super::sop_reassembly_over(&config, &routed).memory_owner,
+            Some(scope)
+        );
+    }
+
     #[tokio::test]
     async fn sop_engine_memory_follows_the_callers_memory() {
         let supplied: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("routed"));

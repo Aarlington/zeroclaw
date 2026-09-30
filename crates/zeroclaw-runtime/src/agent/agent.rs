@@ -2037,6 +2037,20 @@ impl Agent {
         self.disable_principal_unaware_nested_tools();
     }
 
+    /// The owner a cross-agent SOP step of this session re-assembles under:
+    /// `Some(None)` for an unowned session, `Some(Some(scope))` for an owned
+    /// one, whose step agent then runs on the owner's plane for that agent.
+    /// `None` refuses the step: the session is owned but its memory handle
+    /// does not report the scope it is pinned to, so the owner cannot be
+    /// carried into the step.
+    fn sop_step_memory_owner(&self) -> Option<Option<zeroclaw_api::memory_traits::PrincipalScope>> {
+        let scope = self.memory.principal_scope();
+        if self.memory_principal.is_some() && scope.is_none() {
+            return None;
+        }
+        Some(scope)
+    }
+
     /// Nested builders do not yet carry the RPC principal's two selectors.
     /// Refuse only those entry points, not the correctly narrowed parent turn.
     pub(crate) fn disable_principal_unaware_nested_tools(&mut self) {
@@ -3865,6 +3879,7 @@ impl Agent {
             &self.config.resolved.tool_receipts,
         );
         let agent_alias_for_loop = self.observer_agent_alias();
+        let sop_memory_owner = self.sop_step_memory_owner();
         let execution_tree_budget =
             ExecutionTreeBudget::from_limit(self.config.resolved.max_execution_tree_iterations);
         let turn_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
@@ -3953,10 +3968,12 @@ impl Agent {
                         // `provider_switch_config`; test builders without that
                         // context fail closed instead of inheriting this turn.
                         sop_reassembly: self.provider_switch_config.as_ref().and_then(|c| {
+                            let memory_owner = sop_memory_owner.clone()?;
                             c.config.as_deref().map(|config| {
                                 crate::agent::turn::SopStepReassembly {
                                     config,
                                     live_config: c.live_config.clone(),
+                                    memory_owner,
                                 }
                             })
                         }),
@@ -4451,6 +4468,7 @@ impl Agent {
                 let enriched = self.enrich_user_message(&steering_message);
                 round_added.push(ChatMessage::user(enriched));
             }
+            let sop_memory_owner = self.sop_step_memory_owner();
             let round_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 Some(cost_context.clone()),
                 crate::agent::tool_receipts::scope_receipts(
@@ -4551,10 +4569,12 @@ impl Agent {
                             // `provider_switch_config`; test builders without
                             // that context fail closed instead of inheriting it.
                             sop_reassembly: self.provider_switch_config.as_ref().and_then(|c| {
+                                let memory_owner = sop_memory_owner.clone()?;
                                 c.config.as_deref().map(|config| {
                                     crate::agent::turn::SopStepReassembly {
                                         config,
                                         live_config: c.live_config.clone(),
+                                        memory_owner,
                                     }
                                 })
                             }),
@@ -5637,14 +5657,10 @@ mod tests {
         );
     }
 
-    /// An owned session assembled the way production assembles one: the real
-    /// tool factory and `assemble` over a shared SQLite memory, with the
-    /// pipeline allowed to run `memory_store`, then pinned to alice. Returns
-    /// the session and the shared backend both planes live in.
-    async fn factory_assembled_owned_session(tmp: &tempfile::TempDir) -> (Agent, Arc<dyn Memory>) {
-        use zeroclaw_api::memory_traits::PrincipalScope;
+    /// The config the factory-assembled tests run under: agent `alpha`, and a
+    /// pipeline allowed to run `memory_store`.
+    fn factory_test_config() -> Config {
         use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
-
         let mut config = Config::default();
         config
             .risk_profiles
@@ -5659,16 +5675,23 @@ mod tests {
         config.pipeline.enabled = true;
         config.pipeline.max_steps = 5;
         config.pipeline.allowed_tools = vec!["memory_store".to_string()];
-        let shared: Arc<dyn Memory> = Arc::new(
-            zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).expect("sqlite memory"),
-        );
-        let security = Arc::new(crate::security::SecurityPolicy::default());
+        config
+    }
+
+    /// A registry built the way production builds one, by the real tool
+    /// factory and `assemble`, over `memory`.
+    async fn factory_assembled_registry(
+        tmp: &tempfile::TempDir,
+        config: &Config,
+        memory: Arc<dyn Memory>,
+        security: &Arc<crate::security::SecurityPolicy>,
+    ) -> crate::tools::scoped::ScopedToolRegistry {
         let built = crate::tools::all_tools(
             Arc::new(config.clone()),
-            &security,
-            &RiskProfileConfig::default(),
+            security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
             "alpha",
-            Arc::clone(&shared),
+            memory,
             None,
             None,
             &zeroclaw_config::schema::BrowserConfig::default(),
@@ -5677,37 +5700,52 @@ mod tests {
             tmp.path(),
             &HashMap::new(),
             None,
-            &config,
+            config,
             None,
             false,
             None,
         )
         .expect("the tool factory builds");
-        let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
-            crate::tools::scoped::ScopedAssembly {
-                config: &config,
-                agent_alias: "alpha",
-                security: &security,
-                built,
-                skills: &[],
-                runtime: Arc::new(crate::platform::NativeRuntime::new()),
-                caller_allowed: None,
-                connect_mcp: false,
-                connect_peripherals: false,
-                exclude_memory: false,
-                acp_delivery: false,
-                list_deferred_mcp_specs: false,
-                emit_assembly_logs: false,
-                mcp_registry: None,
-            },
-        )
-        .await;
+        crate::tools::scoped::ScopedToolRegistry::assemble(crate::tools::scoped::ScopedAssembly {
+            config,
+            agent_alias: "alpha",
+            security,
+            built,
+            skills: &[],
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await
+        .registry
+    }
+
+    /// An owned session assembled the way production assembles one: the real
+    /// tool factory and `assemble` over a shared SQLite memory, with the
+    /// pipeline allowed to run `memory_store`, then pinned to alice. Returns
+    /// the session and the shared backend both planes live in.
+    async fn factory_assembled_owned_session(tmp: &tempfile::TempDir) -> (Agent, Arc<dyn Memory>) {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+
+        let config = factory_test_config();
+        let shared: Arc<dyn Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).expect("sqlite memory"),
+        );
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let registry =
+            factory_assembled_registry(tmp, &config, Arc::clone(&shared), &security).await;
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(Vec::new()),
             }))
-            .tools(assembled.registry)
+            .tools(registry)
             .memory(Arc::clone(&shared))
             .memory_security(Arc::clone(&security))
             .observer(observer)
@@ -5842,6 +5880,112 @@ mod tests {
             Arc::ptr_eq(&agent.memory, &shared),
             "the session's memory did not move"
         );
+    }
+
+    /// A cross-agent SOP step of an owned session re-assembles under the
+    /// session's owner, and an unowned session's steps carry no owner.
+    #[tokio::test]
+    async fn an_owned_sessions_sop_steps_reassemble_under_its_owner() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (agent, shared) = factory_assembled_owned_session(&tmp).await;
+        let owner = agent
+            .sop_step_memory_owner()
+            .expect("an owned session may re-assemble its steps")
+            .expect("and carries its owner into them");
+        assert_eq!(owner.principal_id, "user:alice");
+
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let unowned = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(Vec::new()),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                Vec::new(),
+            ))
+            .memory(shared)
+            .memory_security(security)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .expect("agent builds");
+        assert_eq!(unowned.sop_step_memory_owner(), Some(None));
+    }
+
+    /// Fails closed: an owned session whose memory handle no longer reports
+    /// the owner it is pinned to cannot carry that owner into a step, so its
+    /// cross-agent steps are refused rather than re-assembled on a shared
+    /// plane.
+    #[tokio::test]
+    async fn an_owned_session_that_cannot_carry_its_owner_refuses_cross_agent_steps() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut agent, shared) = factory_assembled_owned_session(&tmp).await;
+        agent.memory = shared;
+        assert!(agent.memory_principal().is_some());
+        assert_eq!(agent.sop_step_memory_owner(), None);
+    }
+
+    /// A registry built over memory that is already an owner's plane (as a
+    /// delegated target, a SOP step, or a child run receives it) is pinned to
+    /// that owner at construction: its pipeline's memory steps and the child
+    /// its `spawn_subagent` starts stay on that plane without the session
+    /// routing call.
+    #[tokio::test]
+    async fn a_registry_built_over_an_owners_plane_is_pinned_to_it() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = factory_test_config();
+        let shared: Arc<dyn Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).expect("sqlite memory"),
+        );
+        let bob_on_alpha = PrincipalScope::new("user:bob").with_agent(Some("alpha".to_string()));
+        let owned: Arc<dyn Memory> = Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            Arc::clone(&shared),
+            bob_on_alpha.clone(),
+        ));
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let registry =
+            factory_assembled_registry(&tmp, &config, Arc::clone(&owned), &security).await;
+        let tool = |name: &str| {
+            registry
+                .iter()
+                .find(|t| t.name() == name)
+                .unwrap_or_else(|| panic!("{name} is registered"))
+        };
+
+        let result = tool("execute_pipeline")
+            .execute(serde_json::json!({"steps": [
+                {"tool": "memory_store", "args": {"key": "b-marker", "content": "B-MARKER"}}
+            ]}))
+            .await
+            .unwrap();
+        assert!(result.success, "{result:?}");
+        assert!(shared.get("b-marker").await.unwrap().is_none());
+        assert!(
+            shared
+                .get_for_principal(&bob_on_alpha, "b-marker")
+                .await
+                .unwrap()
+                .is_some(),
+            "the pipeline's memory step lands on the owner's plane"
+        );
+
+        let sink = Arc::new(std::sync::Mutex::new(None));
+        crate::tools::spawn_subagent::CHILD_MEMORY_SINK
+            .scope(
+                Arc::clone(&sink),
+                tool("spawn_subagent").execute(serde_json::json!({"prompt": "remember"})),
+            )
+            .await
+            .unwrap();
+        let handed = sink
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the child run was started")
+            .expect("the child is handed the owner's memory");
+        assert!(Arc::ptr_eq(&handed, &owned));
     }
 
     #[tokio::test]

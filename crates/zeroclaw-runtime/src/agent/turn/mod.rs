@@ -2809,6 +2809,11 @@ fn sop_step_excluded_tools(
 pub struct SopStepReassembly<'a> {
     pub config: &'a zeroclaw_config::schema::Config,
     pub live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    /// The owner whose private plane the running session's memory is pinned
+    /// to, or `None` for an unowned session. A re-assembled step agent's
+    /// memory is that owner's plane for the step agent, never the step
+    /// agent's shared plane.
+    pub memory_owner: Option<zeroclaw_api::memory_traits::PrincipalScope>,
 }
 
 /// The re-assembly gate: a step needs its own agent context re-assembled when
@@ -2905,6 +2910,7 @@ pub(crate) async fn assemble_owned_execution(
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
     parent_approval: Option<&crate::approval::ApprovalManager>,
+    memory_owner: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
 ) -> Result<OwnedAgentExecution> {
     assemble_owned_execution_with_admission(
         config,
@@ -2913,6 +2919,7 @@ pub(crate) async fn assemble_owned_execution(
         sop_engine,
         sop_audit,
         parent_approval,
+        memory_owner,
         None,
     )
     .await
@@ -2925,6 +2932,7 @@ pub(crate) async fn assemble_owned_execution_with_admission(
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
     parent_approval: Option<&crate::approval::ApprovalManager>,
+    memory_owner: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
     execution_admission: Option<AgentExecutionAdmission>,
 ) -> Result<OwnedAgentExecution> {
     if let Some(admission) = execution_admission.as_ref() {
@@ -2962,6 +2970,16 @@ pub(crate) async fn assemble_owned_execution_with_admission(
         .and_then(|(_, _, cfg)| cfg.api_key.clone());
     let memory =
         zeroclaw_memory::create_memory_for_agent(config, alias, resolved_key.as_deref()).await?;
+    // A step of an owned session keeps the owner: the step agent's memory is
+    // the owner's plane for that agent, the same plane `memory/*` serves for
+    // this owner and agent. The factory then pins the step registry to it.
+    let memory: Arc<dyn zeroclaw_memory::Memory> = match memory_owner {
+        Some(owner) => Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            memory,
+            owner.clone().with_agent(Some(alias.to_string())),
+        )),
+        None => memory,
+    };
 
     // Mirror a fresh agent turn: the headless SOP driver reaches this agent's
     // tools via `crate::agent::run`, which builds its runtime from
@@ -3299,6 +3317,7 @@ async fn drive_live_sop_actions(
                                     Arc::clone(&queued.engine),
                                     queued.audit.clone(),
                                     approval,
+                                    reassembly.memory_owner.as_ref(),
                                     execution_admission.clone(),
                                 )
                                 .await
@@ -5881,14 +5900,28 @@ mod sop_step_reassembly_tests {
             SopConfig::default(),
         )));
 
-        let reader =
-            assemble_owned_execution(&config, None, "reader", Arc::clone(&engine), None, None)
-                .await
-                .expect("reader assembles");
-        let writer =
-            assemble_owned_execution(&config, None, "writer", Arc::clone(&engine), None, None)
-                .await
-                .expect("writer assembles");
+        let reader = assemble_owned_execution(
+            &config,
+            None,
+            "reader",
+            Arc::clone(&engine),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("reader assembles");
+        let writer = assemble_owned_execution(
+            &config,
+            None,
+            "writer",
+            Arc::clone(&engine),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("writer assembles");
         let reader_names = tool_names(&reader.tools_registry);
         let writer_names = tool_names(&writer.tools_registry);
 
@@ -5908,6 +5941,186 @@ mod sop_step_reassembly_tests {
         // With no parent approval manager the child is non-interactive
         // (auto-deny), matching the headless driver.
         assert!(reader.approval.is_non_interactive());
+    }
+
+    /// A config with a step agent `stepper` on SQLite memory whose policy
+    /// admits the memory tools, as a cross-agent SOP step names it.
+    fn memory_step_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OllamaModelProviderConfig,
+            RiskProfileConfig,
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "stepper".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["memory_store".to_string(), "memory_recall".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "p".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "stepper".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "ollama.p".into(),
+                risk_profile: "stepper".into(),
+                memory: AgentMemoryConfig {
+                    backend: MemoryBackendKind::Sqlite,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
+    /// Run `tool` of a re-assembled step's registry with `args`.
+    async fn run_step_tool(
+        owned: &OwnedAgentExecution,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> zeroclaw_api::tool::ToolResult {
+        owned
+            .tools_registry
+            .iter()
+            .find(|t| t.name() == tool)
+            .unwrap_or_else(|| panic!("the step registry has {tool}"))
+            .execute(args)
+            .await
+            .unwrap()
+    }
+
+    /// A cross-agent step of an owned session re-assembles the step agent on
+    /// the owner's plane for that agent, never the step agent's shared plane.
+    ///
+    /// Its `memory_store` either lands on that plane or, where the step agent's
+    /// backend cannot scope by principal (per-agent SQLite does not forward the
+    /// principal-scoped calls yet), is refused before any effect. Either way
+    /// nothing reaches the step agent's shared plane or another principal's,
+    /// and `memory_recall` does not reach the step agent's shared rows.
+    #[tokio::test]
+    async fn an_owned_sessions_reassembled_step_keeps_the_owner_for_the_step_agent() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config = memory_step_config(&tmp);
+        let step_shared = zeroclaw_memory::create_memory_for_agent(&config, "stepper", None)
+            .await
+            .unwrap();
+        step_shared
+            .store(
+                "shared-row",
+                "STEP-SHARED-SECRET",
+                zeroclaw_memory::MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let owner = PrincipalScope::new("user:alice").with_agent(Some("outer".to_string()));
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            zeroclaw_config::schema::SopConfig::default(),
+        )));
+
+        let owned = assemble_owned_execution(
+            &config,
+            None,
+            "stepper",
+            Arc::clone(&engine),
+            None,
+            None,
+            Some(&owner),
+        )
+        .await
+        .expect("the step agent assembles");
+
+        let stored = run_step_tool(
+            &owned,
+            "memory_store",
+            serde_json::json!({"key": "p-marker", "content": "P-MARKER"}),
+        )
+        .await;
+        assert!(
+            step_shared.get("p-marker").await.unwrap().is_none(),
+            "an owned session's step must not write the step agent's shared plane: {stored:?}"
+        );
+        let on_owner = owner.clone().with_agent(Some("stepper".to_string()));
+        if stored.success {
+            assert_eq!(
+                step_shared
+                    .get_for_principal(&on_owner, "p-marker")
+                    .await
+                    .unwrap()
+                    .expect("a successful store lands on the owner's plane for the step agent")
+                    .content,
+                "P-MARKER"
+            );
+        } else {
+            assert!(
+                stored
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("principal-scoped")),
+                "a refused store is refused for lack of principal scoping: {stored:?}"
+            );
+        }
+        let mallory = PrincipalScope::new("user:mallory").with_agent(Some("stepper".to_string()));
+        assert!(
+            step_shared
+                .get_for_principal(&mallory, "p-marker")
+                .await
+                .map(|row| row.is_none())
+                .unwrap_or(true)
+        );
+        let recalled = run_step_tool(
+            &owned,
+            "memory_recall",
+            serde_json::json!({"query": "STEP-SHARED-SECRET"}),
+        )
+        .await;
+        assert!(
+            !format!("{recalled:?}").contains("STEP-SHARED-SECRET"),
+            "the owned step must not recall the step agent's shared rows: {recalled:?}"
+        );
+    }
+
+    /// Control: an unowned session's step keeps the step agent's shared plane.
+    #[tokio::test]
+    async fn an_unowned_sessions_reassembled_step_keeps_the_shared_plane() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config = memory_step_config(&tmp);
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            zeroclaw_config::schema::SopConfig::default(),
+        )));
+        let owned = assemble_owned_execution(&config, None, "stepper", engine, None, None, None)
+            .await
+            .expect("the step agent assembles");
+        let stored = run_step_tool(
+            &owned,
+            "memory_store",
+            serde_json::json!({"key": "k", "content": "shared-row"}),
+        )
+        .await;
+        assert!(stored.success, "{stored:?}");
+        let step_shared = zeroclaw_memory::create_memory_for_agent(&config, "stepper", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            step_shared.get("k").await.unwrap().unwrap().content,
+            "shared-row"
+        );
     }
 
     #[tokio::test]
@@ -5977,6 +6190,7 @@ mod sop_step_reassembly_tests {
             Some(Arc::clone(&live_config)),
             "stepper",
             Arc::clone(&engine),
+            None,
             None,
             None,
         )
@@ -6076,6 +6290,7 @@ mod sop_step_reassembly_tests {
             Arc::clone(&engine),
             None,
             Some(&parent),
+            None,
         )
         .await
         .expect("restricted assembles");
@@ -7022,6 +7237,73 @@ mod sop_step_reassembly_tests {
         .expect("drive returns Ok");
     }
 
+    /// Through the real driver: a cross-agent step of an owned session is
+    /// re-assembled from the handle's owner. The step agent's model call fails
+    /// here (no provider is reachable), but the driver has already assembled
+    /// and cached the step's execution, and that registry's memory tools are
+    /// on the owner's plane for the step agent, never its shared plane.
+    #[tokio::test]
+    async fn the_driver_reassembles_an_owned_sessions_step_under_its_owner() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config = memory_step_config(&tmp);
+        let (engine, _run_id, action) = start_single_cross_agent_step("stepper");
+        let owner = PrincipalScope::new("user:alice").with_agent(Some("outer".to_string()));
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+            memory_owner: Some(owner.clone()),
+        };
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![ChatMessage::system("parent system prompt")];
+        let mut exec_cache = std::collections::HashMap::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            drive_step(
+                Arc::clone(&engine),
+                action,
+                &TextProvider,
+                &parent_tools,
+                &crate::observability::NoopObserver {},
+                &mut history,
+                None,
+                None,
+                None,
+                Some("outer"),
+                Some(handle),
+                None,
+                &mut exec_cache,
+            ),
+        )
+        .await
+        .expect("the driver settles");
+        let owned = exec_cache
+            .get("stepper")
+            .expect("the driver re-assembled the step agent");
+
+        let stored = run_step_tool(
+            owned,
+            "memory_store",
+            serde_json::json!({"key": "d-marker", "content": "D-MARKER"}),
+        )
+        .await;
+        let step_shared = zeroclaw_memory::create_memory_for_agent(&config, "stepper", None)
+            .await
+            .unwrap();
+        assert!(
+            step_shared.get("d-marker").await.unwrap().is_none(),
+            "the driven step must not write the step agent's shared plane: {stored:?}"
+        );
+        assert!(
+            stored.success
+                || stored
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("principal-scoped")),
+            "the driven step stores on the owner's plane or refuses for lack of principal scoping: {stored:?}"
+        );
+    }
+
     fn step1_result(
         engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
         run_id: &str,
@@ -7108,6 +7390,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            memory_owner: None,
         };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
@@ -7210,6 +7493,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            memory_owner: None,
         };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
@@ -7308,6 +7592,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            memory_owner: None,
         };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
@@ -7372,6 +7657,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            memory_owner: None,
         };
 
         let observer = IdentityCapture::default();
@@ -7428,6 +7714,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            memory_owner: None,
         };
 
         let parent_provider = TextProvider;
@@ -7492,6 +7779,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            memory_owner: None,
         };
 
         let observer = IdentityCapture::default();
@@ -7549,6 +7837,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            memory_owner: None,
         };
 
         let shell_calls = Arc::new(AtomicUsize::new(0));
@@ -7752,6 +8041,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            memory_owner: None,
         };
 
         let mut exec_cache = std::collections::HashMap::new();
