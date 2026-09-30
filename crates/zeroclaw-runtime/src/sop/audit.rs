@@ -16,6 +16,23 @@ pub struct SopAuditLogger {
     memory: Arc<dyn Memory>,
 }
 
+/// The audit logger a session's SOP tool writes through. An unowned
+/// session keeps the logger its tools were built with. Once its session is
+/// pinned to an owner, the logger is one over the owner's routed memory, so
+/// the run payloads and step outputs an audit row carries stay on that
+/// owner's plane rather than the shared one the daemon's logger writes. A
+/// tool built without an audit logger stays without one.
+pub(crate) fn session_audit(
+    captured: Option<&Arc<SopAuditLogger>>,
+    session_memory: Option<&Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
+) -> Option<Arc<SopAuditLogger>> {
+    let captured = captured?;
+    match session_memory.and_then(|route| route.routed()) {
+        Some(routed) => Some(Arc::new(SopAuditLogger::new(Arc::clone(&routed.memory)))),
+        None => Some(Arc::clone(captured)),
+    }
+}
+
 impl SopAuditLogger {
     pub fn new(memory: Arc<dyn Memory>) -> Self {
         Self { memory }
@@ -240,6 +257,34 @@ fn category() -> MemoryCategory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_audit_follows_its_pinned_route() {
+        let shared: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("shared"));
+        let captured = Arc::new(SopAuditLogger::new(Arc::clone(&shared)));
+        let route = Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default());
+        let unpinned = session_audit(Some(&captured), Some(&route)).unwrap();
+        assert!(
+            Arc::ptr_eq(&unpinned, &captured),
+            "unowned: the captured logger"
+        );
+        let owner: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("owner"));
+        route
+            .pin(
+                Arc::clone(&owner),
+                Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            )
+            .unwrap();
+        let pinned = session_audit(Some(&captured), Some(&route)).unwrap();
+        assert!(
+            Arc::ptr_eq(&pinned.memory, &owner),
+            "pinned: a logger over the owner's memory"
+        );
+        assert!(
+            session_audit(None, Some(&route)).is_none(),
+            "no captured logger, no audit"
+        );
+    }
     use crate::sop::types::{SopEvent, SopRunStatus, SopStepStatus, SopTriggerSource};
 
     fn test_run() -> SopRun {

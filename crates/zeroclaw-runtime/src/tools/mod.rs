@@ -2180,18 +2180,25 @@ fn all_tools_with_runtime_on_thread(
     if let Some(ref sop_engine) = sop_engine {
         tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(sop_engine))));
         if let Some(ref sop_audit) = sop_audit {
+            // The audit logger follows the session too: once it is pinned to an
+            // owner, run payloads and step outputs are audited on that owner's
+            // plane rather than through the shared logger captured here.
             tool_arcs.push(Arc::new(
                 SopExecuteTool::new(Arc::clone(sop_engine))
                     .with_audit(Arc::clone(sop_audit))
+                    .with_session_memory(Arc::clone(&session_memory))
                     .with_initiator(agent_alias),
             ));
             tool_arcs.push(Arc::new(
-                SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+                SopAdvanceTool::new(Arc::clone(sop_engine))
+                    .with_audit(Arc::clone(sop_audit))
+                    .with_session_memory(Arc::clone(&session_memory)),
             ));
             tool_arcs.push(Arc::new(
                 SopApproveTool::new(Arc::clone(sop_engine))
                     .with_agent_alias(agent_alias)
-                    .with_audit(Arc::clone(sop_audit)),
+                    .with_audit(Arc::clone(sop_audit))
+                    .with_session_memory(Arc::clone(&session_memory)),
             ));
         } else {
             tool_arcs.push(Arc::new(
