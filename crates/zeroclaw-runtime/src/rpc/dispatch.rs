@@ -1291,6 +1291,36 @@ impl RpcDispatcher {
         self
     }
 
+    async fn ensure_transport_can_use_session_agent(
+        &self,
+        agent: &Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
+    ) -> Result<(), JsonRpcError> {
+        if self.access_policy == RpcAccessPolicy::TrustedLocal {
+            return Ok(());
+        }
+        let guard = agent.lock().await;
+        self.ensure_session_agent_channel_access(&guard)
+    }
+
+    fn ensure_session_agent_channel_access(
+        &self,
+        agent: &crate::agent::agent::Agent,
+    ) -> Result<(), JsonRpcError> {
+        let has_local_session_channels = agent
+            .channel_handles()
+            .reaction
+            .read()
+            .keys()
+            .any(|name| name != "rpc");
+        if has_local_session_channels {
+            return Err(rpc_err(
+                SESSION_NOT_OWNED,
+                "Remote caller cannot use this session's local capabilities",
+            ));
+        }
+        Ok(())
+    }
+
     /// Per-operation authorization: credential expiry, revalidation
     /// deadline, native pairing liveness, authorization-generation
     /// re-resolution, then the method's required grant. Fail-closed on
@@ -4238,7 +4268,7 @@ impl RpcDispatcher {
         &self,
         agent: Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
         session_id: String,
-    ) {
+    ) -> Result<(), JsonRpcError> {
         let approval_channel = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
             "rpc",
             session_id.clone(),
@@ -4247,9 +4277,8 @@ impl RpcDispatcher {
             self.client_elicitation_caps,
         ));
         let current = self.spawn_handle();
-        // Never delay active-turn resume. The same final check applies whether
-        // the Agent was idle or occupied when the continuation was scheduled.
         let expected_agent = Arc::clone(&agent);
+        let remote = self.access_policy == RpcAccessPolicy::RemoteSessionOwner;
         let install = move |mut guard: tokio::sync::OwnedMutexGuard<crate::agent::agent::Agent>| async move {
             current
                 .ctx
@@ -4260,27 +4289,46 @@ impl RpcDispatcher {
                 .ctx
                 .sessions
                 .with_session_effect(&session_id, |session| {
-                    let Some(session) = session.filter(|s| Arc::ptr_eq(&s.agent, &expected_agent))
-                    else {
-                        return;
-                    };
-                    let _ = current.with_live_effect(Method::SessionNew, session, |_| {
+                    let session = session
+                        .filter(|s| Arc::ptr_eq(&s.agent, &expected_agent))
+                        .ok_or_else(|| current.stale_session_incarnation_error())?;
+                    if remote && session.owner_tui_id != current.tui_id {
+                        return Err(current.stale_session_incarnation_error());
+                    }
+                    // Channel refresh uses the Agent mutex. Keep transport eligibility,
+                    // current authority and registration inside this same effect.
+                    if remote {
+                        current.ensure_session_agent_channel_access(&guard)?;
+                    }
+                    current.with_live_effect(Method::SessionNew, session, |_| {
                         guard.set_channel_name("rpc".to_string());
                         guard
                             .channel_handles()
                             .register_channel("rpc", approval_channel);
-                    });
+                    })
                 })
-                .await;
+                .await
         };
+        if remote {
+            self.ctx
+                .sessions
+                .wait_test_effect_pause("remote-approval-agent")
+                .await;
+            return install(agent.lock_owned().await).await;
+        }
+        // Trusted-local reconnect must not wait for an active turn. A deferred
+        // installation still checks the original Agent and current authority.
         match Arc::clone(&agent).try_lock_owned() {
-            Ok(guard) => install(guard).await,
+            Ok(guard) => {
+                let _ = install(guard).await;
+            }
             Err(_) => {
                 zeroclaw_spawn::spawn!(async move {
-                    install(agent.lock_owned().await).await;
+                    let _ = install(agent.lock_owned().await).await;
                 });
             }
         }
+        Ok(())
     }
 
     async fn session_generation_for_agent(
@@ -4364,9 +4412,12 @@ impl RpcDispatcher {
         session_id: String,
         chat_mode: &crate::rpc::types::ChatMode,
         existing: crate::rpc::session::ResumedRpcSession,
+        admission: Option<zeroclaw_infra::session_queue::SessionGuard>,
     ) -> RpcResult {
         self.rebind_rpc_approval_channel(Arc::clone(&existing.agent), session_id.clone())
-            .await;
+            .await?;
+        // Do not retain remote admission across outbound capacity or hooks.
+        drop(admission);
         if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
             self.replay_session_plan(
                 &session_id,
@@ -4455,6 +4506,7 @@ impl RpcDispatcher {
         self.selector_session_agent(Method::SessionNew, &req.agent_alias)?;
         let chat_mode = req.chat_mode.clone().unwrap_or(ChatMode::Chat);
         let resuming = req.session_id.is_some();
+        let mut authorized_resume = None;
         // Check the selected existing session's owner before admission. The
         // durable owner used for restoration is selected again after admission,
         // so a queued request cannot stamp a session from a stale first read.
@@ -4470,13 +4522,14 @@ impl RpcDispatcher {
                 .await?
                 .is_some()
             {
-                self.authorize_session_owner_for_mode(
-                    existing,
-                    Method::SessionNew,
-                    Some(&chat_mode),
-                    scope.as_deref(),
-                )
-                .await?;
+                authorized_resume = self
+                    .authorize_session_owner_for_mode(
+                        existing,
+                        Method::SessionNew,
+                        Some(&chat_mode),
+                        scope.as_deref(),
+                    )
+                    .await?;
             }
         }
         let session_id = req
@@ -4509,9 +4562,12 @@ impl RpcDispatcher {
         // A caller-supplied ID is a resume selector. The live RpcSession is
         // the canonical in-process incarnation, including provider history;
         // same-mode reconnects only rebind the existing canonical session.
-        // Resolve them before queue admission so an active turn can retain its
-        // real permit while the reattach completes. New sessions and
-        // cross-mode replacements remain serialized below.
+        // Local reconnects resolve before queue admission so an active turn can
+        // retain its real permit while the reattach completes. A non-local
+        // reconnect takes the permit first: that fences capability-changing
+        // replacement while transport eligibility is checked, without making
+        // the ordinary local reconnect blocking. New sessions and cross-mode
+        // replacements remain serialized below.
         // Ownership of the live incarnation is decided inside `resume_existing`,
         // under the store lock, against the record being rebound: the read
         // above authorized whatever existed then, this authorizes what exists
@@ -4519,7 +4575,48 @@ impl RpcDispatcher {
         // owner is judged again with the binding, by the authority resolved
         // under that lock, so a stamp that still carries a revoked
         // administrator bypass cannot rebind another principal's session.
+        let mut retained_remote_admission = None;
         if resuming {
+            let non_local = self.access_policy == RpcAccessPolicy::RemoteSessionOwner;
+            if non_local {
+                let guard = self
+                    .ctx
+                    .sessions
+                    .session_queue
+                    .acquire(&session_id)
+                    .await
+                    .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+                let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
+                if let Some(grants) = grants.as_ref() {
+                    self.selector_session_agent_with_grants(
+                        Method::SessionNew,
+                        grants,
+                        &req.agent_alias,
+                    )?;
+                }
+                self.revalidate_admitted_session(
+                    &session_id,
+                    authorized_resume.as_ref(),
+                    self.scoped_principal_id_from(grants.as_ref()).as_deref(),
+                )
+                .await?;
+                if let Some(has_environment) = self
+                    .ctx
+                    .sessions
+                    .has_forwarded_environment(&session_id)
+                    .await
+                {
+                    self.authorize_session_environment(
+                        Method::SessionNew,
+                        grants.as_ref(),
+                        has_environment,
+                    )?;
+                }
+                if let Some(agent) = self.ctx.sessions.get_agent(&session_id).await {
+                    self.ensure_transport_can_use_session_agent(&agent).await?;
+                }
+                retained_remote_admission = Some(guard);
+            }
             match self
                 .resume_existing_session(
                     &session_id,
@@ -4532,7 +4629,12 @@ impl RpcDispatcher {
             {
                 Ok(Some(Ok(existing))) => {
                     return self
-                        .finish_existing_session_resume(session_id, &chat_mode, existing)
+                        .finish_existing_session_resume(
+                            session_id,
+                            &chat_mode,
+                            existing,
+                            retained_remote_admission,
+                        )
                         .await;
                 }
                 Ok(Some(Err(denied))) => return Err(denied),
@@ -4557,13 +4659,16 @@ impl RpcDispatcher {
         // place. Publishing goes through `insert_admitted` (which does NOT
         // re-acquire the permit) rather than `insert`, so the permit-1
         // per-session semaphore is never acquired twice.
-        let _admission = self
-            .ctx
-            .sessions
-            .session_queue
-            .acquire(&session_id)
-            .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        let _admission = if let Some(guard) = retained_remote_admission {
+            guard
+        } else {
+            self.ctx
+                .sessions
+                .session_queue
+                .acquire(&session_id)
+                .await
+                .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?
+        };
 
         // The wait for admission is unbounded, so the principal's profile,
         // credential, or pairing may have changed while this request was
@@ -4629,7 +4734,7 @@ impl RpcDispatcher {
         {
             let existing = existing?;
             return self
-                .finish_existing_session_resume(session_id, &chat_mode, existing)
+                .finish_existing_session_resume(session_id, &chat_mode, existing, Some(_admission))
                 .await;
         }
         if admitted_mode.is_some() {
@@ -6900,6 +7005,9 @@ impl RpcDispatcher {
                     let session = session
                         .filter(|s| Arc::ptr_eq(&s.agent, &agent))
                         .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session was replaced"))?;
+                    if self.access_policy == RpcAccessPolicy::RemoteSessionOwner {
+                        self.ensure_session_agent_channel_access(&_agent)?;
+                    }
                     self.with_live_effect(Method::SessionPrompt, session, |_| ())
                 })
                 .await;
@@ -6987,6 +7095,9 @@ impl RpcDispatcher {
                 let mut admit = |actual_owner: Option<&str>| -> anyhow::Result<LiveSessionEffect<'_>> {
                     if actual_owner != session.owner_principal_id.as_deref() {
                         return Err(SessionEffectDenied(rpc_err(FORBIDDEN, "Session not found or not owned by this principal")).into());
+                    }
+                    if current.access_policy == RpcAccessPolicy::RemoteSessionOwner {
+                        current.ensure_session_agent_channel_access(&guard).map_err(SessionEffectDenied)?;
                     }
                     let authority = current.live_effect_lease(Method::SessionPrompt, session).map_err(SessionEffectDenied)?;
                     if let Some(grants) = authority.grants.as_ref() {
@@ -13515,6 +13626,499 @@ pub(crate) mod connection_test_support {
 #[cfg(test)]
 mod tests {
     use zeroclaw_api::model_provider::ChatMessage;
+
+    struct SessionFactoryStubChannel;
+
+    impl zeroclaw_api::attribution::Attributable for SessionFactoryStubChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(zeroclaw_api::attribution::ChannelKind::Cli)
+        }
+
+        fn alias(&self) -> &str {
+            "stub"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::channel::Channel for SessionFactoryStubChannel {
+        fn name(&self) -> &str {
+            "git"
+        }
+
+        async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn session_factory_stub() -> super::LocalRpcSessionChannelFactory {
+        std::sync::Arc::new(|_, _| {
+            let mut channels = std::collections::HashMap::new();
+            channels.insert(
+                "git.main".to_string(),
+                std::sync::Arc::new(SessionFactoryStubChannel)
+                    as std::sync::Arc<dyn zeroclaw_api::channel::Channel>,
+            );
+            channels
+        })
+    }
+
+    #[tokio::test]
+    async fn local_session_factory_populates_channels_and_resume_preserves_them() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher.local_session_channel_factory = Some(session_factory_stub());
+        dispatcher.set_tui_id_for_test(Some("tui-local".into()));
+
+        let request = serde_json::json!({
+            "agent_alias": "test-agent",
+            "session_id": "local-factory-session",
+        });
+        dispatcher
+            .handle_session_new_for_test(&request)
+            .await
+            .expect("session/new should succeed");
+
+        let before = sessions
+            .get_agent("local-factory-session")
+            .await
+            .expect("session should be live");
+        {
+            let agent = before.lock().await;
+            let reaction = agent.channel_handles().reaction.read();
+            assert_eq!(reaction.len(), 2);
+            assert!(reaction.contains_key("git.main"));
+            assert!(reaction.contains_key("rpc"));
+        }
+
+        dispatcher
+            .handle_session_new_for_test(&request)
+            .await
+            .expect("same-mode resume should succeed");
+        let after = sessions
+            .get_agent("local-factory-session")
+            .await
+            .expect("resumed session should remain live");
+        assert!(
+            std::sync::Arc::ptr_eq(&before, &after),
+            "same-mode resume must rebind the existing session rather than rebuilding it"
+        );
+        assert!(
+            after
+                .lock()
+                .await
+                .channel_handles()
+                .reaction
+                .read()
+                .contains_key("git.main"),
+            "same-mode resume must preserve local channel handles"
+        );
+    }
+
+    #[tokio::test]
+    async fn wss_prompt_rejects_same_principal_local_capability_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut local, _sessions) = make_acp_test_dispatcher(config);
+        local.local_session_channel_factory = Some(session_factory_stub());
+        local.set_tui_id_for_test(Some("tui-shared".into()));
+        local
+            .handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "session_id": "local-capability-session",
+            }))
+            .await
+            .expect("local session/new should succeed");
+
+        let original_rpc_channel = local
+            .ctx
+            .sessions
+            .get_agent("local-capability-session")
+            .await
+            .expect("local session should remain live")
+            .lock()
+            .await
+            .channel_handles()
+            .get_channel("rpc")
+            .expect("local session should have an RPC approval channel");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut remote = super::RpcDispatcher::new_with_access_policy(
+            std::sync::Arc::clone(&local.ctx),
+            tx,
+            "wss:test".into(),
+            super::RpcAccessPolicy::RemoteSessionOwner,
+            None,
+        )
+        .with_transport(
+            crate::rpc::transport::TransportKind::Wss,
+            crate::security::auth_provider::Credential::None,
+        );
+        remote.set_authenticated_for_test();
+        remote.set_tui_id_for_test(Some("tui-shared".into()));
+
+        let resume_error = remote
+            .handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "session_id": "local-capability-session",
+            }))
+            .await
+            .expect_err("WSS resume must not capture the local session back-channel");
+        assert_eq!(
+            resume_error.code,
+            zeroclaw_api::jsonrpc::error_codes::SESSION_NOT_OWNED
+        );
+        let retained_rpc_channel = local
+            .ctx
+            .sessions
+            .get_agent("local-capability-session")
+            .await
+            .expect("refused resume must retain the local session")
+            .lock()
+            .await
+            .channel_handles()
+            .get_channel("rpc")
+            .expect("refused resume must preserve the local RPC approval channel");
+        assert!(
+            std::sync::Arc::ptr_eq(&original_rpc_channel, &retained_rpc_channel),
+            "refused WSS resume must not replace the local approval back-channel"
+        );
+        assert_eq!(
+            local
+                .ctx
+                .sessions
+                .session_owner_tui_id("local-capability-session")
+                .await
+                .flatten()
+                .as_deref(),
+            Some("tui-shared"),
+            "refused WSS resume must not change the session's TUI owner"
+        );
+
+        let error = remote
+            .handle_session_prompt(&serde_json::json!({
+                "session_id": "local-capability-session",
+                "prompt": "must be rejected before tool execution",
+                "client_turn_generation": 17,
+            }))
+            .await
+            .expect_err("WSS prompt must not inherit local capabilities");
+        assert_eq!(
+            error.code,
+            zeroclaw_api::jsonrpc::error_codes::SESSION_NOT_OWNED
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "master rejects local capabilities before provider reconciliation or turn emission"
+        );
+    }
+
+    #[tokio::test]
+    async fn wss_resume_rechecks_local_capabilities_under_admission_fence() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut local, sessions) = make_acp_test_dispatcher(config);
+        local.set_tui_id_for_test(Some("tui-local".into()));
+        let sid = "local-capability-race";
+        local
+            .handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("local session/new should succeed");
+
+        let permit = sessions
+            .session_queue
+            .acquire(sid)
+            .await
+            .expect("test owns the session admission permit");
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut remote = super::RpcDispatcher::new_with_access_policy(
+            std::sync::Arc::clone(&local.ctx),
+            tx,
+            "wss:test".into(),
+            super::RpcAccessPolicy::RemoteSessionOwner,
+            None,
+        )
+        .with_transport(
+            crate::rpc::transport::TransportKind::Wss,
+            crate::security::auth_provider::Credential::None,
+        );
+        remote.set_authenticated_for_test();
+        remote.set_tui_id_for_test(Some("tui-local".into()));
+        let request = serde_json::json!({
+            "agent_alias": "test-agent",
+            "session_id": sid,
+        });
+        let resume =
+            zeroclaw_spawn::spawn!(
+                async move { remote.handle_session_new_for_test(&request).await }
+            );
+        wait_for_session_admission_waiter(&local.ctx, sid).await;
+
+        let agent = sessions
+            .get_agent(sid)
+            .await
+            .expect("session remains live while resume waits");
+        agent
+            .lock()
+            .await
+            .channel_handles()
+            .reaction
+            .write()
+            .insert(
+                "git.main".to_string(),
+                std::sync::Arc::new(SessionFactoryStubChannel)
+                    as std::sync::Arc<dyn zeroclaw_api::channel::Channel>,
+            );
+        drop(permit);
+
+        let error = resume
+            .await
+            .expect("resume task must not panic")
+            .expect_err("post-admission capability recheck must refuse WSS resume");
+        assert_eq!(
+            error.code,
+            zeroclaw_api::jsonrpc::error_codes::SESSION_NOT_OWNED
+        );
+        assert_eq!(
+            sessions
+                .session_owner_tui_id(sid)
+                .await
+                .flatten()
+                .as_deref(),
+            Some("tui-local"),
+            "refused WSS resume must not take the local session's TUI ownership stamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_resume_admission_wait_uses_current_principal() {
+        for own in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = two_user_config_with_administrator_alice(&tmp);
+            std::fs::create_dir_all(config.agent_workspace_dir("test-agent")).unwrap();
+            let data_dir = config.data_dir.clone();
+            let (fixture, sessions, _, store) = make_persistence_test_dispatcher(config, &data_dir);
+            let ctx = Arc::clone(&fixture.ctx);
+            let (mut owner, _) = roster_peer(&ctx, if own { 4242 } else { 4343 }).await;
+            owner.set_tui_id_for_test(Some("shared-tui".into()));
+            owner.handle_session_new_for_test(&json!({"agent_alias":"test-agent", "session_id":"remote-wait", "chat_mode":"acp"})).await.unwrap();
+            let before = store.load_session("remote-wait").unwrap().unwrap();
+            let agent = sessions.get_agent("remote-wait").await.unwrap();
+            let original = agent
+                .lock()
+                .await
+                .channel_handles()
+                .get_channel("rpc")
+                .unwrap();
+            let admission = sessions.session_queue.acquire("remote-wait").await.unwrap();
+            let (mut remote, mut frames) = roster_peer(&ctx, 4242).await;
+            remote.access_policy = RpcAccessPolicy::RemoteSessionOwner;
+            remote.set_tui_id_for_test(Some("shared-tui".into()));
+            let request = zeroclaw_spawn::spawn!(async move {
+                remote.process_line(&json!({"jsonrpc":"2.0", "id":97, "method":"session/new", "params":{"agent_alias":"test-agent", "session_id":"remote-wait", "chat_mode":"acp"}}).to_string()).await;
+                remote
+            });
+            wait_for_session_admission_waiter(&ctx, "remote-wait").await;
+            set_alice_administrator(&ctx, false);
+            drop(admission);
+            let response: Value = serde_json::from_str(
+                &tokio::time::timeout(std::time::Duration::from_secs(5), frames.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            let _remote = request.await.unwrap();
+            assert_eq!(response.get("error").is_none(), own, "{response}");
+            if !own {
+                assert_eq!(response["error"]["code"], FORBIDDEN);
+                assert!(Arc::ptr_eq(
+                    &original,
+                    &agent
+                        .lock()
+                        .await
+                        .channel_handles()
+                        .get_channel("rpc")
+                        .unwrap()
+                ));
+            }
+            let after = store.load_session("remote-wait").unwrap().unwrap();
+            assert_eq!(before.principal_id, after.principal_id);
+            assert_eq!(
+                serde_json::to_value(before.messages).unwrap(),
+                serde_json::to_value(after.messages).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_resume_rechecks_channels_at_final_agent_install() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut local, sessions) = make_acp_test_dispatcher(make_acp_test_config(&tmp));
+        local.set_tui_id_for_test(Some("same-tui".into()));
+        local
+            .handle_session_new_for_test(
+                &json!({"agent_alias":"test-agent", "session_id":"channel-refresh"}),
+            )
+            .await
+            .unwrap();
+        let agent = sessions.get_agent("channel-refresh").await.unwrap();
+        let original = agent
+            .lock()
+            .await
+            .channel_handles()
+            .get_channel("rpc")
+            .unwrap();
+        let (mut remote, mut frames) = make_remote_dispatcher(Arc::clone(&local.ctx), "same-tui");
+        let (arrived, release) = sessions.set_test_effect_pause("remote-approval-agent");
+        let request = zeroclaw_spawn::spawn!(async move {
+            remote.process_line(&json!({"jsonrpc":"2.0", "id":98, "method":"session/new", "params":{"agent_alias":"test-agent", "session_id":"channel-refresh"}}).to_string()).await;
+            remote
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), arrived.notified())
+            .await
+            .unwrap();
+        agent
+            .lock()
+            .await
+            .channel_handles()
+            .register_channel("git.main", Arc::new(SessionFactoryStubChannel));
+        release.notify_one();
+        let response: Value = serde_json::from_str(
+            &tokio::time::timeout(std::time::Duration::from_secs(5), frames.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let _remote = request.await.unwrap();
+        assert_eq!(response["error"]["code"], SESSION_NOT_OWNED);
+        assert!(Arc::ptr_eq(
+            &original,
+            &agent
+                .lock()
+                .await
+                .channel_handles()
+                .get_channel("rpc")
+                .unwrap()
+        ));
+        assert_eq!(
+            sessions
+                .session_owner_tui_id("channel-refresh")
+                .await
+                .flatten()
+                .as_deref(),
+            Some("same-tui")
+        );
+    }
+
+    #[tokio::test]
+    async fn wss_owned_cross_mode_resume_reuses_first_admission() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (local, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut remote = super::RpcDispatcher::new_with_access_policy(
+            std::sync::Arc::clone(&local.ctx),
+            tx,
+            "wss:test".into(),
+            super::RpcAccessPolicy::RemoteSessionOwner,
+            None,
+        )
+        .with_transport(
+            crate::rpc::transport::TransportKind::Wss,
+            crate::security::auth_provider::Credential::None,
+        );
+        remote.set_authenticated_for_test();
+        remote.set_tui_id_for_test(Some("tui-remote".into()));
+
+        let created = remote
+            .handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "chat",
+            }))
+            .await
+            .expect("remote creation must use a server-generated session ID");
+        let sid = created["session_id"].as_str().unwrap().to_string();
+        let initial_generation = sessions.get_generation(&sid).await.unwrap();
+
+        let resumed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            remote.handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+                "chat_mode": "acp",
+            })),
+        )
+        .await
+        .expect("cross-mode fallback must not reacquire its retained admission permit")
+        .expect("an owned RPC-only session must support cross-mode resume");
+        assert_eq!(resumed["session_id"].as_str(), Some(sid.as_str()));
+        assert_eq!(
+            sessions.chat_mode(&sid).await,
+            Some(crate::rpc::types::ChatMode::Acp)
+        );
+        assert_eq!(
+            sessions.get_generation(&sid).await,
+            Some(initial_generation.wrapping_add(1))
+        );
+        assert_eq!(
+            sessions
+                .session_owner_tui_id(&sid)
+                .await
+                .flatten()
+                .as_deref(),
+            Some("tui-remote"),
+        );
+        let agent = sessions.get_agent(&sid).await.unwrap();
+        let agent = agent.lock().await;
+        let channels = agent.channel_handles().reaction.read();
+        assert_eq!(channels.len(), 1);
+        assert!(channels.contains_key("rpc"));
+    }
+
+    #[tokio::test]
+    async fn local_acp_rehydration_restores_session_channels() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        dispatcher.local_session_channel_factory = Some(session_factory_stub());
+        let sid = "acp-rehydrated-factory";
+        dispatcher
+            .handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should create the ACP session");
+        assert!(sessions.remove(sid).await, "reap must remove live state");
+
+        let recovered = dispatcher
+            .rehydrate_reaped_session(sid, dispatcher.stamped_grants())
+            .await
+            .expect("rehydration should not fail")
+            .expect("restorable ACP session must rehydrate");
+        let agent = recovered.lock().await;
+        let reaction = agent.channel_handles().reaction.read();
+        assert_eq!(reaction.len(), 2);
+        assert!(reaction.contains_key("git.main"));
+        assert!(reaction.contains_key("rpc"));
+    }
 
     /// The personality filename allowlist constrains the name, not its target.
     /// Both sides must therefore refuse an allowlisted name planted as a link
@@ -21204,7 +21808,8 @@ mod tests {
             // This is the production nonblocking continuation used by resume.
             alice
                 .rebind_rpc_approval_channel(Arc::clone(&agent), "victim".into())
-                .await;
+                .await
+                .unwrap();
             assert!(Arc::ptr_eq(&original, &handles.get_channel("rpc").unwrap()));
             if replaced {
                 sessions.remove("victim").await;
@@ -21461,6 +22066,8 @@ mod tests {
         use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
         for mode in [
             "live",
+            "remote-live",
+            "remote-cross-mode",
             "restored-new",
             "prompt",
             "restored-new-identity",
@@ -21473,7 +22080,7 @@ mod tests {
                 (false, false, true),
             ] {
                 let identity_race = mode.ends_with("-identity");
-                if identity_race && !replace {
+                if (identity_race && !replace) || (mode == "remote-cross-mode" && replace) {
                     continue;
                 }
                 let tmp = tempfile::TempDir::new().unwrap();
@@ -21496,8 +22103,11 @@ mod tests {
                 let (fixture, sessions, _, store) =
                     make_persistence_test_dispatcher(config, &data_dir);
                 let ctx = Arc::clone(&fixture.ctx);
-                scoped_dispatcher(&ctx, if own {4242} else {4343}).await
-                .handle_session_new_for_test(&json!({"agent_alias":"test-agent", "session_id":"resume-plan", "chat_mode":"acp"})).await.unwrap();
+                let mut owner = scoped_dispatcher(&ctx, if own { 4242 } else { 4343 }).await;
+                if mode.starts_with("remote-") {
+                    owner.set_tui_id_for_test(Some("replay-tui".into()));
+                }
+                owner.handle_session_new_for_test(&json!({"agent_alias":"test-agent", "session_id":"resume-plan", "chat_mode":"acp"})).await.unwrap();
                 let plan = vec![PlanEntry {
                     content: "private-resume-plan-marker".into(),
                     status: PlanStatus::InProgress,
@@ -21508,10 +22118,26 @@ mod tests {
                 store.set_plan("resume-plan", &plan).unwrap();
                 let before = store.load_session("resume-plan").unwrap().unwrap();
                 let before_plan = store.get_plan("resume-plan").unwrap();
-                if mode != "live" {
+                if mode == "remote-cross-mode" {
+                    // Preserve the durable ACP plan while exercising a real
+                    // remote chat-to-ACP replacement under its first permit.
+                    sessions
+                        .publish_prepared(
+                            "resume-plan".into(),
+                            owned_test_session(before.principal_id.as_deref(), ChatMode::Chat)
+                                .with_owner(Some("replay-tui".into())),
+                            sessions.get_generation("resume-plan").await,
+                        )
+                        .await
+                        .unwrap();
+                } else if mode != "live" && mode != "remote-live" {
                     assert!(sessions.remove("resume-plan").await);
                 }
                 let (mut alice, _) = roster_peer(&ctx, 4242).await;
+                if mode.starts_with("remote-") {
+                    alice.access_policy = RpcAccessPolicy::RemoteSessionOwner;
+                    alice.set_tui_id_for_test(Some("replay-tui".into()));
+                }
                 let (tx, mut frames) = tokio::sync::mpsc::channel(1);
                 tx.send("occupied".into()).await.unwrap();
                 let writer = tx.clone();
@@ -21550,6 +22176,23 @@ mod tests {
                     .await
                     .unwrap();
                     assert_eq!(writer.capacity(), 0);
+                    if mode == "remote-live" {
+                        let permit = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            sessions.session_queue.acquire("resume-plan"),
+                        )
+                        .await
+                        .expect("existing resume releases admission before capacity")
+                        .unwrap();
+                        drop(permit);
+                    } else if mode == "remote-cross-mode" {
+                        let waiter = sessions.session_queue.acquire("resume-plan");
+                        tokio::pin!(waiter);
+                        assert!(
+                            futures_util::poll!(&mut waiter).is_pending(),
+                            "prepared transaction retains admission through durable stamping"
+                        );
+                    }
                 }
                 if demote {
                     set_alice_administrator(&ctx, false);
