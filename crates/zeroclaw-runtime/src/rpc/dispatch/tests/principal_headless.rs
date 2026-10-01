@@ -18,10 +18,11 @@ async fn principal_cron_rpc_refuses_agent_jobs_but_keeps_shell_jobs() {
         let (mut caller, mut rx) = roster_peer(&ctx, 4242).await;
         let patch = json!({"id": job.id, "agent": "alpha", "prompt": "read foreign history"});
         if posture == "demoted" {
-            let mut cfg = ctx.config.write();
-            cfg.permission_profiles.get_mut("cron-alpha").unwrap().admin = false;
-            ctx.auth.refresh_from_config(&cfg).unwrap();
-            drop(cfg);
+            {
+                let mut cfg = ctx.config.write();
+                cfg.permission_profiles.get_mut("cron-alpha").unwrap().admin = false;
+                ctx.auth.refresh_from_config(&cfg).unwrap();
+            }
             assert!(
                 caller.has_admin_grants(),
                 "the connection stamp is deliberately stale"
@@ -235,7 +236,7 @@ async fn principal_sessions_refuse_headless_tools_and_captured_aliases() {
         let mut manifest =
             "[skill]\nname='headless'\ndescription='fixture'\nversion='1.0.0'\n".to_string();
         for name in TARGETS {
-            manifest.push_str(&format!("\n[[tools]]\nname='{name}'\ndescription='fixture'\nkind='builtin'\ntarget='{name}'\n"));
+            manifest.push_str(&format!("\n[[tools]]\nname='{name}'\ndescription='fixture'\nkind='builtin'\ncommand=''\ntarget='{name}'\n"));
         }
         std::fs::write(skill.join("SKILL.toml"), manifest).unwrap();
         let job = crate::cron::add_agent_job(
