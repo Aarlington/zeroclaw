@@ -20754,15 +20754,18 @@ mod tests {
             } else {
                 let err =
                     result.expect_err("a replaced session cannot be configured by the old owner");
-                if owner == "user:alice" {
-                    assert_eq!(err.code, SESSION_NOT_FOUND, "{}", err.message);
-                    assert_eq!(err.message, "Session changed while queued");
-                } else {
-                    // Owner checks intentionally hide foreign existence before
-                    // revealing whether a generation was replaced.
-                    assert_eq!(err.code, FORBIDDEN, "{}", err.message);
+                // The original incarnation was captured before the proven
+                // lock wait. Either replacement must first fail its generation
+                // fence, regardless of who owns the successor.
+                assert_eq!(err.code, SESSION_NOT_FOUND, "{}", err.message);
+                assert_eq!(err.message, "Session changed while queued");
+                if owner != "user:alice" {
+                    // A fresh request has not captured the old incarnation:
+                    // admission must instead hide the foreign session.
+                    let fresh = alice.handle_session_configure(&params).await.unwrap_err();
+                    assert_eq!(fresh.code, FORBIDDEN, "{}", fresh.message);
                     assert_eq!(
-                        err.message,
+                        fresh.message,
                         "Session not found or not owned by this principal"
                     );
                 }
