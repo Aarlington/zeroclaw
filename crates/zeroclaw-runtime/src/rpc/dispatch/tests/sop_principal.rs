@@ -87,7 +87,7 @@ async fn sop_entry_tools_and_aliases_cannot_escape_principal_ceilings() {
                 std::fs::create_dir_all(&skill_dir).unwrap();
                 std::fs::write(skill_dir.join("SKILL.toml"), format!(
                     "[skill]\nname = 'sop_guard'\ndescription = 'SOP fixture'\nversion = '1.0.0'\n\
-                     [[tools]]\nname = 'invoke'\ndescription = 'SOP fixture'\nkind = 'builtin'\ntarget = '{target}'\n"
+                     [[tools]]\nname = 'invoke'\ndescription = 'SOP fixture'\nkind = 'builtin'\ncommand = ''\ntarget = '{target}'\n"
                 )).unwrap();
                 let mut engine = crate::sop::SopEngine::new(config.sop.clone());
                 engine.set_sops_for_test(vec![gated_sop("target-sop", "target-agent")]);
@@ -102,8 +102,16 @@ async fn sop_entry_tools_and_aliases_cannot_escape_principal_ceilings() {
                     16,
                     Arc::new(SessionActorQueue::new(4, 10, 60)),
                 ));
-                let ctx =
-                    RpcContext::minimal_with_sop_engine(config, sessions, Arc::clone(&engine));
+                let audit = Arc::new(crate::sop::SopAuditLogger::new(Arc::new(
+                    zeroclaw_memory::NoneMemory::new("sop-fixture"),
+                )));
+                let ctx = RpcContext::minimal_with_sop_engine_and_audit(
+                    config,
+                    sessions,
+                    Arc::clone(&engine),
+                    audit,
+                    Some(crate::sop::SopDriverHandles::default()),
+                );
                 let (mut caller, mut rx) = roster_peer(&ctx, 4242).await;
                 let created = rpc(
                     &mut caller,
