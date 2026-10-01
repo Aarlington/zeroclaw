@@ -8558,6 +8558,29 @@ impl RpcDispatcher {
 
     // ── Cron handlers ────────────────────────────────────────────
 
+    /// Agent jobs rebuild tools without the caller's principal. An agent
+    /// selector (even a wildcard) cannot confer that missing authority.
+    fn authorize_cron_agent_execution(
+        &self,
+        method: Method,
+        job: &crate::cron::CronJob,
+    ) -> Result<(), JsonRpcError> {
+        if job.job_type != crate::cron::JobType::Agent {
+            return Ok(());
+        }
+        if self
+            .recheck_authority_after_admission(method)?
+            .is_some_and(|grants| grants.admin)
+        {
+            return Ok(());
+        }
+        let denied = crate::rpc::auth::AuthDenied::forbidden(crate::i18n::get_required_cli_string(
+            "rpc-cron-agent-principal-required",
+        ));
+        self.audit_auth_denial(method, &denied);
+        Err(rpc_err(denied.code, denied.message))
+    }
+
     async fn handle_cron_list(&self) -> RpcResult {
         let config = self.ctx.config.read().clone();
         let mut jobs = crate::cron::list_jobs(&config)
@@ -8627,6 +8650,7 @@ impl RpcDispatcher {
         // write cannot open a window. An operator-level principal patches
         // any row, including the ownerless legacy ones.
         let owner = self.authorize_cron_job(Method::CronPatch, &config, &req.id)?;
+        self.authorize_cron_agent_execution(Method::CronPatch, &owner)?;
         // Validate a replacement command under the owning agent's policy before
         // it is persisted. `cron/add` validates on the way in; without the same
         // check here an invalid command can replace a working job through the
@@ -8691,6 +8715,7 @@ impl RpcDispatcher {
         .capture_selection();
         let config = self.ctx.config.read().clone();
         let job = self.authorize_cron_job(Method::CronTrigger, &config, &req.id)?;
+        self.authorize_cron_agent_execution(Method::CronTrigger, &job)?;
         let event_tx = self.ctx.event_tx.clone();
         let result = crate::cron::scheduler::run_manual_job_with_selection(
             &config,
@@ -13284,6 +13309,8 @@ pub(crate) mod connection_test_support {
 
 #[cfg(test)]
 mod tests {
+    mod principal_headless;
+
     use zeroclaw_api::model_provider::ChatMessage;
 
     struct SessionFactoryStubChannel;
@@ -15145,7 +15172,16 @@ mod tests {
     async fn cron_patch_rejects_a_command_the_owner_policy_refuses() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = cron_roster_config_in(&tmp, 4242);
-        let job = seed_cron_job(&config, "alpha", "alpha-job");
+        let job = crate::cron::add_shell_job_with_approval(
+            &config,
+            "alpha",
+            Some("alpha-job".into()),
+            Schedule::Every { every_ms: 3600000 },
+            "echo original",
+            None,
+            true,
+        )
+        .unwrap();
         let ctx = enforcement_ctx(config.clone());
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
 
