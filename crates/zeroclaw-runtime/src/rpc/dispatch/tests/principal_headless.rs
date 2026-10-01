@@ -306,7 +306,8 @@ async fn principal_sessions_refuse_headless_tools_and_captured_aliases() {
                 .await;
             assert!(
                 control.success && control.output.contains("foreign session secret"),
-                "{control:?}"
+                "{}",
+                control.output
             );
             drop(guard);
             let mut cfg = operator.ctx.config.write();
