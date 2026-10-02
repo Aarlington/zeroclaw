@@ -87,12 +87,14 @@ impl ScopedToolRegistry {
         }
         let starts_memory_work = self.0.iter().any(|tool| {
             matches!(
-                tool.name(),
+                tool.builtin_target_name().unwrap_or_else(|| tool.name()),
                 tools::SpawnSubagentTool::NAME
                     | tools::PipelineTool::NAME
                     | "sop_execute"
                     | "sop_advance"
                     | "sop_approve"
+                    | "sop_status"
+                    | "sop_list"
             )
         });
         if starts_memory_work {

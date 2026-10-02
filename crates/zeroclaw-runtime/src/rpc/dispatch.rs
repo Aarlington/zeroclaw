@@ -9019,7 +9019,7 @@ impl RpcDispatcher {
                             rpc_err(INVALID_PARAMS, format!("Cron patch rejected: {error}"))
                         })?;
                 }
-                Ok((live, lease))
+                Ok((lease, live))
             };
             authorize().map_err(|error| {
                 let message = error.message.clone();
@@ -11796,7 +11796,7 @@ impl RpcDispatcher {
                 .map_err(|denied| rpc_err(denied.code, denied.message))?;
             self.refuse_constrained_principal_for_sop(method, &grants)?;
         }
-        Ok(Box::new((config, lease)))
+        Ok(Box::new((lease, config)))
     }
 
     /// The procedure as the engine will load it once `save_sop` has written it.
@@ -12050,7 +12050,26 @@ impl RpcDispatcher {
         ))
     }
 
+    fn sop_run_read_lease(
+        &self,
+        method: Method,
+    ) -> Result<crate::rpc::auth::AuthorityLease<'_>, JsonRpcError> {
+        let lease = self.ctx.auth.hold_authority();
+        if let Some(auth) = self.auth.as_ref() {
+            let grants = current_authority_under(&lease, auth, method)
+                .map_err(|error| rpc_err(error.code, error.message))?;
+            if !grants.admin {
+                return Err(rpc_err(
+                    FORBIDDEN,
+                    crate::i18n::get_required_cli_string("sop-rpc-run-admin-required"),
+                ));
+            }
+        }
+        Ok(lease)
+    }
+
     fn handle_sops_runs(&self, params: &Value) -> RpcResult {
+        drop(self.sop_run_read_lease(Method::SopsRuns)?);
         let req: SopRunsRequest = parse_params(params)?;
         let engine = self
             .ctx
@@ -12059,6 +12078,7 @@ impl RpcDispatcher {
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
         let runs = crate::sop::run_summaries_for(engine, req.sop.as_deref())
             .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
+        let _authority = self.sop_run_read_lease(Method::SopsRuns)?;
         to_result(serde_json::json!({ "runs": runs }))
     }
 
@@ -12082,6 +12102,7 @@ impl RpcDispatcher {
                  authenticated principal to authorize run contents against",
             ));
         }
+        drop(self.sop_run_read_lease(Method::SopsRunDetail)?);
         let req: SopRunDetailRequest = parse_params(params)?;
         let engine = self
             .ctx
@@ -12098,10 +12119,12 @@ impl RpcDispatcher {
             rpc_err(code, msg)
         })?;
         let detail = crate::sop::types::SopRunDetail::from_run(&run, active);
+        let _authority = self.sop_run_read_lease(Method::SopsRunDetail)?;
         to_result(serde_json::json!({ "run": detail }))
     }
 
     fn handle_sops_run_overlay(&self, params: &Value) -> RpcResult {
+        drop(self.sop_run_read_lease(Method::SopsRunOverlay)?);
         let req: SopRunOverlayRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
         let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
@@ -12120,6 +12143,7 @@ impl RpcDispatcher {
             };
             rpc_err(code, msg)
         })?;
+        let _authority = self.sop_run_read_lease(Method::SopsRunOverlay)?;
         to_result(overlay)
     }
 
@@ -19248,6 +19272,55 @@ mod tests {
             .unwrap()
             .allowed_agents = vec!["*".into()];
         ctx.auth.refresh_from_config(&config).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sop_global_run_reads_refuse_roster_users_before_lookup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
+        allow_all_sop_agents(&ctx);
+        let run_id = park_sop_run(&engine, "alpha-sop");
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        for (method, params) in [
+            ("sops/runs", json!({})),
+            ("sops/run-detail", json!({"run_id":run_id})),
+            ("sops/run-detail", json!({"run_id":"missing"})),
+            (
+                "sops/run-overlay",
+                json!({"name":"alpha-sop","run_id":run_id}),
+            ),
+            (
+                "sops/run-overlay",
+                json!({"name":"missing","run_id":"missing"}),
+            ),
+        ] {
+            let response = rpc(&mut alice, &mut rx, 1, method, params).await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(FORBIDDEN),
+                "{method}: {response}"
+            );
+            assert_eq!(
+                response["error"]["message"],
+                json!(crate::i18n::get_required_cli_string(
+                    "sop-rpc-run-admin-required"
+                ))
+            );
+        }
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        let response = rpc(
+            &mut operator,
+            &mut op_rx,
+            2,
+            "sops/run-detail",
+            json!({"run_id":run_id}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["run"]["run_id"],
+            json!(run_id),
+            "{response}"
+        );
     }
 
     fn grant_sop_admin(ctx: &RpcContext) {

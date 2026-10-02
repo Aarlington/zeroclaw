@@ -2181,7 +2181,10 @@ fn all_tools_with_runtime_on_thread(
 
     // SOP tools (registered when engine handle is provided)
     if let Some(ref sop_engine) = sop_engine {
-        tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(sop_engine))));
+        tool_arcs.push(Arc::new(
+            SopListTool::new(Arc::clone(sop_engine))
+                .with_session_memory(Arc::clone(&session_memory)),
+        ));
         if let Some(ref sop_audit) = sop_audit {
             // The audit logger follows the session too: once it is pinned to an
             // owner, run payloads and step outputs are audited on that owner's

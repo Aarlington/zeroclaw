@@ -419,27 +419,34 @@ operator sessions keep their configured tools. Existing jobs keep running.
 
 RPC `cron/patch` and `cron/trigger` also refuse agent jobs for non-admins,
 including wildcard selectors. These jobs cannot carry the caller's session
-restrictions; the check uses current authority after looking up the job.
-Shell jobs retain their existing grant and command-policy checks. Cron reads,
+restrictions. Patches acquire SQLite's writer transaction, reload the job,
+then hold current authority through validation and commit. A revocation,
+owner change, or job-type change while queued cannot reuse the earlier
+admission. Shell jobs retain their grant and current command-policy checks. Cron reads,
 deletion, and jobs already scheduled by an operator are unchanged.
 
-SOP execution and authoring remain separate routes that can start runs under
-the agent's own identity with its configured tools, including the session-data
-tools. The SOP containment change must be integrated separately; this change
-does not claim that all principal-unaware execution paths are closed.
-Until the tools check ownership, an operator who lets non-admin principals
-reach these routes can list `sessions_list`, `sessions_history`, and
-`sessions_send`, plus any skill tool that targets them, in `excluded_tools`
-of the risk profile of each agent those runs use. That removes them from
-every run of those agents, administrators' sessions included.
+The model-facing `sop_execute`, `sop_approve`, and `sop_advance` tools and
+their aliases are also withheld from non-admin RPC sessions. The owner
+recorded on a private SOP run protects its status, output, run counts, and
+control operations at tool execution, including captured pipeline tools.
+An owned session can access only its exact principal, agent, namespace,
+and tenant plane. Legacy runs without an owner are not public. Unowned
+operator tools retain assistance access, while completion audit records
+remain on the run's original owner's plane. Global metrics are omitted
+from owned `sop_status` queries.
 
-RPC `sops/run` and `sops/decide` also refuse a non-admin principal with a
-constrained agent selector, even when the procedure names only permitted
-agents. Headless steps can delegate, and do not carry that caller's agent
-ceiling into their descendants. They require both wildcard selectors and
-`tools:execute`, or administrator grants. This includes deny, amend, and
-revise decisions, matching the existing tool-ceiling restriction on those
-methods. SOP authoring keeps its separate agent-selector checks.
+Global RPC run summaries, detail, and overlays require an administrator;
+remote WSS run detail retains its existing refusal. Procedure definitions
+remain governed by their separate read and authoring grants.
+
+RPC `sops/run` and `sops/decide` require administrator grants, including
+when a non-admin has wildcard tool and agent selectors. Headless steps do
+not carry the caller's principal restrictions. This includes deny, amend,
+and revise decisions. After decision-model and engine waits, the RPC holds
+current authority through its synchronous store effects. A busy SOP store
+refuses the request immediately; retry once contention clears. Background
+SOP processing keeps its normal storage timeout. SOP authoring retains its
+separate agent-selector checks.
 
 The existing eight-argument Rust `Agent::from_live_config_with_tui_env`
 constructor remains available. RPC uses the additive
@@ -448,9 +455,9 @@ the shared resolver's grants at prompt admission.
 
 That composition does not cover every route to an agent's tools. Cron jobs
 and SOP authoring check only the agent selector. A constrained principal
-holding cron grants can create a shell job for its agent, or give an
-existing agent job a new prompt and trigger it, and one holding SOP create
-or update grants can save a procedure whose trigger runs it later. Treat
+holding cron grants can create a shell job for its agent, and one holding
+SOP create or update grants can save a procedure whose trigger runs it
+later. Agent cron patching and manual triggering require admin. Treat
 cron and SOP authoring grants as grants of the agent's tools.
 
 Principal-owned sessions may use synchronous and parallel delegation when

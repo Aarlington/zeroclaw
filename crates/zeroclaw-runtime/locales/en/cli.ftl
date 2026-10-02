@@ -1442,3 +1442,5 @@ rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop 
 
 cli-sop-run-unavailable = SOP run unavailable in this session.
 rpc-cron-agent-principal-required = Agent cron jobs do not carry principal restrictions; only administrators may modify or trigger them.
+
+sop-rpc-run-admin-required = Global procedure run data requires an administrator; use the session-scoped SOP status tool for your own runs.

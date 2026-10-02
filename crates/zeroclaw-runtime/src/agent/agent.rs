@@ -6464,6 +6464,7 @@ mod tests {
             None,
         )
         .expect("the tool factory builds");
+        let delegate = built.delegate_tool.clone();
         let registry = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
                 config: &config,
@@ -6490,6 +6491,7 @@ mod tests {
                 responses: Mutex::new(Vec::new()),
             }))
             .tools(registry)
+            .delegate_tool(delegate)
             .memory(Arc::clone(&shared))
             .memory_security(Arc::clone(&security))
             .observer(observer)
@@ -6816,6 +6818,15 @@ mod tests {
                     with_audit,
                 )
                 .await;
+                let listed = foreign
+                    .execute_tool_for_test("sop_list", serde_json::json!({}))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    !listed.output.contains("active runs: 1"),
+                    "foreign count leaked: {listed:?}"
+                );
                 for args in [
                     serde_json::json!({}),
                     serde_json::json!({"sop_name":"audit-sop","include_metrics":true}),
