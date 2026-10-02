@@ -1346,6 +1346,7 @@ sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: exe
 sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
 sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.
 sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve this SOP step.
+sop-rpc-principal-ceiling-required = Procedure execution requires an administrator until headless steps preserve the caller's principal restrictions.
 sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
 sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 
@@ -1430,6 +1431,9 @@ rpc-auth-revalidation-due = Credential revalidation due: re-initialize to revali
 rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
 
 cron-agent-job-failed = The scheduled task could not be completed. Please try again or ask an administrator to check the logs.
+
+# Principal-owned delegation
+delegate-owned-background-unavailable = Background delegation and task management are unavailable in principal-owned sessions until task results enforce principal ownership. Use synchronous delegation instead.
 
 # Atomic RPC configuration batches
 rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`

@@ -1298,6 +1298,17 @@ impl DelegateTool {
         }))
     }
 
+    fn memory_tool_name_for_target<'a>(&self, tool: &'a dyn Tool) -> &'a str {
+        // Only owned aliases participate in target-memory substitution.
+        // Unowned aliases retain their captured caller handle; canonical
+        // memory tools retain their existing target substitution.
+        if self.principal_scope.read().is_some() {
+            tool.builtin_target_name().unwrap_or_else(|| tool.name())
+        } else {
+            tool.name()
+        }
+    }
+
     fn memory_tools_for_target(
         memory: Arc<dyn Memory>,
         security: Arc<SecurityPolicy>,
@@ -1401,6 +1412,14 @@ impl DelegateTool {
             self.live_config.clone(),
             self.execution_capability.clone(),
         )?;
+
+        // Bind the concrete delegate before skills capture it in alias wrappers.
+        // Target memory construction will reselect the agent dimension per hop.
+        if let Some(scope) = self.principal_scope.read().clone()
+            && let Some(delegate) = &all_tools_result.delegate_tool
+        {
+            delegate.bind_principal_scope(scope)?;
+        }
 
         let target_workspace = config.agent_workspace_dir(agent_name);
         let skills = crate::skills::load_skills_for_agent_from_config(config, agent_name);
@@ -2497,6 +2516,22 @@ impl Tool for DelegateTool {
                 )),
             });
         };
+
+        // Detached results and management use agent-alias visibility, not the
+        // bound owner's memory scope. Until tasks and artifacts carry that
+        // owner end to end, do not publish or retrieve them from owned turns.
+        if self.principal_scope.read().is_some()
+            && (action != DelegateAction::Delegate
+                || args.get("background").and_then(serde_json::Value::as_bool) == Some(true))
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "delegate-owned-background-unavailable",
+                )),
+            });
+        }
 
         // Bounded sub-agents carry delegate-only instances: their identity is
         // transient, so the management surface stays with the ancestors, who
@@ -4718,12 +4753,12 @@ impl DelegateTool {
                     let parent_tools = self.parent_tools.read();
                     parent_tools.iter().any(|tool| {
                         self.security.is_tool_allowed(tool.name())
-                            && zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&tool.name())
+                            && zeroclaw_tools::MEMORY_TOOL_NAMES
+                                .contains(&self.memory_tool_name_for_target(tool.as_ref()))
                             && Self::delegate_admits_with_mcp(&tool_policy, tool.name())
                     })
                 };
-                let mut target_memory_tools: HashMap<String, Box<dyn Tool>> = if needs_memory_tools
-                {
+                let target_memory_tools: HashMap<String, Arc<dyn Tool>> = if needs_memory_tools {
                     match self
                         .memory_for_target_agent(target_config, agent_name)
                         .await
@@ -4731,7 +4766,7 @@ impl DelegateTool {
                         Ok(Some(memory)) => {
                             Self::memory_tools_for_target(memory, Arc::clone(&target_policy))
                                 .into_iter()
-                                .map(|tool| (tool.name().to_string(), tool))
+                                .map(|tool| (tool.name().to_string(), Arc::from(tool)))
                                 .collect()
                         }
                         Ok(None) => HashMap::new(),
@@ -4864,11 +4899,33 @@ impl DelegateTool {
                 let mut filtered: Vec<Box<dyn Tool>> = bounded_base_tools
                     .iter()
                     .map(|tool| {
-                        target_memory_tools.remove(tool.name()).unwrap_or_else(|| {
-                            Box::new(ToolArcRef::new(Arc::clone(tool))) as Box<dyn Tool>
-                        })
+                        let target_name = self.memory_tool_name_for_target(tool.as_ref());
+                        let replacement = match target_memory_tools.get(target_name) {
+                            Some(target) if tool.builtin_target_name().is_some() => tool
+                                .with_builtin_target(Arc::clone(target))
+                                .ok_or_else(|| {
+                                    ::zeroclaw_log::record!(
+                                        ERROR,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Reject
+                                        )
+                                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(::serde_json::json!({"tool": tool.name()})),
+                                        "Memory alias cannot rebind its builtin target"
+                                    );
+                                    anyhow::Error::msg(format!(
+                                        "memory alias '{}' cannot rebind its builtin target",
+                                        tool.name()
+                                    ))
+                                })?,
+                            Some(target) => Arc::clone(target),
+                            None => Arc::clone(tool),
+                        };
+                        Ok(Box::new(ToolArcRef::new(replacement)) as Box<dyn Tool>)
                     })
-                    .collect();
+                    .collect::<anyhow::Result<_>>()?;
                 // Appended after the inherited set; the target-bound instance
                 // takes the retained delegation slot the parent's instance used
                 // to fill implicitly.
@@ -5181,6 +5238,14 @@ impl ::zeroclaw_api::attribution::Attributable for ToolArcRef {
 
 #[async_trait]
 impl Tool for ToolArcRef {
+    fn builtin_target_name(&self) -> Option<&str> {
+        self.inner.builtin_target_name()
+    }
+
+    fn with_builtin_target(&self, target: Arc<dyn Tool>) -> Option<Arc<dyn Tool>> {
+        self.inner.with_builtin_target(target)
+    }
+
     fn requires_unrestricted_principal(&self) -> bool {
         self.inner.requires_unrestricted_principal()
     }
@@ -7510,6 +7575,7 @@ mod tests {
     }
 
     struct MemoryStoreRecallThenFinalModelProvider {
+        aliased: bool,
         key: &'static str,
         content: &'static str,
         recall_query: &'static str,
@@ -7534,13 +7600,21 @@ mod tests {
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
+            let tool_name = |name: &str| {
+                let alias = format!("notes__{name}");
+                if self.aliased {
+                    alias
+                } else {
+                    name.to_string()
+                }
+            };
             let tool_message_count = request.messages.iter().filter(|m| m.role == "tool").count();
             match tool_message_count {
                 0 => Ok(ChatResponse {
                     text: None,
                     tool_calls: vec![ToolCall {
                         id: "call_store".to_string(),
-                        name: "memory_store".to_string(),
+                        name: tool_name("memory_store"),
                         arguments: serde_json::json!({
                             "key": self.key,
                             "content": self.content,
@@ -7556,7 +7630,7 @@ mod tests {
                     text: None,
                     tool_calls: vec![ToolCall {
                         id: "call_recall".to_string(),
-                        name: "memory_recall".to_string(),
+                        name: tool_name("memory_recall"),
                         arguments: serde_json::json!({
                             "query": self.recall_query,
                             "limit": 5
@@ -9313,6 +9387,7 @@ mod tests {
         // cannot write into the caller's memory namespace.
         let fixture = delegate_memory_fixture(None).await;
         let model_provider = MemoryStoreRecallThenFinalModelProvider {
+            aliased: false,
             key: "sync-key",
             content: "sync target memory",
             recall_query: "sync-key",
@@ -9339,8 +9414,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unowned_bounded_memory_aliases_keep_caller_with_canonical_target_siblings() {
+        for canonical_siblings in [false, true] {
+            let mut fixture = delegate_memory_fixture(None).await;
+            let mut config = fixture.tool.root_config.as_deref().unwrap().clone();
+            let profile = config.risk_profiles.get_mut("agentic_test").unwrap();
+            let alias_names = [
+                "notes__memory_store".to_string(),
+                "notes__memory_recall".to_string(),
+            ];
+            profile.allowed_tools.extend(alias_names.clone());
+            profile.auto_approve.extend(alias_names);
+            fixture.tool.security = Arc::new(SecurityPolicy::for_agent(&config, "caller").unwrap());
+            fixture.tool.risk_profiles = Arc::new(config.risk_profiles.clone());
+            fixture.tool.root_config = Some(Arc::new(config));
+            let canonical = fixture.tool.parent_tools.read().clone();
+            let mut parent: Vec<Arc<dyn Tool>> = canonical
+                .iter()
+                .map(|tool| {
+                    let definition: crate::skills::SkillTool = serde_json::from_value(json!({
+                    "name": tool.name(), "description": "captured memory alias", "kind": "builtin"
+                })).unwrap();
+                    Arc::new(crate::tools::SkillBuiltinTool::new(
+                        "notes",
+                        &definition,
+                        Arc::clone(tool),
+                        HashMap::new(),
+                    )) as Arc<dyn Tool>
+                })
+                .collect();
+            if canonical_siblings {
+                parent.extend(canonical);
+            }
+            fixture.tool.parent_tools = Arc::new(RwLock::new(parent));
+            for (uuid, content) in [
+                (&fixture.caller_uuid, "scopeprobe caller-shared"),
+                (&fixture.target_uuid, "scopeprobe target-shared"),
+            ] {
+                scoped_sqlite_memory(Arc::clone(&fixture.inner_memory), uuid)
+                    .store("sentinel", content, MemoryCategory::Core, None)
+                    .await
+                    .unwrap();
+            }
+            assert!(fixture.tool.principal_scope.read().is_none());
+            for aliased in if canonical_siblings {
+                vec![true, false]
+            } else {
+                vec![true]
+            } {
+                let key = if aliased {
+                    "alias-write"
+                } else {
+                    "canonical-write"
+                };
+                let observed = Arc::new(std::sync::Mutex::new(String::new()));
+                let provider = MemoryStoreRecallThenFinalModelProvider {
+                    aliased,
+                    key,
+                    content: "scopeprobe write",
+                    recall_query: "scopeprobe",
+                    observed_recall: Some(Arc::clone(&observed)),
+                };
+                let result = fixture
+                    .tool
+                    .execute_agentic(
+                        "target",
+                        &fixture.target_config,
+                        "custom",
+                        "delegate-test-model",
+                        &provider,
+                        "store and recall memory",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+                let (expected_uuid, excluded_uuid, expected, excluded) = if aliased {
+                    (
+                        &fixture.caller_uuid,
+                        &fixture.target_uuid,
+                        "caller-shared",
+                        "target-shared",
+                    )
+                } else {
+                    (
+                        &fixture.target_uuid,
+                        &fixture.caller_uuid,
+                        "target-shared",
+                        "caller-shared",
+                    )
+                };
+                assert!(
+                    fixture
+                        .inner_memory
+                        .get_for_agent(key, expected_uuid)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    fixture
+                        .inner_memory
+                        .get_for_agent(key, excluded_uuid)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                let recalled = observed.lock().unwrap().clone();
+                assert!(recalled.contains(expected), "{recalled}");
+                assert!(!recalled.contains(excluded), "{recalled}");
+                assert!(recalled.contains("scopeprobe write"), "{recalled}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn owned_delegate_child_recalls_and_stores_only_in_owners_target_plane() {
-        let fixture = delegate_memory_fixture(None).await;
+        assert_owned_delegate_memory(false).await;
+    }
+
+    #[tokio::test]
+    async fn owned_bounded_delegate_memory_aliases_rebind_without_changing_parent() {
+        assert_owned_delegate_memory(true).await;
+    }
+
+    async fn assert_owned_delegate_memory(aliased: bool) {
+        let mut fixture = delegate_memory_fixture(None).await;
+        if aliased {
+            let aliases: Vec<String> = ["memory_store", "memory_recall"]
+                .iter()
+                .map(|name| format!("notes__{name}"))
+                .collect();
+            let mut config = fixture.tool.root_config.as_deref().unwrap().clone();
+            let profile = config.risk_profiles.get_mut("agentic_test").unwrap();
+            profile.allowed_tools = aliases.clone();
+            profile.auto_approve = aliases;
+            fixture.tool.security = Arc::new(SecurityPolicy::for_agent(&config, "caller").unwrap());
+            fixture.tool.risk_profiles = Arc::new(config.risk_profiles.clone());
+            fixture.tool.root_config = Some(Arc::new(config));
+            let aliases = fixture
+                .tool
+                .parent_tools
+                .read()
+                .iter()
+                .map(|tool| {
+                    let definition: crate::skills::SkillTool = serde_json::from_value(json!({
+                    "name": tool.name(), "description": "private memory alias", "kind": "builtin"
+                })).unwrap();
+                    Arc::new(crate::tools::SkillBuiltinTool::new(
+                        "notes",
+                        &definition,
+                        Arc::clone(tool),
+                        HashMap::new(),
+                    )) as Arc<dyn Tool>
+                })
+                .collect();
+            fixture.tool.parent_tools = Arc::new(RwLock::new(aliases));
+        }
         let owner_target = PrincipalScope::new("user:owner").with_agent(Some("target".to_string()));
         let other_target = PrincipalScope::new("user:other").with_agent(Some("target".to_string()));
         // The target agent's own shared-plane row: an unscoped child handle
@@ -9396,6 +9626,7 @@ mod tests {
 
         let observed_recall = Arc::new(std::sync::Mutex::new(String::new()));
         let provider = MemoryStoreRecallThenFinalModelProvider {
+            aliased,
             key: "child-write",
             content: "scopeprobe child-private",
             recall_query: "scopeprobe",
@@ -9445,15 +9676,300 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        if aliased {
+            // A child receives a rebuilt wrapper; the captured parent tool is unchanged.
+            let parent_store = fixture
+                .tool
+                .parent_tools
+                .read()
+                .iter()
+                .find(|tool| tool.name() == "notes__memory_store")
+                .unwrap()
+                .clone();
+            let result = parent_store
+                .execute(json!({"key": "parent-after-child", "content": "caller row"}))
+                .await
+                .unwrap();
+            assert!(result.success, "{result:?}");
+            assert!(
+                fixture
+                    .inner_memory
+                    .get_for_agent("parent-after-child", &fixture.caller_uuid)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                fixture
+                    .inner_memory
+                    .get_for_principal(&owner_target, "parent-after-child")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]
-    async fn owned_background_delegate_stores_only_in_owners_target_plane() {
-        // The detached worker rebuilds its delegate instance; it must inherit
-        // the bound owner rather than start unscoped.
-        let server =
-            start_memory_tool_chat_server("owned-background-key", "owned background memory").await;
-        let fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
+    async fn independent_delegate_alias_inherits_owner_before_nested_capture() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = Arc::clone(&captured);
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            for response in [
+                chat_completion_tool_call(
+                    "memory_store",
+                    "store",
+                    json!({"key": "nested-write", "content": "scopeprobe nested-private"}),
+                ),
+                chat_completion_tool_call(
+                    "memory_recall",
+                    "recall",
+                    json!({"query": "scopeprobe", "limit": 20}),
+                ),
+                json!({"choices": [{"message": {"content": "nested done"}}]}),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                capture.lock().unwrap().push(http_request_json(&request));
+                write_json_response(&mut socket, response).await;
+            }
+        });
+        let mut fixture = delegate_memory_fixture(Some(uri)).await;
+        let mut config = fixture.tool.root_config.as_deref().unwrap().clone();
+        config
+            .providers
+            .models
+            .custom
+            .get_mut("local")
+            .unwrap()
+            .base
+            .native_tools = Some(true);
+        let mut third = fixture.target_config.clone();
+        third.risk_profile = "third".into();
+        let third_profile = config.risk_profiles["agentic_test"].clone();
+        config.risk_profiles.insert("third".into(), third_profile);
+        config.agents.insert("third".into(), third);
+        let target = config.agents.get_mut("target").unwrap();
+        target.delegates = vec![DelegateTargetConfig {
+            agent: "third".into(),
+            mode: DelegateExecutionMode::Independent,
+        }];
+        let workspace = fixture._tmp.path().join("target-workspace");
+        target.workspace.path = Some(workspace.clone());
+        let profile = config.risk_profiles.get_mut("agentic_test").unwrap();
+        profile.allowed_tools.extend([
+            "delegate".into(),
+            "notes__nested".into(),
+            "notes__memory_store".into(),
+            "notes__memory_recall".into(),
+        ]);
+        profile.auto_approve.extend([
+            "delegate".into(),
+            "notes__nested".into(),
+            "notes__memory_store".into(),
+        ]);
+        config.agents.get_mut("caller").unwrap().delegates = vec![DelegateTargetConfig {
+            agent: "target".into(),
+            mode: DelegateExecutionMode::Independent,
+        }];
+        let skill_dir = workspace.join("skills/notes");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            r#"[skill]
+name = "notes"
+description = "memory delegation regression"
+version = "0.1.0"
+[[tools]]
+name = "nested"
+description = "delegate to third"
+kind = "builtin"
+command = ""
+target = "delegate"
+[tools.locked_args]
+agent = "third"
+[[tools]]
+name = "memory_store"
+description = "store memory"
+kind = "builtin"
+command = ""
+target = "memory_store"
+[[tools]]
+name = "memory_recall"
+description = "recall memory"
+kind = "builtin"
+command = ""
+target = "memory_recall"
+"#,
+        )
+        .unwrap();
+        fixture.tool = fixture
+            .tool
+            .with_root_config(Arc::new(config.clone()))
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime(Arc::new(DelegateTestRuntime));
+        let owner = owner_session_scope("user:owner")
+            .with_namespace(Some("notes".into()))
+            .with_tenant(Some("tenant-one".into()));
+        let third_scope = owner.clone().with_agent(Some("third".into()));
+        let other_scope = PrincipalScope::new("user:other")
+            .with_agent(Some("third".into()))
+            .with_namespace(Some("notes".into()))
+            .with_tenant(Some("tenant-one".into()));
+        let third_uuid = fixture
+            .inner_memory
+            .ensure_agent_uuid("third")
+            .await
+            .unwrap();
+        scoped_sqlite_memory(Arc::clone(&fixture.inner_memory), &third_uuid)
+            .store(
+                "shared",
+                "scopeprobe shared-secret",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        for (scope, key, content) in [
+            (&third_scope, "owner", "scopeprobe owner-private"),
+            (&other_scope, "other", "scopeprobe other-private"),
+            (&owner, "caller", "scopeprobe caller-private"),
+        ] {
+            fixture
+                .inner_memory
+                .store_for_principal(scope, key, content, MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+        fixture.tool.bind_principal_scope(owner.clone()).unwrap();
+        let independent = fixture
+            .tool
+            .independent_agentic_tools_for_target(
+                "target",
+                fixture.tool.policy_for_target("target").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !independent
+                .tools
+                .iter()
+                .any(|tool| tool.name() == "delegate")
+        );
+        assert!(
+            !independent
+                .tools
+                .iter()
+                .any(|tool| matches!(tool.name(), "spawn_subagent" | "execute_pipeline"))
+        );
+        let store = independent
+            .tools
+            .iter()
+            .find(|tool| tool.name() == "notes__memory_store")
+            .unwrap();
+        let stored = store
+            .execute(json!({"key": "independent-write", "content": "independent private"}))
+            .await
+            .unwrap();
+        assert!(stored.success, "{stored:?}");
+        assert!(
+            fixture
+                .inner_memory
+                .get_for_principal(
+                    &owner.clone().with_agent(Some("target".into())),
+                    "independent-write"
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            fixture
+                .inner_memory
+                .get_for_agent("independent-write", &fixture.target_uuid)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let recall = independent
+            .tools
+            .iter()
+            .find(|tool| tool.name() == "notes__memory_recall")
+            .unwrap()
+            .execute(json!({"query": "independent"}))
+            .await
+            .unwrap();
+        assert!(recall.output.contains("independent private"), "{recall:?}");
+        let alias = independent
+            .tools
+            .iter()
+            .find(|tool| tool.name() == "notes__nested")
+            .unwrap();
+        assert!(
+            alias.parameters_schema()["properties"]
+                .get("agent")
+                .is_none(),
+            "locked target remains hidden"
+        );
+        let result = alias
+            .execute(json!({"agent": "caller", "prompt": "store and recall memory"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{result:?}");
+        server.await.unwrap();
+        let captured = captured.lock().unwrap().clone();
+        // Custom providers may encode tool results as user-role messages.
+        // Inspect the final provider request, after store and recall executed.
+        let recall = captured.last().unwrap().to_string();
+        assert!(recall.contains("owner-private"), "{recall}");
+        assert!(recall.contains("nested-private"), "{recall}");
+        for forbidden in ["shared-secret", "other-private", "caller-private"] {
+            assert!(!recall.contains(forbidden), "{recall}");
+        }
+        assert!(
+            fixture
+                .inner_memory
+                .get_for_principal(&third_scope, "nested-write")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            fixture
+                .inner_memory
+                .get_for_principal(&other_scope, "nested-write")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixture
+                .inner_memory
+                .get_for_principal(&owner, "nested-write")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixture
+                .inner_memory
+                .get_for_agent("nested-write", &third_uuid)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_background_delegate_refuses_before_creating_shared_results() {
+        let server = wiremock::MockServer::start().await;
+        let mut fixture = delegate_memory_fixture(Some(server.uri())).await;
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        fixture.tool = fixture
+            .tool
+            .with_task_control_plane(task_control_plane(Arc::clone(&store)));
         fixture
             .tool
             .bind_principal_scope(owner_session_scope("user:owner"))
@@ -9469,20 +9985,102 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            result.success,
-            "owned background delegate failed: {result:?}"
+        assert!(!result.success, "{result:?}");
+        assert_eq!(
+            result.error,
+            Some(crate::i18n::get_required_cli_string(
+                "delegate-owned-background-unavailable"
+            ))
         );
-        let task_id = result
-            .output
-            .lines()
-            .find(|line| line.starts_with("task_id:"))
-            .unwrap()
-            .trim_start_matches("task_id: ")
-            .trim();
-        let bg_result = wait_for_terminal_background_result(&fixture.tool, task_id).await;
-        assert_eq!(bg_result.status, BackgroundTaskStatus::Completed);
-        assert_stored_for_owner_target_only(&fixture, "user:owner", "owned-background-key").await;
+        assert!(!fixture.tool.results_dir().exists());
+        assert!(store.list_by_agent("target").await.unwrap().is_empty());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn owned_delegate_management_refuses_same_alias_and_legacy_results() {
+        let tmp = TempDir::new().unwrap();
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let complete = "15151515-1515-1515-1515-151515151515";
+        let running = "16161616-1616-1616-1616-161616161616";
+        let legacy = "17171717-1717-1717-1717-171717171717";
+        let sentinel = "foreign principal private result";
+        for id in [complete, running] {
+            let mut task = task_record(id, TaskStatus::Running);
+            task.principal_id = Some("foreign-session".into());
+            store.create(task).await.unwrap();
+        }
+        store
+            .update_status(complete, TaskStatus::Completed, Some(sentinel.into()), None)
+            .await
+            .unwrap();
+        write_background_result(
+            tmp.path(),
+            &background_result(
+                legacy,
+                BackgroundTaskStatus::Completed,
+                Some(sentinel),
+                None,
+            ),
+        );
+        let tool = Arc::new(
+            DelegateTool::new(HashMap::new(), None, test_security())
+                .with_workspace_dir(tmp.path().into())
+                .with_caller_alias("caller")
+                .with_task_control_plane(task_control_plane(Arc::clone(&store))),
+        );
+        // These exact same-alias and legacy results are readable to the shared
+        // operator. Ownership, not an absent fixture, must cause the refusal.
+        for id in [complete, legacy] {
+            let control = tool
+                .execute(json!({"action":"check_result", "task_id":id}))
+                .await
+                .unwrap();
+            assert!(
+                control.success && control.output.contains(sentinel),
+                "{control:?}"
+            );
+        }
+        let spec: crate::skills::SkillTool = serde_json::from_value(json!({
+            "name":"tasks", "description":"fixture", "kind":"builtin", "target":"delegate"
+        }))
+        .unwrap();
+        let alias = crate::tools::skill_tool::SkillBuiltinTool::new(
+            "bridge",
+            &spec,
+            tool.clone(),
+            HashMap::new(),
+        );
+        tool.bind_principal_scope(owner_session_scope("user:owner"))
+            .unwrap();
+        for entry in [tool.as_ref() as &dyn Tool, &alias as &dyn Tool] {
+            for args in [
+                json!({"action":"check_result", "task_id":complete}),
+                json!({"action":"check_result", "task_id":legacy}),
+                json!({"action":"list_results"}),
+                json!({"action":"await_sessions", "task_ids":[complete, legacy], "timeout_ms":0}),
+                json!({"action":"cancel_task", "task_id":running}),
+                json!({"agent":"target", "prompt":"probe", "background":true}),
+            ] {
+                let result = entry.execute(args).await.unwrap();
+                assert!(!result.success, "{result:?}");
+                assert!(result.output.is_empty());
+                assert_eq!(
+                    result.error,
+                    Some(crate::i18n::get_required_cli_string(
+                        "delegate-owned-background-unavailable"
+                    ))
+                );
+            }
+        }
+        assert_eq!(
+            store.get(running).await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            store.get(complete).await.unwrap().unwrap().status,
+            TaskStatus::Completed
+        );
     }
 
     #[tokio::test]
@@ -9508,6 +10106,187 @@ mod tests {
         assert!(result.success, "owned parallel delegate failed: {result:?}");
         assert!(result.output.contains("memory workflow done"));
         assert_stored_for_owner_target_only(&fixture, "user:owner", "owned-parallel-key").await;
+    }
+
+    #[tokio::test]
+    async fn admitted_target_memory_config_precedes_stale_root_with_owner_scope() {
+        let fixture = delegate_memory_fixture(None).await;
+        fixture
+            .tool
+            .bind_principal_scope(owner_session_scope("user:owner"))
+            .unwrap();
+        let current = TempDir::new().unwrap();
+        let mut config = fixture.tool.root_config.as_deref().unwrap().clone();
+        config.data_dir = current.path().join("data");
+        let memory = fixture
+            .tool
+            .memory_for_target_agent(Some(&config), "target")
+            .await
+            .unwrap()
+            .unwrap();
+        memory
+            .store(
+                "admitted-memory",
+                "private target",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let current_memory = SqliteMemory::new("current", &config.data_dir).unwrap();
+        let scope = owner_session_scope("user:owner").with_agent(Some("target".into()));
+        assert!(
+            current_memory
+                .get_for_principal(&scope, "admitted-memory")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            current_memory
+                .get("admitted-memory")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixture
+                .inner_memory
+                .get_for_principal(&scope, "admitted-memory")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn unowned_configless_delegate_retains_original_memory_fallback() {
+        let mut fixture = delegate_memory_fixture(None).await;
+        fixture.tool.root_config = None;
+        let original = fixture.tool.memory.as_ref().unwrap();
+        let resolved = fixture
+            .tool
+            .memory_for_target_agent(None, "target")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(original, &resolved));
+    }
+
+    #[tokio::test]
+    async fn owned_target_memory_reuses_canonical_tool_for_multiple_aliases() {
+        struct ThreeNames;
+        #[async_trait]
+        impl ModelProvider for ThreeNames {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok("unused".into())
+            }
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _: &str,
+                _: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                let index = request.messages.iter().filter(|m| m.role == "tool").count();
+                let names = [
+                    "memory_store",
+                    "notes__memory_store",
+                    "archive__memory_store",
+                ];
+                Ok(ChatResponse {
+                    text: (index >= names.len()).then(|| "three memory writes complete".into()),
+                    tool_calls: names.get(index).map(|name| vec![ToolCall {
+                        id: format!("store_{index}"), name: (*name).into(),
+                        arguments: json!({"key": format!("alias-{index}"), "content":"private target", "category":"core"}).to_string(),
+                        extra_content: None,
+                    }]).unwrap_or_default(), usage: None, reasoning_content: None,
+                })
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for ThreeNames {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "three-memory-names"
+            }
+        }
+        let mut fixture = delegate_memory_fixture(None).await;
+        let mut config = fixture.tool.root_config.as_deref().unwrap().clone();
+        let names = vec![
+            "memory_store".to_string(),
+            "notes__memory_store".to_string(),
+            "archive__memory_store".to_string(),
+        ];
+        let profile = config.risk_profiles.get_mut("agentic_test").unwrap();
+        profile.allowed_tools = names.clone();
+        profile.auto_approve = names;
+        fixture.tool.security = Arc::new(SecurityPolicy::for_agent(&config, "caller").unwrap());
+        fixture.tool.risk_profiles = Arc::new(config.risk_profiles.clone());
+        fixture.tool.root_config = Some(Arc::new(config));
+        let canonical = fixture
+            .tool
+            .parent_tools
+            .read()
+            .iter()
+            .find(|t| t.name() == "memory_store")
+            .unwrap()
+            .clone();
+        let definition: crate::skills::SkillTool = serde_json::from_value(
+            json!({"name":"memory_store", "description":"private memory", "kind":"builtin"}),
+        )
+        .unwrap();
+        let mut tools = vec![Arc::clone(&canonical)];
+        for label in ["notes", "archive"] {
+            tools.push(Arc::new(crate::tools::SkillBuiltinTool::new(
+                label,
+                &definition,
+                Arc::clone(&canonical),
+                HashMap::new(),
+            )));
+        }
+        fixture.tool.parent_tools = Arc::new(RwLock::new(tools));
+        fixture
+            .tool
+            .bind_principal_scope(owner_session_scope("user:owner"))
+            .unwrap();
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "target",
+                &fixture.target_config,
+                "custom",
+                "delegate-test-model",
+                &ThreeNames,
+                "write three private rows",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "{result:?}");
+        for index in 0..3 {
+            let key = format!("alias-{index}");
+            assert_stored_for_owner_target_only(&fixture, "user:owner", &key).await;
+            let other = owner_session_scope("user:other").with_agent(Some("target".into()));
+            assert!(
+                fixture
+                    .inner_memory
+                    .get_for_principal(&other, &key)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]
@@ -9543,6 +10322,7 @@ mod tests {
             .unwrap();
 
         let provider = MemoryStoreRecallThenFinalModelProvider {
+            aliased: false,
             key: "configless-write",
             content: "scopeprobe configless",
             recall_query: "configless-write",

@@ -69,7 +69,7 @@ pub struct TimestampedMessage {
     pub created_at: Option<DateTime<Utc>>,
 }
 
-/// Guard returned by admission and retained through a synchronous storage effect.
+/// A caller-owned, synchronous authority hold. Storage knows no runtime policy.
 pub trait SessionEffectGuard {}
 impl<T> SessionEffectGuard for T {}
 
@@ -363,24 +363,35 @@ pub trait SessionBackend: Send + Sync {
         ))
     }
 
-    /// Delete a session ONLY if `owner_principal_id` matches the stored
-    /// owner: the ownership check and the destruction of the ownership row
-    /// are one SQL statement (the RFC 7141 atomic storage predicate), so a
-    /// concurrent re-stamp cannot race them apart. Backends without
-    /// ownership support fail closed: `Ok(false)`, nothing deleted.
-    fn delete_session_owned(
+    /// Invoke a disclosure effect under the backend's owner-read boundary.
+    fn with_session_owner(
         &self,
         _session_key: &str,
-        _owner_principal_id: &str,
-    ) -> std::io::Result<bool> {
-        Ok(false)
+        _effect: &mut dyn FnMut(Option<&str>) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded session disclosure unsupported",
+        ))
     }
 
-    /// Set the session state (e.g. "idle", "running", "error").
-    /// `turn_id` identifies the current turn (set when running, cleared on idle).
-    /// Admit a no-state backend against the caller's locked live owner.
-    /// Persisting backends must instead resolve their stored owner under the
-    /// mutation lock and retain the returned guard through commit.
+    /// Authorize after the backend serialization boundary, retaining the guard
+    /// through the exact-owner mutation. Unsupported stores fail closed.
+    fn delete_session_authorized(
+        &self,
+        _session_key: &str,
+        _expected_owner: Option<&str>,
+        _authorize: &SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<bool> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded session deletion unsupported",
+        ))
+    }
+
+    /// Backends with no state effect still admit against the caller's locked
+    /// live incarnation. Persisting implementations must resolve the stored owner
+    /// under their mutation lock instead of trusting this fallback identity.
     fn set_session_state_authorized(
         &self,
         _session_key: &str,
@@ -393,6 +404,18 @@ pub trait SessionBackend: Send + Sync {
         Ok(())
     }
 
+    /// Delete only a matching stored owner. Backends without ownership support
+    /// fail closed without deleting anything.
+    fn delete_session_owned(
+        &self,
+        _session_key: &str,
+        _owner_principal_id: &str,
+    ) -> std::io::Result<bool> {
+        Ok(false)
+    }
+
+    /// Set the session state (e.g. "idle", "running", "error").
+    /// `turn_id` identifies the current turn (set when running, cleared on idle).
     fn set_session_state(
         &self,
         _session_key: &str,
