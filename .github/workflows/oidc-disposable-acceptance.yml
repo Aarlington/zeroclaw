@@ -26,6 +26,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.98.0
@@ -45,6 +46,25 @@ jobs:
           cp target/debug/zeroclaw acceptance-build/zeroclaw
           git rev-parse HEAD > acceptance-build/source-sha.txt
           sha256sum acceptance-build/zeroclaw > acceptance-build/binary-sha256.txt
+      - name: Prove regressions fail on the original combined source
+        run: python3 tests/manual/oidc_baseline_regressions.py
+      - name: Prove regressions pass on the repaired source
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test in \
+            factory_delegate_inherits_private_memory_owner_before_any_action \
+            sop_decide_rechecks_before_lookup_and_final_projection \
+            session_configure_revoked_at_commit_changes_neither_overrides_nor_agent \
+            selection_capture_finishes_while_a_writer_waits_for_an_effect_read; do
+            cargo test --locked -p zeroclaw-runtime --lib "$test" 2>&1 | tee "acceptance-evidence/repaired-$test.log"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: oidc-regression-evidence
+          path: acceptance-evidence/
+          retention-days: 7
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: oidc-acceptance-binary
