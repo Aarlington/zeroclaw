@@ -60,8 +60,8 @@ def command(args, **kwargs):
     return subprocess.run(args, capture_output=True, text=True, timeout=600, **kwargs)
 
 
-def http(url, data=None, token=None, method=None, form=False, basic=None):
-    headers = {}
+def http(url, data=None, token=None, method=None, form=False, basic=None, extra_headers=None):
+    headers = dict(extra_headers or {})
     if token:
         headers['Authorization'] = 'Bearer ' + token
     if basic:
@@ -193,8 +193,10 @@ class Fixture:
                          'config': {'claim.name': 'roles', 'claim.value': 'reader',
                                     'jsonType.label': 'String', 'access.token.claim': 'true',
                                     'introspection.token.claim': 'true'}}]}
+        reserved_id = 'zc-service: +/%'
         realm = {'realm': 'zc-test', 'enabled': True, 'sslRequired': 'none',
-                 'accessTokenLifespan': 300, 'clients': [client('zc-human', True), client('zc-service', False)],
+                 'accessTokenLifespan': 300,
+                 'clients': [client('zc-human', True), client('zc-service', False), client(reserved_id, False)],
                  'users': [{'username': 'acceptance-user', 'enabled': True,
                             'emailVerified': True, 'firstName': 'Synthetic', 'lastName': 'User',
                             'email': 'acceptance@example.invalid',
@@ -211,7 +213,8 @@ class Fixture:
         issuer = 'http://127.0.0.1:18080/realms/zc-test'
         wait_for(lambda: http(issuer + '/.well-known/openid-configuration')[0] == 200)
         self.entries = [dict(alias='human', issuer=issuer, audience='zeroclaw', client='zc-human'),
-                        dict(alias='service', issuer=issuer, audience='zeroclaw', client='zc-service', secret=self.secret)]
+                        dict(alias='service', issuer=issuer, audience='zeroclaw', client='zc-service', secret=self.secret),
+                        dict(alias='reserved', issuer=issuer, audience='zeroclaw', client=reserved_id, secret=self.secret)]
 
     def setup_authentik(self):
         pg_secret = secrets.token_hex(24)
@@ -229,7 +232,8 @@ class Fixture:
                          'environment': {'POSTGRES_DB': 'authentik', 'POSTGRES_USER': 'authentik', 'POSTGRES_PASSWORD': pg_secret},
                          'healthcheck': {'test': ['CMD-SHELL', 'pg_isready -U authentik'], 'interval': '5s', 'retries': 40},
                          'volumes': ['database:/var/lib/postgresql/data']},
-            'server': {'image': image, 'command': 'server', 'environment': env,
+            'server': {'image': image, 'command': 'server',
+                       'environment': {key: value for key, value in env.items() if not key.startswith('AUTHENTIK_BOOTSTRAP_')},
                        'depends_on': {'postgres': {'condition': 'service_healthy'}},
                        'ports': ['127.0.0.1:19000:9000'], 'shm_size': '512mb'},
             'worker': {'image': image, 'command': 'worker', 'environment': env,
@@ -242,15 +246,22 @@ class Fixture:
             status, body = http(base + path, data, self.bootstrap, method)
             require(status < 300, 'authentik API ' + path.split('?')[0] + ' status ' + str(status))
             return body
-        flows = api('flows/instances/?page_size=100')['results']
-        authorization = next(f['pk'] for f in flows if f['slug'] == 'default-provider-authorization-implicit-consent')
-        invalidation = next(f['pk'] for f in flows if f['slug'] == 'default-provider-invalidation-flow')
+        # API availability precedes the worker applying default blueprints.
+        # Wait for the concrete defaults we use, including the login flow.
+        required_flows = {'default-provider-authorization-implicit-consent',
+                          'default-provider-invalidation-flow', 'default-authentication-flow'}
+        def default_flows():
+            flows = {f['slug']: f['pk'] for f in api('flows/instances/?page_size=100')['results']}
+            return flows if required_flows <= flows.keys() else None
+        flows = wait_for(default_flows, 240)
+        authorization = flows['default-provider-authorization-implicit-consent']
+        invalidation = flows['default-provider-invalidation-flow']
         code_flow = api('flows/instances/', {'name': 'Acceptance device', 'title': 'Approve device',
                     'slug': 'acceptance-device', 'designation': 'stage_configuration', 'authentication': 'require_authenticated'})
-        brand = api('core/brands/')['results'][0]
+        brands = wait_for(lambda: api('core/brands/')['results'], 60)
+        brand = brands[0]
         api('core/brands/' + brand['brand_uuid'] + '/', {'flow_device_code': code_flow['pk']}, 'PATCH')
-        keys = api('crypto/certificatekeypairs/?has_key=true')['results']
-        require(bool(keys), 'authentik signing key absent')
+        keys = wait_for(lambda: api('crypto/certificatekeypairs/?has_key=true')['results'], 60)
         user = api('core/users/', {'username': 'acceptance-user', 'name': 'Synthetic User',
                                   'is_active': True, 'type': 'internal'})
         api('core/users/' + str(user['pk']) + '/set_password/', {'password': self.password})
@@ -329,6 +340,16 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
             require(result.returncode == 0, 'client certificate issuance failed')
         self.tls = ssl.create_default_context(cafile=str(cert / 'ca.crt'))
         self.tls.load_cert_chain(str(cert / 'client.crt'), str(cert / 'client.key'))
+        # A listening TCP socket precedes completed RPC startup. Require a
+        # valid native handshake before attributing IdP failures to auth.
+        def rpc_ready():
+            try:
+                ws, response = self.rpc(self.native, 'native')
+                ws.close()
+                return 'result' in response
+            except (TimeoutError, OSError):
+                return False
+        wait_for(rpc_ready, 30)
 
     def stop_daemon(self):
         if self.daemon:
@@ -341,13 +362,15 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
             self.daemon_log.close()
             self.daemon = None
 
-    def rpc(self, token=None, provider=None):
+    def rpc(self, token=None, provider=None, continuity=None):
         ws = connect('wss://127.0.0.1:19781', ssl=self.tls, open_timeout=10, proxy=None)
         params = {}
         if token is not None:
             params['auth_token'] = token
         if provider is not None:
             params['auth_provider'] = provider
+        if continuity:
+            params.update(continuity)
         response = self.call(ws, 'initialize', params)
         return ws, response
 
@@ -366,6 +389,7 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         ws, response = self.rpc(token, 'oidc.' + alias)
         try:
             require('result' in response, 'OIDC initialize denied: ' + self.error_detail(response))
+            require(bool(response['result'].get('principal_id')), 'OIDC credential became unowned operator')
             require('result' in self.call(ws, 'session/list'), 'authorized read denied')
             denied = self.call(ws, 'config/set', {'prop': 'wss.port', 'value': 19782})
             require(denied.get('error', {}).get('code') == -32012, 'reader config write not forbidden')
@@ -465,6 +489,14 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
     def run_cases(self, browser):
         tokens = {}
         def flow(name, alias, device=False):
+            if device:
+                entry = next(e for e in self.entries if e['alias'] == alias)
+                status, discovery = http(entry['issuer'].rstrip('/') + '/.well-known/openid-configuration')
+                require(status == 200, 'device discovery failed')
+                status, response = http(discovery['device_authorization_endpoint'],
+                                         {'client_id': entry['client'], 'scope': 'openid'}, form=True)
+                self.token_shapes['device-endpoint-probe'] = {'status': status, 'error': response.get('error'),
+                    'description': self.scrub(response.get('error_description', ''))}
             token = self.enroll(alias, browser if alias == 'human' else None, device)
             tokens[name] = token
             parts = token.split('.')
@@ -486,6 +518,38 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
             finally:
                 ws.close()
         self.record('native-pairing-positive-control', native_control)
+        if self.provider == 'keycloak':
+            def reserved_basic():
+                entry = next(e for e in self.entries if e['alias'] == 'reserved')
+                status, discovery = http(entry['issuer'] + '/.well-known/openid-configuration')
+                require(status == 200, 'reserved client discovery failed')
+                status, token = http(discovery['token_endpoint'], {'grant_type': 'client_credentials', 'scope': 'openid'},
+                                     form=True, basic=(entry['client'], entry['secret']))
+                require(status == 200 and token.get('access_token'), 'standards-encoded Basic control failed')
+                self.enroll('reserved')
+            self.record('reserved-client-id-oauth-basic-cli', reserved_basic)
+        def continuity():
+            first, response = self.rpc(self.native, 'native')
+            try:
+                require('result' in response, 'native initial connection failed')
+                identity = {key: response['result'].get(key) for key in ['tui_id', 'tui_sig']}
+                require(all(identity.values()), 'fresh connection has no signed TUI identity')
+            finally:
+                first.close()
+            reconnect, resumed = self.rpc(self.native, 'native', identity)
+            try:
+                require(resumed.get('result', {}).get('tui_id') == identity['tui_id'], 'signed reconnect failed')
+                require('result' in self.call(reconnect, 'session/list'), 'signed reconnect cannot read')
+            finally:
+                reconnect.close()
+            for stale in [{'tui_id': identity['tui_id']}, {'tui_id': identity['tui_id'], 'tui_sig': 'invalid-old-key-signature'}]:
+                rejected, response = self.rpc(self.native, 'native', stale)
+                try:
+                    require(response.get('error', {}).get('code') == -32010, 'unverified TUI continuity accepted')
+                finally:
+                    rejected.close()
+            native_control()
+        self.record('signed-reconnect-and-stale-continuity-refusal', continuity)
         if 'client-credentials' in tokens:
             def fresh_control():
                 self.write_config()
@@ -516,7 +580,14 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                 self.write_config(cap=1)
                 self.start_daemon()
                 time.sleep(2)
-                self.denied(service, 'oidc.service')
+                ws, response = self.rpc(service, 'oidc.service')
+                try:
+                    require('result' in response or response.get('error', {}).get('code') == -32010,
+                            'unexpected cap handshake result')
+                    require(self.call(ws, 'session/list').get('error', {}).get('code') == -32010,
+                            'protected read survived offline lifetime cap')
+                finally:
+                    ws.close()
                 restored_control(service)
             self.record('offline-lifetime-cap-denied', expiry)
             def introspection():
@@ -528,10 +599,16 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                     self.write_config(validation='introspection')
                     self.start_daemon()
                     fresh = self.enroll('service')
-                    self.accepted(fresh, 'service')
                     entry = self.entries[0]
                     status, discovery = http(entry['issuer'].rstrip('/') + '/.well-known/openid-configuration')
                     require(status == 200 and discovery.get('revocation_endpoint'), 'revocation endpoint absent')
+                    status, inspected = http(discovery['introspection_endpoint'], {'token': fresh, 'token_type_hint': 'access_token'},
+                                             form=True, basic=(entry['client'], entry['secret']))
+                    self.token_shapes['introspection-response'] = {'status': status, 'claim_names': sorted(inspected),
+                        'active': inspected.get('active'), 'token_type': inspected.get('token_type'),
+                        'typ': inspected.get('typ'), 'client_id_matches': inspected.get('client_id') == entry['client'],
+                        'audience_matches': entry['audience'] in ([inspected.get('aud')] if isinstance(inspected.get('aud'), str) else inspected.get('aud', []))}
+                    self.accepted(fresh, 'service')
                     ws, initialized = self.rpc(fresh, 'oidc.service')
                     try:
                         require('result' in initialized, 'introspection initialize failed')
@@ -561,12 +638,16 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
             local = LocalConnection(self.root / 'rpc.sock')
             try:
                 require('result' in self.call(local, 'initialize'), 'trusted daemon UID refused')
-                require('result' in self.call(local, 'config/set', {'prop': 'gateway.paired_tokens', 'value': []}),
-                        'local pairing revocation failed')
+                rotated = command([str(self.binary), 'gateway', 'get-paircode', '--rotate', '--json'], env=self.env)
+                require(rotated.returncode == 0, 'supported local pairing rotation failed')
+                code = json.loads(rotated.stdout).get('pairing_code')
+                require(bool(code), 'local rotation returned no recovery code')
                 self.denied(self.native, 'native')
-                restored = self.call(local, 'config/set', {'prop': 'gateway.paired_tokens',
-                                                         'value': [hashlib.sha256(self.native.encode()).hexdigest()]})
-                require('result' in restored, 'local recovery refused')
+                require('result' in self.call(local, 'config/set', {'prop': 'security.trust_daemon_uid', 'value': True}),
+                        'trusted local UID lost config repair access')
+                status, paired = http('http://127.0.0.1:19617/pair', {}, extra_headers={'X-Pairing-Code': code})
+                require(status == 200 and paired.get('token'), 'local recovery pairing failed')
+                self.native = paired['token']
                 native_control()
                 self.denied()
             finally:
