@@ -1106,6 +1106,7 @@ pub(crate) fn all_tools_with_runtime_context(
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
 ) -> anyhow::Result<AllToolsResult> {
+    let owner = memory.principal_scope();
     let builder = move || {
         // Warm the lazy regexes BEFORE the registry build and BEFORE any
         // turn can start: LazyLock runs the initializer on whichever thread
@@ -1151,13 +1152,20 @@ pub(crate) fn all_tools_with_runtime_context(
                     "failed to spawn tool-registry builder thread: {error}"
                 ))
             })?;
-        Ok(match handle.join() {
+        let result = match handle.join() {
             Ok(result) => result,
             // Preserve the inline build's panic semantics: a builder panic is
             // resumed on the caller's thread exactly as if it had unwound
             // through the caller's frames.
             Err(panic) => std::panic::resume_unwind(panic),
-        })
+        };
+        // Child runs and cross-agent SOP steps arrive with already-private
+        // memory and never pass through Agent's later session routing. Bind
+        // the same delegate instance its canonical name and aliases retain.
+        if let (Some(owner), Some(delegate)) = (owner, result.delegate_tool.as_ref()) {
+            delegate.bind_principal_scope(owner)?;
+        }
+        Ok(result)
     })
 }
 

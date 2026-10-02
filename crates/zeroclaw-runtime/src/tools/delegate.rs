@@ -1365,14 +1365,6 @@ impl DelegateTool {
             self.execution_capability.clone(),
         )?;
 
-        // Bind the concrete delegate before skills capture it in alias wrappers.
-        // Target memory construction will reselect the agent dimension per hop.
-        if let Some(scope) = self.principal_scope.read().clone()
-            && let Some(delegate) = &all_tools_result.delegate_tool
-        {
-            delegate.bind_principal_scope(scope)?;
-        }
-
         let target_workspace = config.agent_workspace_dir(agent_name);
         let skills = crate::skills::load_skills_for_agent_from_config(config, agent_name);
 
@@ -9889,6 +9881,139 @@ target = "memory_recall"
                 .get_for_agent("nested-write", &third_uuid)
                 .await
                 .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_delegate_inherits_private_memory_owner_before_any_action() {
+        let fixture = delegate_memory_fixture(None).await;
+        let config = fixture.tool.root_config.as_ref().unwrap();
+        let owner = owner_session_scope("user:owner");
+        let shared = fixture.tool.memory.as_ref().unwrap();
+        let owned: Arc<dyn Memory> = Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            Arc::clone(shared),
+            owner.clone(),
+        ));
+        let build = |memory| {
+            crate::tools::all_tools(
+                Arc::clone(config),
+                &fixture.tool.security,
+                &config.risk_profiles["agentic_test"],
+                "caller",
+                memory,
+                None,
+                None,
+                &config.browser,
+                &config.http_request,
+                &config.web_fetch,
+                &fixture.tool.workspace_dir,
+                &config.agents,
+                None,
+                config,
+                None,
+                false,
+                None,
+            )
+            .unwrap()
+            .delegate_tool
+            .expect("nonempty agents construct the real delegate")
+        };
+        let delegate = build(owned);
+        let spec: crate::skills::SkillTool = serde_json::from_value(json!({
+            "name":"tasks", "description":"fixture", "kind":"builtin", "target":"delegate"
+        }))
+        .unwrap();
+        let alias = crate::tools::skill_tool::SkillBuiltinTool::new(
+            "bridge",
+            &spec,
+            delegate.clone(),
+            HashMap::new(),
+        );
+        for entry in [delegate.as_ref() as &dyn Tool, &alias as &dyn Tool] {
+            for args in [
+                json!({"action":"check_result"}),
+                json!({"action":"list_results"}),
+                json!({"action":"cancel_task"}),
+                json!({"action":"await_sessions"}),
+                json!({"background":true}),
+            ] {
+                let result = entry
+                    .execute(args)
+                    .await
+                    .expect("owned refusal is a tool result");
+                assert!(!result.success, "{result:?}");
+                assert_eq!(
+                    result.error,
+                    Some(crate::i18n::get_required_cli_string(
+                        "delegate-owned-background-unavailable"
+                    ))
+                );
+            }
+        }
+        let target = delegate
+            .memory_for_target_agent(None, "target")
+            .await
+            .unwrap()
+            .unwrap();
+        let target_owner = owner.with_agent(Some("target".into()));
+        assert_eq!(target.principal_scope(), Some(target_owner.clone()));
+        target
+            .store(
+                "factory-owner",
+                "private",
+                zeroclaw_memory::MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .inner_memory
+                .get("factory-owner")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixture
+                .inner_memory
+                .get_for_principal(&target_owner, "factory-owner")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            delegate
+                .bind_principal_scope(owner_session_scope("user:other"))
+                .is_err()
+        );
+        // Independent delegation rebuilds over the target agent's private
+        // memory. It must not try to rebind that factory to the caller agent.
+        delegate
+            .independent_agentic_tools_for_target(
+                "target",
+                Arc::new(SecurityPolicy::for_agent(config, "target").unwrap()),
+            )
+            .await
+            .expect("the private target registry retains its own agent dimension");
+
+        // The unowned factory keeps its supported shared-operator behavior.
+        let unowned = build(Arc::clone(shared));
+        assert!(unowned.principal_scope.read().is_none());
+        assert!(
+            unowned
+                .execute(json!({"action":"check_result"}))
+                .await
+                .is_err()
+        );
+        assert!(
+            unowned
+                .memory_for_target_agent(None, "target")
+                .await
+                .unwrap()
+                .unwrap()
+                .principal_scope()
                 .is_none()
         );
     }
