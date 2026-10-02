@@ -1432,3 +1432,6 @@ cron-agent-job-failed = The scheduled task could not be completed. Please try ag
 rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
 rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
+sop-store-busy = SOP storage is busy or unavailable; retry the request.
+sop-store-nonblocking-unavailable = SOP storage cannot provide immediate access; this request was refused.
+sop-rpc-definition-unavailable = The procedure definition is no longer available.
