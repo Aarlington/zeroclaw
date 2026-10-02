@@ -1444,3 +1444,7 @@ cli-sop-run-unavailable = SOP run unavailable in this session.
 rpc-cron-agent-principal-required = Agent cron jobs do not carry principal restrictions; only administrators may modify or trigger them.
 
 sop-rpc-run-admin-required = Global procedure run data requires an administrator; use the session-scoped SOP status tool for your own runs.
+cron-rpc-requested-agent-forbidden = The principal is not entitled to the requested agent.
+sop-store-busy = SOP storage is busy or unavailable; retry the request.
+sop-store-nonblocking-unavailable = SOP storage cannot provide immediate access; this request was refused.
+sop-rpc-definition-unavailable = The procedure definition is no longer available.
