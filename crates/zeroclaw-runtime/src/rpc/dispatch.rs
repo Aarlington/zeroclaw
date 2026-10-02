@@ -12076,9 +12076,9 @@ impl RpcDispatcher {
             .sop_engine
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        let runs = crate::sop::run_summaries_for(engine, req.sop.as_deref())
-            .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
+        let runs = crate::sop::run_summaries_for(engine, req.sop.as_deref());
         let _authority = self.sop_run_read_lease(Method::SopsRuns)?;
+        let runs = runs.map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
         to_result(serde_json::json!({ "runs": runs }))
     }
 
@@ -12109,7 +12109,11 @@ impl RpcDispatcher {
             .sop_engine
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        let (run, active) = crate::sop::run_detail_for(engine, &req.run_id).map_err(|e| {
+        let result = crate::sop::run_detail_for(engine, &req.run_id);
+        // Recheck before either success or error projection: a missing-run
+        // response must not become an existence oracle after revocation.
+        let _authority = self.sop_run_read_lease(Method::SopsRunDetail)?;
+        let (run, active) = result.map_err(|e| {
             let msg = e.to_string();
             let code = if msg.contains("not found") {
                 INVALID_PARAMS
@@ -12119,7 +12123,6 @@ impl RpcDispatcher {
             rpc_err(code, msg)
         })?;
         let detail = crate::sop::types::SopRunDetail::from_run(&run, active);
-        let _authority = self.sop_run_read_lease(Method::SopsRunDetail)?;
         to_result(serde_json::json!({ "run": detail }))
     }
 
@@ -12134,7 +12137,9 @@ impl RpcDispatcher {
             .sop_engine
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        let overlay = crate::sop::run_overlay_for(&sop, engine, &req.run_id).map_err(|e| {
+        let result = crate::sop::run_overlay_for(&sop, engine, &req.run_id);
+        let _authority = self.sop_run_read_lease(Method::SopsRunOverlay)?;
+        let overlay = result.map_err(|e| {
             let msg = e.to_string();
             let code = if msg.contains("not found") {
                 INVALID_PARAMS
@@ -12143,7 +12148,6 @@ impl RpcDispatcher {
             };
             rpc_err(code, msg)
         })?;
-        let _authority = self.sop_run_read_lease(Method::SopsRunOverlay)?;
         to_result(overlay)
     }
 
@@ -19273,6 +19277,72 @@ mod tests {
             .unwrap()
             .allowed_agents = vec!["*".into()];
         ctx.auth.refresh_from_config(&config).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sop_run_reads_recheck_after_contention_for_success_and_missing_results() {
+        for method in ["sops/runs", "sops/run-detail", "sops/run-overlay"] {
+            for missing in [false, true] {
+                for revoke in [false, true] {
+                    let tmp = tempfile::TempDir::new().unwrap();
+                    let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
+                    grant_sop_admin(&ctx);
+                    let run_id = park_sop_run(&engine, "alpha-sop");
+                    let (alice, _) = roster_peer(&ctx, 4242).await;
+                    let (operator, _) = local_operator(&ctx).await;
+                    let requested = if missing {
+                        "absent".to_string()
+                    } else {
+                        run_id
+                    };
+                    let held = engine.lock().unwrap();
+                    let (entered, waiting) = std::sync::mpsc::channel();
+                    let worker = std::thread::Builder::new()
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(move || {
+                            crate::sop::notify_run_read_wait_for_test(entered);
+                            let params = json!({"name":"alpha-sop", "run_id":requested});
+                            match method {
+                                "sops/runs" => alice.handle_sops_runs(&params),
+                                "sops/run-detail" => alice.handle_sops_run_detail(&params),
+                                _ => alice.handle_sops_run_overlay(&params),
+                            }
+                        })
+                        .unwrap();
+                    let arrived = waiting.recv_timeout(std::time::Duration::from_secs(3));
+                    if arrived.is_ok() && revoke {
+                        let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+                        let mut changed = ctx.config.read().clone();
+                        changed
+                            .permission_profiles
+                            .get_mut("cron-alpha")
+                            .unwrap()
+                            .admin = false;
+                        changed.mark_dirty("permission_profiles.cron-alpha");
+                        operator
+                            .save_and_swap_config(changed, &guard)
+                            .await
+                            .unwrap();
+                    }
+                    drop(held);
+                    let response = worker.join().unwrap();
+                    arrived
+                        .expect("read must pass initial admission and reach the real engine wait");
+                    if revoke {
+                        let error = response.unwrap_err();
+                        assert_eq!(error.code, FORBIDDEN, "{method}, missing={missing}");
+                        assert_eq!(
+                            error.message,
+                            crate::i18n::get_required_cli_string("sop-rpc-run-admin-required")
+                        );
+                    } else if missing && method != "sops/runs" {
+                        assert_eq!(response.unwrap_err().code, INVALID_PARAMS, "{method}");
+                    } else {
+                        assert!(response.is_ok(), "{method}: {response:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
