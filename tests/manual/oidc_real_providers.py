@@ -556,10 +556,14 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                 require('result' in self.call(reconnect, 'session/list'), 'signed reconnect cannot read')
             finally:
                 reconnect.close()
-            for stale in [{'tui_id': identity['tui_id']}, {'tui_id': identity['tui_id'], 'tui_sig': 'invalid-old-key-signature'}]:
+            require(bool(re.fullmatch('[0-9a-fA-F]{64}', identity['tui_sig'])), 'unexpected TUI signature encoding')
+            altered_sig = ('1' if identity['tui_sig'][0] == '0' else '0') + identity['tui_sig'][1:]
+            for stale in [{'tui_id': identity['tui_id']}, {'tui_id': identity['tui_id'], 'tui_sig': altered_sig}]:
                 rejected, response = self.rpc(self.native, 'native', stale)
                 try:
                     require(response.get('error', {}).get('code') == -32010, 'unverified TUI continuity accepted')
+                    require(self.call(rejected, 'session/list').get('error', {}).get('code') == -32010,
+                            'refused continuity connection can read')
                 finally:
                     rejected.close()
             native_control()
@@ -669,21 +673,25 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         self.record('local-uid-recovery-after-remote-lockout', local_recovery)
         def config_rollback():
             entries = self.entries
+            service = None
+            if 'client-credentials' in tokens:
+                service = self.enroll('service')
+                self.accepted(service, 'service')
             try:
                 self.entries = []
                 self.write_config()
                 self.start_daemon()
                 native_control()
                 self.denied()
-                if 'client-credentials' in tokens:
-                    self.denied(tokens['client-credentials'], 'oidc.service')
+                if service:
+                    self.denied(service, 'oidc.service')
             finally:
                 self.entries = entries
             self.write_config()
             self.start_daemon()
             native_control()
-            if 'client-credentials' in tokens:
-                self.accepted(self.enroll('service'), 'service')
+            if service:
+                self.accepted(service, 'service')
         self.record('oidc-config-removal-and-restore-keeps-remote-closed', config_rollback)
 
     def close(self):

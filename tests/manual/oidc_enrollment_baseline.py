@@ -33,3 +33,16 @@ try:
         raise SystemExit('baseline did not demonstrate the specific regression')
 finally:
     source.write_text(fixed)
+
+result = subprocess.run(['cargo', 'test', '--locked', '-p', 'zeroclaw-runtime', '--lib', name, '--', '--exact'],
+                        capture_output=True, text=True)
+output = result.stdout + result.stderr
+(evidence / 'enrollment-repaired.log').write_text(output)
+verified = (result.returncode == 0 and 'running 1 test' in output
+            and f'test {name} ... ok' in output and 'test result: ok. 1 passed; 0 failed;' in output)
+record = {'test': name, 'exit': result.returncode, 'exact_repaired_pass_verified': verified}
+(evidence / 'enrollment-repaired.json').write_text(json.dumps(record, indent=2))
+print(json.dumps(record), flush=True)
+if not verified:
+    print(output[-12000:])
+    raise SystemExit('repaired regression did not execute and pass exactly once')

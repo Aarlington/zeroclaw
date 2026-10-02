@@ -39,11 +39,11 @@ jobs:
       - name: Install linker
         run: bash scripts/ci/apt_install.sh mold
       - name: Prove enrollment regression and build shipped CLI
+        shell: bash
         run: |
           mkdir -p web/dist
           touch web/dist/.gitkeep
           python3 tests/manual/oidc_enrollment_baseline.py
-          cargo test --locked -p zeroclaw-runtime --lib security::auth_provider::enrollment::tests::enrollment_basic_credentials_round_trip_on_every_endpoint -- --exact 2>&1 | tee regression-evidence/enrollment-repaired.log
           cargo test --locked -p zeroclaw-runtime --lib rpc::tui_identity::tests::config_signing_key_is_used_when_runtime_data_lives_elsewhere -- --exact
           cargo build --locked -p zeroclaw --bin zeroclaw
           mkdir -p acceptance-build
