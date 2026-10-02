@@ -9802,7 +9802,7 @@ impl RpcDispatcher {
                 {
                     return Err(rpc_err(
                         FORBIDDEN,
-                        "Principal is not entitled to the requested agent",
+                        crate::i18n::get_required_cli_string("cron-rpc-requested-agent-forbidden"),
                     ));
                 }
                 if !grants.may_use_agent(&job.agent_alias) {
@@ -16904,6 +16904,7 @@ mod tests {
                                     .unwrap()
                                     .retain(|verb| *verb != zeroclaw_api::grants::Verb::Update);
                             }
+                            changed.mark_dirty("permission_profiles.cron-alpha");
                             operator
                                 .save_and_swap_config(changed, &guard)
                                 .await
