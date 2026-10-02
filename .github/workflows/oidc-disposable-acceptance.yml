@@ -1,0 +1,52 @@
+name: OIDC disposable acceptance
+
+on:
+  push:
+    branches: [codex/oidc-two-provider-acceptance]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oidc-disposable-acceptance
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'Aarlington/zeroclaw'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: '-C link-arg=-fuse-ld=mold'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+      - uses: ./.github/actions/rust-cache
+        with:
+          use-blacksmith: 'false'
+          cache-on-failure: true
+          shared-key: oidc-disposable-acceptance
+      - name: Install linker
+        run: bash scripts/ci/apt_install.sh mold
+      - name: Build the shipped CLI and daemon
+        run: |
+          mkdir -p web/dist
+          touch web/dist/.gitkeep
+          cargo build --locked -p zeroclaw --bin zeroclaw
+          mkdir -p acceptance-build
+          cp target/debug/zeroclaw acceptance-build/zeroclaw
+          git rev-parse HEAD > acceptance-build/source-sha.txt
+          sha256sum acceptance-build/zeroclaw > acceptance-build/binary-sha256.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: oidc-acceptance-binary
+          path: acceptance-build/
+          retention-days: 3
