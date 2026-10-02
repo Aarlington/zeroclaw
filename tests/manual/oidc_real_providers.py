@@ -32,6 +32,25 @@ class CheckError(Exception):
     pass
 
 
+class LocalConnection:
+    def __init__(self, path):
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.settimeout(15)
+        self.socket.connect(str(path))
+        self.reader = self.socket.makefile('rb')
+
+    def send(self, text):
+        self.socket.sendall(text.encode() + b'\n')
+
+    def recv(self, timeout):
+        self.socket.settimeout(timeout)
+        return self.reader.readline(1024 * 1024)
+
+    def close(self):
+        self.reader.close()
+        self.socket.close()
+
+
 def require(condition, message):
     if not condition:
         raise CheckError(message)
@@ -86,6 +105,7 @@ class Fixture:
         self.native = 'zc_' + secrets.token_urlsafe(32)
         self.results = []
         self.images = []
+        self.token_shapes = {}
         self.daemon = None
         self.entries = []
         self.compose = root / 'compose.json'
@@ -129,6 +149,8 @@ class Fixture:
             'provider': self.provider, 'source': os.environ.get('GITHUB_SHA'),
             'binary_sha256': hashlib.sha256(self.binary.read_bytes()).hexdigest(),
             'images': self.images,
+            'token_shapes': self.token_shapes,
+            'binary_source': (self.binary.parent / 'source-sha.txt').read_text().strip(),
             'results': self.results,
         }, indent=2))
 
@@ -199,7 +221,7 @@ class Fixture:
         env = {'AUTHENTIK_POSTGRESQL__HOST': 'postgres', 'AUTHENTIK_POSTGRESQL__USER': 'authentik',
                'AUTHENTIK_POSTGRESQL__NAME': 'authentik', 'AUTHENTIK_POSTGRESQL__PASSWORD': pg_secret,
                'AUTHENTIK_SECRET_KEY': secrets.token_hex(48), 'AUTHENTIK_BOOTSTRAP_TOKEN': self.bootstrap,
-               'AUTHENTIK_BOOTSTRAP_PASSWORD_HASH': password_hash,
+               'AUTHENTIK_BOOTSTRAP_PASSWORD_HASH': password_hash.replace('$', '$$'),
                'AUTHENTIK_BOOTSTRAP_EMAIL': 'bootstrap@example.invalid', 'AUTHENTIK_ERROR_REPORTING__ENABLED': 'false'}
         image = 'ghcr.io/goauthentik/server:2026.8.3'
         self.compose.write_text(json.dumps({'services': {
@@ -333,10 +355,12 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
     def call(ws, method, params=None):
         request_id = secrets.randbelow(1000000)
         ws.send(json.dumps({'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params or {}}))
-        while True:
-            response = json.loads(ws.recv(timeout=15))
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            response = json.loads(ws.recv(timeout=max(0.01, deadline - time.monotonic())))
             if response.get('id') == request_id:
                 return response
+        raise CheckError('RPC response deadline exceeded')
 
     def accepted(self, token, alias):
         ws, response = self.rpc(token, 'oidc.' + alias)
@@ -348,11 +372,12 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         finally:
             ws.close()
 
-    def denied(self, token=None, provider=None):
+    def denied(self, token=None, provider=None, code=-32010):
         ws, response = self.rpc(token, provider)
         try:
-            require(response.get('error', {}).get('code') == -32010, 'initialize did not return AUTH_REQUIRED')
-            require('error' in self.call(ws, 'session/list'), 'denied connection gained session read')
+            require(response.get('error', {}).get('code') == code, 'unexpected initialize denial: ' + self.error_detail(response))
+            require(self.call(ws, 'session/list').get('error', {}).get('code') == -32010,
+                    'uninitialized connection did not return AUTH_REQUIRED')
         finally:
             ws.close()
 
@@ -366,10 +391,13 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
             return self.check_token_output(result.stdout)
         proc = subprocess.Popen(args, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         messages = queue.Queue()
+        stderr_lines = []
         def drain():
             for line in proc.stderr:
+                stderr_lines.append(line)
                 messages.put(line)
-        threading.Thread(target=drain, daemon=True).start()
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
         context = browser.new_context()
         page = context.new_page()
         try:
@@ -381,6 +409,8 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                 except queue.Empty:
                     require(proc.poll() is None, 'interactive CLI exited before sign-in URL')
                     continue
+                if 'Error:' in line:
+                    raise CheckError('interactive CLI failed: ' + self.scrub(line.strip()))
                 match = re.search(r'https?://[^\s\x1b]+', line)
                 if match:
                     url = match.group().rstrip('.,')
@@ -404,11 +434,8 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                         approve.click()
                 page.wait_for_timeout(700)
             require(proc.poll() is not None, 'interactive browser flow timed out')
-            errors = []
-            while not messages.empty():
-                line = messages.get_nowait()
-                if line.startswith('Error:'):
-                    errors.append(self.scrub(line.strip()))
+            reader.join(timeout=2)
+            errors = [self.scrub(line.strip()) for line in stderr_lines if 'Error:' in line]
             require(proc.returncode == 0, 'CLI rejected completed browser flow: ' + '; '.join(errors))
             return self.check_token_output(proc.stdout.read())
         finally:
@@ -440,6 +467,11 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         def flow(name, alias, device=False):
             token = self.enroll(alias, browser if alias == 'human' else None, device)
             tokens[name] = token
+            parts = token.split('.')
+            if len(parts) == 3:
+                header = json.loads(base64.urlsafe_b64decode(parts[0] + '==='))
+                claims = json.loads(base64.urlsafe_b64decode(parts[1] + '==='))
+                self.token_shapes[name] = {'typ': header.get('typ'), 'claim_names': sorted(claims)}
             self.accepted(token, alias)
         for name, alias, device in [('client-credentials', 'service', False), ('browser-pkce', 'human', False), ('device', 'human', True)]:
             self.record(name + '-cli-through-mtls-rpc', lambda n=name, a=alias, d=device: flow(n, a, d))
@@ -455,22 +487,37 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                 ws.close()
         self.record('native-pairing-positive-control', native_control)
         if 'client-credentials' in tokens:
-            service = tokens['client-credentials']
+            def fresh_control():
+                self.write_config()
+                self.start_daemon()
+                service = self.enroll('service')
+                self.accepted(service, 'service')
+                return service
+            def restored_control(service):
+                self.write_config()
+                self.start_daemon()
+                self.accepted(service, 'service')
             def wrong_audience():
+                service = fresh_control()
                 self.write_config(audience='wrong-resource')
                 self.start_daemon()
                 self.denied(service, 'oidc.service')
+                restored_control(service)
             self.record('wrong-audience-denied', wrong_audience)
             def unmapped():
+                service = fresh_control()
                 self.write_config(map_service=False)
                 self.start_daemon()
-                self.denied(service, 'oidc.service')
+                self.denied(service, 'oidc.service', code=-32012)
+                restored_control(service)
             self.record('unmapped-service-denied', unmapped)
             def expiry():
+                service = fresh_control()
                 self.write_config(cap=1)
                 self.start_daemon()
                 time.sleep(2)
                 self.denied(service, 'oidc.service')
+                restored_control(service)
             self.record('offline-lifetime-cap-denied', expiry)
             def introspection():
                 # Public enrollment entry uses JWKS; introspection needs a
@@ -510,6 +557,39 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         self.record('rest-unauthenticated-denied', lambda: require(http('http://127.0.0.1:19617/api/sessions')[0] == 401,
                                                                   'unauthenticated REST sessions accepted'))
         self.record('native-control-after-rollback', native_control)
+        def local_recovery():
+            local = LocalConnection(self.root / 'rpc.sock')
+            try:
+                require('result' in self.call(local, 'initialize'), 'trusted daemon UID refused')
+                require('result' in self.call(local, 'config/set', {'prop': 'gateway.paired_tokens', 'value': []}),
+                        'local pairing revocation failed')
+                self.denied(self.native, 'native')
+                restored = self.call(local, 'config/set', {'prop': 'gateway.paired_tokens',
+                                                         'value': [hashlib.sha256(self.native.encode()).hexdigest()]})
+                require('result' in restored, 'local recovery refused')
+                native_control()
+                self.denied()
+            finally:
+                local.close()
+        self.record('local-uid-recovery-after-remote-lockout', local_recovery)
+        def config_rollback():
+            entries = self.entries
+            try:
+                self.entries = []
+                self.write_config()
+                self.start_daemon()
+                native_control()
+                self.denied()
+                if 'client-credentials' in tokens:
+                    self.denied(tokens['client-credentials'], 'oidc.service')
+            finally:
+                self.entries = entries
+            self.write_config()
+            self.start_daemon()
+            native_control()
+            if 'client-credentials' in tokens:
+                self.accepted(self.enroll('service'), 'service')
+        self.record('oidc-config-removal-and-restore-keeps-remote-closed', config_rollback)
 
     def close(self):
         self.stop_daemon()

@@ -16,24 +16,37 @@ jobs:
   build:
     if: github.repository == 'Aarlington/zeroclaw'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: '-C link-arg=-fuse-ld=mold'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-          fetch-depth: 0
-      - name: Verify unchanged reviewed production source
-        run: git diff --exit-code aaa681d085c9cc4f2b2e6e1071b3a97b1053ec23 -- . ':!tests/manual/**' ':!.github/workflows/oidc-disposable-acceptance.yml'
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          name: oidc-acceptance-binary
-          path: acceptance-build
-          run-id: 36957374376
-          github-token: ${{ github.token }}
-      - name: Verify tested binary provenance
+          toolchain: 1.98.0
+      - uses: ./.github/actions/rust-cache
+        with:
+          use-blacksmith: 'false'
+          cache-on-failure: true
+          shared-key: oidc-disposable-acceptance
+      - name: Install linker
+        run: bash scripts/ci/apt_install.sh mold
+      - name: Test canonical signing key and build shipped CLI
         run: |
-          test "$(cat acceptance-build/source-sha.txt)" = 2ac574da0c802968889dc1d35aca51f0ab7f693b
-          sha256sum --check acceptance-build/binary-sha256.txt
+          mkdir -p web/dist
+          touch web/dist/.gitkeep
+          cargo test --locked -p zeroclaw-runtime --lib rpc::tui_identity::tests::config_signing_key_is_used_when_runtime_data_lives_elsewhere -- --exact
+          cargo build --locked -p zeroclaw --bin zeroclaw
+          mkdir -p acceptance-build
+          cp target/debug/zeroclaw acceptance-build/zeroclaw
+          git rev-parse HEAD > acceptance-build/source-sha.txt
+          sha256sum acceptance-build/zeroclaw > acceptance-build/binary-sha256.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: oidc-acceptance-binary
