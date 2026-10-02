@@ -85,6 +85,7 @@ class Fixture:
         self.bootstrap = secrets.token_hex(32)
         self.native = 'zc_' + secrets.token_urlsafe(32)
         self.results = []
+        self.images = []
         self.daemon = None
         self.entries = []
         self.compose = root / 'compose.json'
@@ -110,6 +111,12 @@ class Fixture:
             result = {'case': name, 'status': 'failed', 'error_type': type(exc).__name__}
             if isinstance(exc, CheckError):
                 result['detail'] = str(exc)
+            if name == 'real-provider-and-daemon-setup' and self.compose.exists():
+                # Setup has not issued any OAuth tokens yet. Keep only error
+                # diagnostics, redact fixture credentials and URLs, never env.
+                logs = self.docker('logs', '--no-color', '--tail', '60')
+                result['setup_errors'] = [self.scrub(line) for line in logs.stdout.splitlines()
+                                          if re.search(r'error|exception|failed|fatal', line, re.I)][-12:]
         result['seconds'] = round(time.monotonic() - started, 2)
         self.results.append(result)
         print(json.dumps(result), flush=True)
@@ -121,6 +128,7 @@ class Fixture:
         (self.evidence / f'{self.provider}.json').write_text(json.dumps({
             'provider': self.provider, 'source': os.environ.get('GITHUB_SHA'),
             'binary_sha256': hashlib.sha256(self.binary.read_bytes()).hexdigest(),
+            'images': self.images,
             'results': self.results,
         }, indent=2))
 
@@ -129,6 +137,12 @@ class Fixture:
             self.setup_keycloak()
         else:
             self.setup_authentik()
+        images = self.docker('images', '-q')
+        require(images.returncode == 0, 'cannot record provider image identities')
+        for image_id in sorted(set(images.stdout.split())):
+            inspected = command(['docker', 'image', 'inspect', '--format', '{{json .RepoDigests}}', image_id])
+            require(inspected.returncode == 0, 'cannot record provider image digest')
+            self.images.append({'id': image_id, 'repo_digests': json.loads(inspected.stdout)})
         self.write_config()
         self.start_daemon()
 
@@ -140,6 +154,7 @@ class Fixture:
                     'serviceAccountsEnabled': not public,
                     'redirectUris': ['http://127.0.0.1/callback', 'http://127.0.0.1:*'],
                     'attributes': {'oauth2.device.authorization.grant.enabled': 'true',
+                                   'access.token.header.type.rfc9068': 'true',
                                    'pkce.code.challenge.method': 'S256'},
                     'protocolMappers': [
                         {'name': 'client identity', 'protocol': 'openid-connect',
@@ -269,12 +284,15 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
             text += 'interactive_clients = ["zc-human"]\nservice_clients = ["zc-service"]\n'
             text += 'profile_map = { reader = "reader" }\n'
             text += 'service_profile_map = ' + ('{ "zc-service" = "reader" }' if map_service else '{}') + '\n'
-            text += 'max_auth_lifetime_secs = ' + str(cap) + '\nrevalidation_secs = 0\n'
+            text += 'max_auth_lifetime_secs = ' + str(cap) + '\nrevalidation_secs = 5\n'
         self.config.write_text(text)
         self.config.chmod(0o600)
 
     def start_daemon(self):
         self.stop_daemon()
+        saved = command([str(self.binary), 'config', 'set', 'security.trust_daemon_uid', 'true', '--no-interactive', '--json'], env=self.env)
+        require(saved.returncode == 0, 'CLI config save failed')
+        require((self.config.parent / '.secret_key').exists(), 'CLI config save did not provision signing key')
         self.daemon_log = open(self.root / 'daemon.log', 'w')
         self.daemon = subprocess.Popen([str(self.binary), 'daemon'], env=self.env,
                                         stdout=self.daemon_log, stderr=subprocess.STDOUT)
@@ -323,7 +341,7 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
     def accepted(self, token, alias):
         ws, response = self.rpc(token, 'oidc.' + alias)
         try:
-            require('result' in response, 'OIDC initialize denied')
+            require('result' in response, 'OIDC initialize denied: ' + self.error_detail(response))
             require('result' in self.call(ws, 'session/list'), 'authorized read denied')
             denied = self.call(ws, 'config/set', {'prop': 'wss.port', 'value': 19782})
             require(denied.get('error', {}).get('code') == -32012, 'reader config write not forbidden')
@@ -333,7 +351,7 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
     def denied(self, token=None, provider=None):
         ws, response = self.rpc(token, provider)
         try:
-            require('error' in response, 'invalid remote credential accepted')
+            require(response.get('error', {}).get('code') == -32010, 'initialize did not return AUTH_REQUIRED')
             require('error' in self.call(ws, 'session/list'), 'denied connection gained session read')
         finally:
             ws.close()
@@ -386,7 +404,12 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                         approve.click()
                 page.wait_for_timeout(700)
             require(proc.poll() is not None, 'interactive browser flow timed out')
-            require(proc.returncode == 0, 'CLI rejected completed browser flow')
+            errors = []
+            while not messages.empty():
+                line = messages.get_nowait()
+                if line.startswith('Error:'):
+                    errors.append(self.scrub(line.strip()))
+            require(proc.returncode == 0, 'CLI rejected completed browser flow: ' + '; '.join(errors))
             return self.check_token_output(proc.stdout.read())
         finally:
             context.close()
@@ -400,6 +423,17 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         token = stdout.strip()
         require(bool(token) and not any(c.isspace() for c in token), 'CLI returned invalid token output')
         return token
+
+    def scrub(self, text):
+        for value in [self.password, self.secret, self.native, self.bootstrap]:
+            text = text.replace(value, '[redacted]')
+        text = re.sub(r'eyJ[A-Za-z0-9_\-.]+', '[jwt]', text)
+        text = re.sub(r'https?://\S+', '[url]', text)
+        return text[:500]
+
+    def error_detail(self, response):
+        error = response.get('error', {})
+        return self.scrub(str(error.get('code')) + ': ' + str(error.get('message')))
 
     def run_cases(self, browser):
         tokens = {}
@@ -415,7 +449,7 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         def native_control():
             ws, response = self.rpc(self.native, 'native')
             try:
-                require('result' in response, 'native paired token rejected')
+                require('result' in response, 'native paired token rejected: ' + self.error_detail(response))
                 require('result' in self.call(ws, 'session/list'), 'native read refused')
             finally:
                 ws.close()
@@ -458,13 +492,19 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                         status, _ = http(discovery['revocation_endpoint'], {'token': fresh, 'token_type_hint': 'access_token'},
                                          form=True, basic=(entry['client'], entry['secret']))
                         require(status == 200, 'provider revocation failed')
-                        require('error' in self.call(ws, 'session/list'), 'existing connection survived revoked credential')
+                        # RPC identities intentionally retain no raw token. They
+                        # fail closed at the revalidation deadline and require
+                        # a fresh handshake; they do not poll introspection.
+                        time.sleep(6)
+                        expired = self.call(ws, 'session/list')
+                        require(expired.get('error', {}).get('code') == -32010,
+                                'existing connection outlived introspection deadline')
                     finally:
                         ws.close()
                     self.denied(fresh, 'oidc.service')
                 finally:
                     self.entries = saved
-            self.record('introspection-revocation-live-and-reconnect', introspection)
+            self.record('introspection-deadline-and-revoked-reconnect', introspection)
         self.write_config()
         self.start_daemon()
         self.record('rest-unauthenticated-denied', lambda: require(http('http://127.0.0.1:19617/api/sessions')[0] == 401,
