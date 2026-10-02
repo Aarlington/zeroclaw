@@ -24,7 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as BrowserTimeoutError, sync_playwright
 from websockets.sync.client import connect
 
 
@@ -177,7 +177,7 @@ class Fixture:
                     'redirectUris': ['http://127.0.0.1/callback', 'http://127.0.0.1:*'],
                     'attributes': {'oauth2.device.authorization.grant.enabled': 'true',
                                    'access.token.header.type.rfc9068': 'true',
-                                   'pkce.code.challenge.method': 'S256'},
+                                   **({'pkce.code.challenge.method': 'S256'} if name == 'zc-human' else {})},
                     'protocolMappers': [
                         {'name': 'client identity', 'protocol': 'openid-connect',
                          'protocolMapper': 'oidc-hardcoded-claim-mapper',
@@ -188,6 +188,10 @@ class Fixture:
                          'protocolMapper': 'oidc-audience-mapper',
                          'config': {'included.custom.audience': 'zeroclaw',
                                     'access.token.claim': 'true', 'introspection.token.claim': 'true'}},
+                        {'name': 'introspecting client audience', 'protocol': 'openid-connect',
+                         'protocolMapper': 'oidc-audience-mapper',
+                         'config': {'included.custom.audience': name,
+                                    'access.token.claim': 'true', 'introspection.token.claim': 'true'}},
                         {'name': 'reader role', 'protocol': 'openid-connect',
                          'protocolMapper': 'oidc-hardcoded-claim-mapper',
                          'config': {'claim.name': 'roles', 'claim.value': 'reader',
@@ -196,7 +200,8 @@ class Fixture:
         reserved_id = 'zc-service: +/%'
         realm = {'realm': 'zc-test', 'enabled': True, 'sslRequired': 'none',
                  'accessTokenLifespan': 300,
-                 'clients': [client('zc-human', True), client('zc-service', False), client(reserved_id, False)],
+                 'clients': [client('zc-human', True), client('zc-device', True),
+                             client('zc-service', False), client(reserved_id, False)],
                  'users': [{'username': 'acceptance-user', 'enabled': True,
                             'emailVerified': True, 'firstName': 'Synthetic', 'lastName': 'User',
                             'email': 'acceptance@example.invalid',
@@ -213,6 +218,7 @@ class Fixture:
         issuer = 'http://127.0.0.1:18080/realms/zc-test'
         wait_for(lambda: http(issuer + '/.well-known/openid-configuration')[0] == 200)
         self.entries = [dict(alias='human', issuer=issuer, audience='zeroclaw', client='zc-human'),
+                        dict(alias='device', issuer=issuer, audience='zeroclaw', client='zc-device'),
                         dict(alias='service', issuer=issuer, audience='zeroclaw', client='zc-service', secret=self.secret),
                         dict(alias='reserved', issuer=issuer, audience='zeroclaw', client=reserved_id, secret=self.secret)]
 
@@ -314,7 +320,7 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                 text += key + ' = ' + q(val) + '\n'
             if 'secret' in entry:
                 text += 'client_secret = ' + q(entry['secret']) + '\n'
-            text += 'interactive_clients = ["zc-human"]\nservice_clients = ["zc-service"]\n'
+            text += 'interactive_clients = ["zc-human", "zc-device"]\nservice_clients = ["zc-service"]\n'
             text += 'profile_map = { reader = "reader" }\n'
             text += 'service_profile_map = ' + ('{ "zc-service" = "reader" }' if map_service else '{}') + '\n'
             text += 'max_auth_lifetime_secs = ' + str(cap) + '\nrevalidation_secs = 5\n'
@@ -424,6 +430,7 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         reader.start()
         context = browser.new_context()
         page = context.new_page()
+        stage = 'read sign-in URL'
         try:
             deadline = time.monotonic() + 45
             url = None
@@ -439,7 +446,9 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                 if match:
                     url = match.group().rstrip('.,')
             require(url is not None, 'CLI did not present sign-in URL')
-            page.goto(url)
+            stage = 'open provider sign-in page'
+            page.goto(url, wait_until='domcontentloaded')
+            stage = 'complete provider sign-in'
             deadline = time.monotonic() + 80
             while time.monotonic() < deadline and proc.poll() is None:
                 # Playwright pierces authentik's open shadow roots.
@@ -462,6 +471,10 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
             errors = [self.scrub(line.strip()) for line in stderr_lines if 'Error:' in line]
             require(proc.returncode == 0, 'CLI rejected completed browser flow: ' + '; '.join(errors))
             return self.check_token_output(proc.stdout.read())
+        except BrowserTimeoutError:
+            if proc.poll() == 0:
+                return self.check_token_output(proc.stdout.read())
+            raise CheckError('browser timed out during: ' + stage) from None
         finally:
             context.close()
             if proc.poll() is None:
@@ -497,7 +510,7 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                                          {'client_id': entry['client'], 'scope': 'openid'}, form=True)
                 self.token_shapes['device-endpoint-probe'] = {'status': status, 'error': response.get('error'),
                     'description': self.scrub(response.get('error_description', ''))}
-            token = self.enroll(alias, browser if alias == 'human' else None, device)
+            token = self.enroll(alias, browser if alias in ['human', 'device'] else None, device)
             tokens[name] = token
             parts = token.split('.')
             if len(parts) == 3:
@@ -505,7 +518,8 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                 claims = json.loads(base64.urlsafe_b64decode(parts[1] + '==='))
                 self.token_shapes[name] = {'typ': header.get('typ'), 'claim_names': sorted(claims)}
             self.accepted(token, alias)
-        for name, alias, device in [('client-credentials', 'service', False), ('browser-pkce', 'human', False), ('device', 'human', True)]:
+        device_alias = 'device' if self.provider == 'keycloak' else 'human'
+        for name, alias, device in [('client-credentials', 'service', False), ('browser-pkce', 'human', False), ('device', device_alias, True)]:
             self.record(name + '-cli-through-mtls-rpc', lambda n=name, a=alias, d=device: flow(n, a, d))
         self.record('mtls-without-bearer-denied', lambda: self.denied())
         self.record('bad-bearer-denied', lambda: self.denied('invalid-token', 'oidc.service'))
