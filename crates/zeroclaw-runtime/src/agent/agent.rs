@@ -6247,6 +6247,57 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn sop_read_tools_without_a_route_refuse_owner_pinning_including_aliases() {
+        for name in ["sop_status", "sop_list"] {
+            for aliased in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let shared: Arc<dyn Memory> =
+                    Arc::new(zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).unwrap());
+                let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+                    zeroclaw_config::schema::SopConfig::default(),
+                )));
+                let target: Arc<dyn Tool> = match name {
+                    "sop_status" => Arc::new(crate::tools::SopStatusTool::new(engine)),
+                    _ => Arc::new(crate::tools::SopListTool::new(engine)),
+                };
+                let tool: Box<dyn Tool> = if aliased {
+                    let mut skill = make_skill("peek", &["runs"]);
+                    skill.tools[0].kind = "builtin".into();
+                    skill.tools[0].target = Some(name.into());
+                    Box::new(crate::tools::skill_tool::SkillBuiltinTool::new(
+                        "peek",
+                        &skill.tools[0],
+                        target,
+                        HashMap::new(),
+                    ))
+                } else {
+                    Box::new(crate::tools::ArcToolRef(target))
+                };
+                let mut agent = Agent::builder()
+                    .model_provider(Box::new(MockModelProvider {
+                        responses: Mutex::new(Vec::new()),
+                    }))
+                    .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                        vec![tool],
+                    ))
+                    .memory(Arc::clone(&shared))
+                    .memory_security(Arc::new(crate::security::SecurityPolicy::default()))
+                    .observer(Arc::new(crate::observability::NoopObserver {}))
+                    .tool_dispatcher(Box::new(NativeToolDispatcher))
+                    .workspace_dir(tmp.path().to_path_buf())
+                    .build()
+                    .unwrap();
+                let refused = agent.route_memory_to_principal(
+                    zeroclaw_api::memory_traits::PrincipalScope::new("user:alice"),
+                );
+                assert!(refused.is_err(), "{name}, aliased={aliased}");
+                assert!(agent.memory_principal().is_none());
+                assert!(Arc::ptr_eq(&agent.memory, &shared));
+            }
+        }
+    }
+
     /// A cross-agent SOP step of an owned session re-assembles under the
     /// session's owner, and an unowned session's steps carry no owner.
     #[tokio::test]
