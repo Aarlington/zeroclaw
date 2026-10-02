@@ -8645,28 +8645,68 @@ impl RpcDispatcher {
             name: req.name,
             ..Default::default()
         };
-        // The ownership test rides in the `UPDATE` itself for a scoped
-        // principal, so an agent rename landing between the check and the
-        // write cannot open a window. An operator-level principal patches
-        // any row, including the ownerless legacy ones.
-        let owner = self.authorize_cron_job(Method::CronPatch, &config, &req.id)?;
-        self.authorize_cron_agent_execution(Method::CronPatch, &owner)?;
-        // Validate a replacement command under the owning agent's policy before
-        // it is persisted. `cron/add` validates on the way in; without the same
-        // check here an invalid command can replace a working job through the
-        // patch path, and the job only fails later, at execution.
-        if let Some(command) = patch.command.as_deref()
-            && !command.trim().is_empty()
-        {
-            crate::cron::validate_shell_command(&config, &owner.agent_alias, command, true)
-                .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron patch rejected: {e}")))?;
+        // Keep the opaque initial ownership refusal, but repeat all authority
+        // and row checks under the actual writer transaction below.
+        self.authorize_cron_job(Method::CronPatch, &config, &req.id)?;
+        let command = patch.command.clone();
+        let denied = parking_lot::Mutex::new(None);
+        let job = crate::cron::update_job_authorized(&config, &req.id, None, patch, |job| {
+            let authorize = || -> Result<_, JsonRpcError> {
+                // Storage first, then config -> accepted authority -> pairing,
+                // with no further storage acquisition or await after resolution.
+                let live = self.ctx.config.read();
+                let lease = self.ctx.auth.hold_authority();
+                let auth = self
+                    .auth
+                    .as_ref()
+                    .ok_or_else(|| rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"))?;
+                let grants = current_authority_under(&lease, auth, Method::CronPatch)
+                    .map_err(|error| rpc_err(error.code, error.message))?;
+                if !grants.may_use_agent(&req.agent)
+                    || (!grants.admin && !live.agents.contains_key(&req.agent))
+                {
+                    return Err(rpc_err(
+                        FORBIDDEN,
+                        "Principal is not entitled to the requested agent",
+                    ));
+                }
+                if !grants.may_use_agent(&job.agent_alias) {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        format!(
+                            "Cron job not found: {}",
+                            crate::cron::job_not_found(&req.id)
+                        ),
+                    ));
+                }
+                if job.job_type == crate::cron::JobType::Agent && !grants.admin {
+                    return Err(rpc_err(
+                        FORBIDDEN,
+                        crate::i18n::get_required_cli_string("rpc-cron-agent-principal-required"),
+                    ));
+                }
+                if let Some(command) = command
+                    .as_deref()
+                    .filter(|command| !command.trim().is_empty())
+                {
+                    crate::cron::validate_shell_command(&live, &job.agent_alias, command, true)
+                        .map_err(|error| {
+                            rpc_err(INVALID_PARAMS, format!("Cron patch rejected: {error}"))
+                        })?;
+                }
+                Ok((live, lease))
+            };
+            authorize().map_err(|error| {
+                let message = error.message.clone();
+                *denied.lock() = Some(error);
+                anyhow::Error::msg(message)
+            })
+        });
+        if let Some(error) = denied.into_inner() {
+            return Err(error);
         }
-        let job = if self.has_admin_grants() {
-            crate::cron::update_job(&config, &req.id, patch)
-        } else {
-            crate::cron::update_job_for_agent(&config, &req.id, &owner.agent_alias, patch)
-        }
-        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron patch failed: {e}")))?;
+        let job =
+            job.map_err(|error| rpc_err(INTERNAL_ERROR, format!("Cron patch failed: {error}")))?;
         to_result(job)
     }
 
@@ -15209,6 +15249,130 @@ mod tests {
             "a rejected patch must leave the stored command unchanged"
         );
         assert_eq!(reread.name.as_deref(), job.name.as_deref());
+    }
+
+    #[test]
+    fn cron_patch_rechecks_authority_and_row_after_sqlite_writer_wait() {
+        run_on_a_large_stack(|| async {
+            for scenario in [
+                "agent-demotion",
+                "shell-revocation",
+                "owner-change",
+                "type-change",
+                "agent-control",
+                "shell-control",
+            ] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let mut config = cron_roster_config_in(&tmp, 4242);
+                let agent = scenario.starts_with("agent-");
+                config
+                    .permission_profiles
+                    .get_mut("cron-alpha")
+                    .unwrap()
+                    .admin = agent;
+                let job = if agent {
+                    seed_cron_job(&config, "alpha", "original")
+                } else {
+                    crate::cron::add_shell_job_with_approval(
+                        &config,
+                        "alpha",
+                        Some("original".into()),
+                        Schedule::Every { every_ms: 3600000 },
+                        "echo original",
+                        None,
+                        true,
+                    )
+                    .unwrap()
+                };
+                let ctx = enforcement_ctx(config.clone());
+                let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+                let (operator, _) = local_operator(&ctx).await;
+                let writer =
+                    rusqlite::Connection::open(config.data_dir.join("cron/jobs.db")).unwrap();
+                writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+                let (arrived, waiting) = std::sync::mpsc::channel();
+                let id = job.id.clone();
+                let worker = std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        crate::cron::notify_patch_writer_wait_for_test(arrived);
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap()
+                            .block_on(rpc(
+                                &mut alice,
+                                &mut rx,
+                                1,
+                                "cron/patch",
+                                json!({"id":id,"agent":"alpha","name":"patched"}),
+                            ))
+                    })
+                    .unwrap();
+                let arrival = waiting.recv_timeout(std::time::Duration::from_secs(3));
+                if arrival.is_ok() {
+                    match scenario {
+                        "agent-demotion" | "shell-revocation" => {
+                            let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+                            let mut changed = ctx.config.read().clone();
+                            let profile =
+                                changed.permission_profiles.get_mut("cron-alpha").unwrap();
+                            profile.admin = false;
+                            if scenario == "shell-revocation" {
+                                profile
+                                    .grants
+                                    .get_mut(&zeroclaw_api::grants::Resource::Cron)
+                                    .unwrap()
+                                    .retain(|verb| *verb != zeroclaw_api::grants::Verb::Update);
+                            }
+                            operator
+                                .save_and_swap_config(changed, &guard)
+                                .await
+                                .unwrap();
+                        }
+                        "owner-change" => {
+                            writer
+                                .execute(
+                                    "UPDATE cron_jobs SET agent_alias='beta' WHERE id=?1",
+                                    [&job.id],
+                                )
+                                .unwrap();
+                        }
+                        "type-change" => {
+                            writer.execute("UPDATE cron_jobs SET job_type='agent', prompt='private' WHERE id=?1", [&job.id]).unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+                writer.execute_batch("COMMIT").unwrap();
+                let response = worker.join().unwrap();
+                arrival.expect("patch must enter the real SQLite writer wait");
+                let stored = crate::cron::get_job(&config, &job.id).unwrap();
+                if scenario.ends_with("control") {
+                    assert!(response.get("error").is_none(), "{scenario}: {response}");
+                    assert_eq!(stored.name.as_deref(), Some("patched"));
+                } else {
+                    assert_eq!(
+                        response["error"]["code"],
+                        json!(if scenario == "owner-change" {
+                            INVALID_PARAMS
+                        } else {
+                            FORBIDDEN
+                        }),
+                        "{scenario}: {response}"
+                    );
+                    assert_eq!(stored.name.as_deref(), Some("original"), "{scenario}");
+                    assert_eq!(stored.command, job.command);
+                    assert_eq!(stored.next_run, job.next_run);
+                }
+                assert!(stored.last_run.is_none());
+                assert!(
+                    crate::cron::list_runs(&config, &job.id, 10)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        });
     }
 
     #[tokio::test]
