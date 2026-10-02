@@ -19295,7 +19295,18 @@ mod tests {
                     } else {
                         run_id
                     };
-                    let held = engine.lock().unwrap();
+                    let (locked, acquired) = std::sync::mpsc::channel();
+                    let (release, released) = std::sync::mpsc::channel();
+                    let holder = std::thread::spawn(move || {
+                        let _held = engine.lock().unwrap();
+                        locked.send(()).unwrap();
+                        // Dropping the sender also releases the lock if a test
+                        // assertion fails before the ordinary release signal.
+                        let _ = released.recv();
+                    });
+                    acquired
+                        .recv_timeout(std::time::Duration::from_secs(3))
+                        .unwrap();
                     let (entered, waiting) = std::sync::mpsc::channel();
                     let worker = std::thread::Builder::new()
                         .stack_size(8 * 1024 * 1024)
@@ -19324,7 +19335,8 @@ mod tests {
                             .await
                             .unwrap();
                     }
-                    drop(held);
+                    release.send(()).unwrap();
+                    holder.join().unwrap();
                     let response = worker.join().unwrap();
                     arrived
                         .expect("read must pass initial admission and reach the real engine wait");
