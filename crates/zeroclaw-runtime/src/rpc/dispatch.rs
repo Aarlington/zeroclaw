@@ -15838,7 +15838,6 @@ mod tests {
         results
     }
 
-    #[tokio::test]
     async fn assert_session_data_tools_withheld(
         agent: &Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
         foreign_session_key: &str,
