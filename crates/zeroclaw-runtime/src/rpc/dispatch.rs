@@ -7771,44 +7771,37 @@ impl RpcDispatcher {
             None
         };
 
+        let update = built_model_provider.map(
+            |(
+                model_provider,
+                model_provider_name,
+                model_name,
+                model_route_resolver,
+                tool_dispatcher,
+                config_generation,
+            )| crate::rpc::session::ModelProviderUpdate {
+                model_provider,
+                model_provider_name,
+                model_name,
+                model_route_resolver,
+                tool_dispatcher,
+                config_generation: Arc::clone(&config_generation),
+                temperature: None,
+                multimodal_config: config_generation.multimodal.clone(),
+            },
+        );
         let merged = self
             .ctx
             .sessions
-            .set_overrides_gated(&req.session_id, session_generation, req.overrides)
-            .await
+            .configure_authorized(
+                &req.session_id,
+                session_generation,
+                merged,
+                update,
+                |session| self.live_effect_lease(Method::SessionConfigure, session),
+            )
+            .await?
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-
-        if let Some((
-            model_provider,
-            model_provider_name,
-            model_name,
-            model_route_resolver,
-            tool_dispatcher,
-            config_generation,
-        )) = built_model_provider
-        {
-            self.ctx
-                .sessions
-                .apply_model_provider(
-                    &req.session_id,
-                    session_generation,
-                    crate::rpc::session::ModelProviderUpdate {
-                        model_provider,
-                        model_provider_name,
-                        model_name,
-                        model_route_resolver,
-                        tool_dispatcher,
-                        config_generation: Arc::clone(&config_generation),
-                        // Temperature is already committed through
-                        // `set_overrides_gated` on this path.
-                        temperature: None,
-                        multimodal_config: config_generation.multimodal.clone(),
-                    },
-                )
-                .await
-                .then_some(())
-                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        }
 
         to_result(SessionConfigureResult {
             session_id: req.session_id,
@@ -12186,10 +12179,16 @@ impl RpcDispatcher {
         }
 
         let mut resolved_outcome = None;
+        self.ctx
+            .sessions
+            .wait_test_effect_pause("sop-decision-admission")
+            .await;
         {
             let mut guard = engine
                 .lock()
                 .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
+            self.authorize_sop_execution(Method::SopsDecide, guard.get_sop(&req.name))?;
+            let _authority = self.sop_execution_lease(Method::SopsDecide)?;
             let run_sop_name = guard
                 .get_run(&req.run_id)
                 .map(|run| run.sop_name.clone())
@@ -12205,25 +12204,11 @@ impl RpcDispatcher {
                     ),
                 ));
             }
-            // Check the loaded run's procedure after acquiring the same lock
-            // that guards the broker mutation, never a detached disk snapshot.
-            self.authorize_sop_execution(Method::SopsDecide, guard.get_sop(&run_sop_name))?;
             use crate::sop::approval::{BrokerOutcome, ResolveOutcome};
             let principal = crate::sop::approval::ApprovalPrincipal::cli(self.tui_id.clone());
-            let denied = parking_lot::Mutex::new(None);
             let outcome = guard.with_nonblocking_store(|engine| {
-                let _authority = self
-                    .sop_execution_lease(Method::SopsDecide)
-                    .map_err(|error| {
-                        let reason = error.message.clone();
-                        *denied.lock() = Some(error);
-                        anyhow::Error::msg(reason)
-                    })?;
                 engine.resolve_via_broker_deferred(&req.run_id, decision, principal)
             });
-            if let Some(error) = denied.into_inner() {
-                return Err(error);
-            }
             match outcome.map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))? {
                 outcome @ BrokerOutcome::Resolved(ResolveOutcome::Resumed(_)) => {
                     resolved_outcome = Some(outcome);
@@ -12291,7 +12276,15 @@ impl RpcDispatcher {
             );
         }
 
-        let overlay = crate::sop::run_overlay_for(&sop, &engine, &req.run_id).map_err(|e| {
+        self.ctx
+            .sessions
+            .wait_test_effect_pause("sop-decision-result")
+            .await;
+        let result = crate::sop::run_overlay_for(&sop, &engine, &req.run_id);
+        // The effect lease ended before driving the resumed work. The final
+        // read can wait again; authorize its success and error projections.
+        let _authority = self.sop_execution_lease(Method::SopsDecide)?;
+        let overlay = result.map_err(|e| {
             let msg = e.to_string();
             let code = if msg.contains("not found") {
                 INVALID_PARAMS
@@ -19956,6 +19949,81 @@ mod tests {
             engine.lock().unwrap().get_run(&run_id).unwrap().status,
             crate::sop::SopRunStatus::WaitingApproval
         );
+    }
+
+    #[tokio::test]
+    async fn sop_decide_rechecks_before_lookup_and_final_projection() {
+        for (boundary, target) in [
+            ("sop-decision-admission", "valid"),
+            ("sop-decision-admission", "missing"),
+            ("sop-decision-admission", "mismatched"),
+            ("sop-decision-result", "valid"),
+        ] {
+            for revoke in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
+                allow_all_sop_agents(&ctx);
+                grant_sop_admin(&ctx);
+                let run_id = park_sop_run(&engine, "alpha-sop");
+                let requested = match target {
+                    "missing" => "missing".to_string(),
+                    "mismatched" => park_sop_run(&engine, "beta-sop"),
+                    _ => run_id.clone(),
+                };
+                let (alice, _) = roster_peer(&ctx, 4242).await;
+                let (operator, _) = local_operator(&ctx).await;
+                let (entered, release) = ctx.sessions.set_test_effect_pause(boundary);
+                let params = json!({
+                    "name":"alpha-sop", "run_id":requested, "decision":{"deny":{}}
+                });
+                let request = alice.handle_sops_decide(&params);
+                let change = async {
+                    entered.notified().await;
+                    if revoke {
+                        let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+                        let mut changed = ctx.config.read().clone();
+                        changed
+                            .permission_profiles
+                            .get_mut("cron-alpha")
+                            .unwrap()
+                            .admin = false;
+                        changed.mark_dirty("permission_profiles.cron-alpha");
+                        operator
+                            .save_and_swap_config(changed, &guard)
+                            .await
+                            .unwrap();
+                    }
+                    release.notify_one();
+                };
+                let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(request, change)
+                })
+                .await
+                .expect("decision reaches and leaves the effect boundary");
+                if revoke {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.code, FORBIDDEN, "{boundary}, {target}");
+                    assert_eq!(
+                        error.message,
+                        crate::i18n::get_required_cli_string("sop-rpc-principal-ceiling-required")
+                    );
+                } else if target == "valid" {
+                    assert!(result.is_ok(), "{result:?}");
+                } else {
+                    assert_eq!(result.unwrap_err().code, INVALID_PARAMS);
+                }
+                let status = engine.lock().unwrap().get_run(&run_id).unwrap().status;
+                let changed = target == "valid" && (!revoke || boundary == "sop-decision-result");
+                assert_eq!(
+                    status,
+                    if changed {
+                        crate::sop::SopRunStatus::Cancelled
+                    } else {
+                        crate::sop::SopRunStatus::WaitingApproval
+                    }
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -45135,6 +45203,87 @@ mod tests {
     /// generation, enters the gated method, then the session is removed and
     /// recreation starts while the stale configure is paused. The stale work must be
     /// rejected and the successor must remain untouched.
+    #[tokio::test]
+    async fn session_configure_revoked_at_commit_changes_neither_overrides_nor_agent() {
+        for model_change in [false, true] {
+            for revoke in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let mut config = make_model_refresh_test_config(&tmp);
+                config.gateway.paired_tokens = vec!["zc_configure_test".into()];
+                let mut dispatcher = make_config_set_test_dispatcher(config);
+                dispatcher
+                    .handle_initialize(&json!({"auth_token":"zc_configure_test"}))
+                    .await
+                    .unwrap();
+                let sid = create_model_refresh_test_session(&dispatcher, &tmp).await;
+                let sessions = Arc::clone(&dispatcher.ctx.sessions);
+                let before_overrides = sessions
+                    .preview_overrides(&sid, &Default::default())
+                    .await
+                    .unwrap();
+                let before_model = model_name_for_session(&dispatcher, &sid).await;
+                let before_temperature = temperature_for_session(&dispatcher, &sid).await;
+                let (entered, release, _) = sessions.set_test_gated_op_pause();
+                let mut overrides = json!({"temperature":0.99});
+                if model_change {
+                    overrides["model_provider"] = json!("openai.test-provider");
+                    overrides["model"] = json!("configured-model");
+                }
+                let params = json!({"session_id":sid,"overrides":overrides});
+                let request = dispatcher.handle_session_configure(&params);
+                let change = async {
+                    entered.notified().await;
+                    if revoke {
+                        assert!(
+                            dispatcher
+                                .ctx
+                                .auth
+                                .pairing()
+                                .revoke_token("zc_configure_test")
+                        );
+                    }
+                    release.notify_one();
+                };
+                let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(request, change)
+                })
+                .await
+                .expect("configure reaches and leaves its final commit boundary");
+                sessions.clear_test_gated_op_pause();
+                if revoke {
+                    assert_eq!(result.unwrap_err().code, AUTH_REQUIRED);
+                    let after = sessions
+                        .preview_overrides(&sid, &Default::default())
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(after).unwrap(),
+                        serde_json::to_value(before_overrides).unwrap()
+                    );
+                    assert_eq!(
+                        model_name_for_session(&dispatcher, &sid).await,
+                        before_model
+                    );
+                    assert_eq!(
+                        temperature_for_session(&dispatcher, &sid).await,
+                        before_temperature
+                    );
+                } else {
+                    assert!(result.is_ok(), "{result:?}");
+                    assert_eq!(temperature_for_session(&dispatcher, &sid).await, Some(0.99));
+                    assert_eq!(
+                        model_name_for_session(&dispatcher, &sid).await,
+                        if model_change {
+                            "configured-model"
+                        } else {
+                            before_model.as_str()
+                        }
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn session_configure_stale_gen_replaced_during_provider_build() {
         let tmp = tempfile::TempDir::new().unwrap();
