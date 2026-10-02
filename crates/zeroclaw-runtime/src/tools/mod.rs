@@ -2202,15 +2202,23 @@ fn all_tools_with_runtime_on_thread(
             ));
         } else {
             tool_arcs.push(Arc::new(
-                SopExecuteTool::new(Arc::clone(sop_engine)).with_initiator(agent_alias),
+                SopExecuteTool::new(Arc::clone(sop_engine))
+                    .with_session_memory(Arc::clone(&session_memory))
+                    .with_initiator(agent_alias),
             ));
-            tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
             tool_arcs.push(Arc::new(
-                SopApproveTool::new(Arc::clone(sop_engine)).with_agent_alias(agent_alias),
+                SopAdvanceTool::new(Arc::clone(sop_engine))
+                    .with_session_memory(Arc::clone(&session_memory)),
+            ));
+            tool_arcs.push(Arc::new(
+                SopApproveTool::new(Arc::clone(sop_engine))
+                    .with_session_memory(Arc::clone(&session_memory))
+                    .with_agent_alias(agent_alias),
             ));
         }
         tool_arcs.push(Arc::new(
             SopStatusTool::new(Arc::clone(sop_engine))
+                .with_session_memory(Arc::clone(&session_memory))
                 .with_collector(crate::sop::SopMetricsCollector::shared()),
         ));
         if root_config.sop.procedural_memory_enabled {
