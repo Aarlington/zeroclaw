@@ -70,11 +70,16 @@ async fn sop_entry_tools_and_aliases_cannot_escape_principal_ceilings() {
             for posture in ["tool-scoped", "agent-scoped", "wildcard", "admin"] {
                 // A permitted execute control parks at approval, so it reaches
                 // the real engine without starting a headless provider turn.
-                if target != "sop_execute" && matches!(posture, "wildcard" | "admin") {
+                if target != "sop_execute" && posture == "admin" {
                     continue;
                 }
                 let tmp = tempfile::TempDir::new().unwrap();
                 let mut config = principal_test_config(&tmp, &["*"], &["*"]);
+                config
+                    .permission_profiles
+                    .get_mut("principal-test")
+                    .unwrap()
+                    .admin = true;
                 let target_config = config.agents["test-agent"].clone();
                 config.agents.insert("target-agent".into(), target_config);
                 let name = if alias { "sop_guard__invoke" } else { target };
@@ -138,6 +143,7 @@ async fn sop_entry_tools_and_aliases_cannot_escape_principal_ceilings() {
                         .permission_profiles
                         .get_mut("principal-test")
                         .unwrap();
+                    profile.admin = posture == "admin";
                     match posture {
                         "tool-scoped" => {
                             profile.allowed_tools = vec![name.into(), "calculator".into()]
@@ -193,7 +199,7 @@ async fn sop_entry_tools_and_aliases_cannot_escape_principal_ceilings() {
                     .unwrap()
                     .clone()
                     .expect("the model receives the tool result");
-                let constrained = matches!(posture, "tool-scoped" | "agent-scoped");
+                let constrained = posture != "admin";
                 assert_eq!(
                     agent.lock().await.tool_names().contains(&name),
                     !constrained
