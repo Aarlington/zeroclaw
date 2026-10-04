@@ -33,11 +33,12 @@ importantly, what changes for existing remote connections.
      live session held under such an alias is refused. The other
      session methods do not check the agent yet, as described under
      [What this layer does not do (yet)](#what-this-layer-does-not-do-yet);
-   - running or approving an SOP requires unrestricted tool and agent
-     selectors plus `tools:execute`, or administrator grants. Creating,
-     saving, or deleting one requires the agents it runs as. A step that names
-     no agent, on the step or on the procedure, counts as the first configured agent alias in
-     sort order, which is the agent the headless executor falls back to.
+   - RPC `sops/run` and `sops/decide` require administrator grants, including
+     when the caller has wildcard tool and agent selectors. Creating,
+     saving, or deleting a procedure retains its separate agent-selector checks.
+     A step that names no agent, on the step or on the procedure, counts as the
+     first configured agent alias in sort order, which is the agent the
+     headless executor falls back to.
      Every step counts, including the steps of a deterministic procedure;
    - attachments, personality files, cost queries that name an agent, and
      cron jobs check the agent selector. An attachment sent by local path
