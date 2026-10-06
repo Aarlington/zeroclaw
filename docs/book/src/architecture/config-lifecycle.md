@@ -20,7 +20,8 @@ For the build order, tracked-output rules, and drift checks that turn the typed 
 | Generated reference | `cargo mdbook refs` / `markdown-schema` | `docs/book/src/reference/config.md` at build time | Documentation only |
 | Bootstrap location | `ZEROCLAW_CONFIG_DIR`, `ZEROCLAW_DATA_DIR`, deprecated `ZEROCLAW_WORKSPACE` | Environment only | Before `Config` exists |
 | Schema-mirror overrides | `ZEROCLAW_<lowercase_path>` with `__` for dots | In-memory only | Each `Config::load_or_init()` |
-| CLI config writes | `zeroclaw config set`, `config patch`, aliases, model helpers | `save_dirty()` to `config.toml` | Next load/reload unless the current command uses the new in-memory value |
+| Disk-only CLI config writes | Config and alias writes outside daemon-routed agent-alias paths, including authorization sections | `save_dirty()` to `config.toml` | Next load/reload unless the current command uses the new in-memory value |
+| Daemon-routed CLI agent mutations | With `agent-runtime`, agent-targeting `config set` / `config init` and agent-alias create, rename, and delete | Daemon RPC (`config/*` and `agents/delete*`) while running; guarded disk writes when offline | The daemon coordinates the mutation; agent-targeting `config patch` refuses while the daemon owns config |
 | RPC and TUI config writes | `config/*` RPC methods used by zerocode | `save_dirty()` to `config.toml` | Shared live config and accepted authorization policy update before success; daemon-owned subsystems that need rebuilding still need reload |
 | Quickstart apply | Shared web, CLI, and zerocode apply path | `save_dirty()` to `config.toml` | Web and RPC can signal daemon reload; standalone CLI applies on next load/reload |
 | Gateway config writes | Config API handlers and `persist_and_swap()` | `save_dirty()` to `config.toml` | Live config and accepted authorization policy update before success; shared with RPC in a supervised run; other daemon subsystems apply after reload |
@@ -117,9 +118,12 @@ for connection revalidation and the separate pairing-token revocation boundary.
 
 The reload banner still tells the operator that channels, providers, scheduler,
 or other daemon-owned components may be running from the previous subsystem
-instance. Direct file edits and CLI config writes do not use that in-process
-publication path: they take effect at the next load, reload, or restart. The CLI
-does not currently trigger a daemon reload after saving.
+instance. Direct file edits, and CLI writes outside daemon-routed agent-alias
+paths (including authorization sections), do not use that in-process publication
+path: they take effect at the next load, reload, or restart. These disk-only CLI
+writes do not trigger a daemon reload after saving. With `agent-runtime`, supported
+agent-alias mutations use the running daemon's RPC; agent-targeting
+`config patch` refuses while the daemon owns config.
 
 Standalone `zeroclaw gateway start` has no daemon supervisor. Its reload
 endpoint returns a restart-required response because there is no outer daemon
