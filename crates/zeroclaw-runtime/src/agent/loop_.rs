@@ -3336,7 +3336,7 @@ pub(crate) async fn process_message_shared_with_admission(
 
 pub(crate) async fn process_message_shared_with_live_config_and_admission(
     config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -3358,7 +3358,7 @@ pub(crate) async fn process_message_shared_with_live_config_and_admission(
 
 pub(crate) async fn process_message_shared_with_live_config_and_admission_and_principal(
     config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -3383,7 +3383,7 @@ pub(crate) async fn process_message_shared_with_live_config_and_admission_and_pr
 /// source for tools that resolve security policy at execution time.
 pub async fn process_message_with_live_config(
     config: Config,
-    live_config: Arc<parking_lot::RwLock<Config>>,
+    live_config: zeroclaw_config::live::LiveConfigHandle,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -3403,7 +3403,7 @@ pub async fn process_message_with_live_config(
 
 pub async fn process_message_with_live_config_and_admission(
     config: Config,
-    live_config: Arc<parking_lot::RwLock<Config>>,
+    live_config: zeroclaw_config::live::LiveConfigHandle,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -3425,7 +3425,7 @@ pub async fn process_message_with_live_config_and_admission(
 
 async fn process_message_inner(
     mut config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -19691,10 +19691,10 @@ Let me check the result."#;
             None,
         )
         .await;
-        let live_config = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let live_config = zeroclaw_config::live::LiveConfig::new(config.clone());
         let live_result = super::process_message_with_live_config(
             config,
-            live_config,
+            live_config.handle(),
             "process-message-reassembly-agent",
             "hello",
             Some("session"),
@@ -19845,16 +19845,16 @@ Let me check the result."#;
         std::fs::create_dir_all(config.agent_workspace_dir("live-file-download-agent"))
             .expect("agent workspace directory");
 
-        let live_config = Arc::new(RwLock::new(config.clone()));
+        let live_config = zeroclaw_config::live::LiveConfig::new(config.clone());
+        let mut reloaded = live_config.snapshot();
+        reloaded.file_download.allowed_private_hosts.clear();
         live_config
-            .write()
-            .file_download
-            .allowed_private_hosts
-            .clear();
+            .publish(live_config.next_revision().unwrap(), reloaded)
+            .unwrap();
 
         let result = super::process_message_with_live_config(
             config.clone(),
-            live_config,
+            live_config.handle(),
             "live-file-download-agent",
             "download the private document",
             Some("session"),
