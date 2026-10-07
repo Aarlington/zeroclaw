@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import tomllib
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -129,7 +130,16 @@ class Fixture:
         except Exception as exc:
             # Never serialize arbitrary exception strings: browser/HTTP errors
             # can embed authorization URLs, callback codes or credentials.
-            result = {'case': name, 'status': 'failed', 'error_type': type(exc).__name__}
+            result = {'case': name, 'status': 'failed', 'error_type': type(exc).__name__,
+                      'harness_frames': [{'function': frame.name, 'line': frame.lineno}
+                                         for frame in traceback.extract_tb(exc.__traceback__)
+                                         if Path(frame.filename).resolve() == Path(__file__).resolve()]}
+            # Codes are protocol metadata. Never retain a peer-provided close
+            # reason, exception text, request payload or frame locals.
+            for direction in ['rcvd', 'sent']:
+                code = getattr(getattr(exc, direction, None), 'code', None)
+                if isinstance(code, int):
+                    result[direction + '_close_code'] = code
             if isinstance(exc, CheckError):
                 result['detail'] = str(exc)
             if name == 'real-provider-and-daemon-setup' and self.compose.exists():
@@ -514,6 +524,14 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         return self.scrub(str(error.get('code')) + ': ' + str(error.get('message')))
 
     def principal_boundaries(self, browser):
+        try:
+            return self.check_principal_boundaries(browser)
+        finally:
+            # Enrollment/setup failures must also restore the following cases.
+            self.write_config()
+            self.start_daemon()
+
+    def check_principal_boundaries(self, browser):
         """Equal grants force ownership checks to decide, at real RPC/storage boundaries."""
         self.write_config(participants=True)
         self.start_daemon()
@@ -663,16 +681,19 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                 response = self.call(ws, 'memory/get', {'key': key})
                 require(response.get('error', {}).get('code') == -32010,
                         'old OIDC connection retained authority after policy publication')
+                ws.close()
             ar, _ = connect_human(tokens[0])
             br, _ = connect_human(tokens[1])
             for ws in [ar, br]:
                 success(ws, 'session/list')
                 forbidden(ws, 'memory/get', {'key': key})
                 forbidden(ws, 'memory/store', {'key': key, 'content': 'revoked overwrite'})
+                ws.close()
             success(local, 'config/set', {'prop': prop, 'value': 'roles'})
             restored, pa = connect_human(tokens[0])
             require(pa == principal_a and get_memory(restored, key) == value_a,
                     'revoked write changed owner data or mapping did not restore')
+            restored.close()
             checked.append('live mapping narrows fresh grants and invalidates existing OIDC connections')
 
             # Only B's actual subject is mapped. Changing OIDC configuration
@@ -690,11 +711,13 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                 response = self.call(ws, 'memory/get', {'key': key})
                 require(response.get('error', {}).get('code') == -32010,
                         'old OIDC connection retained authority after provider reconfiguration')
+                ws.close()
             self.denied(tokens[0], 'oidc.human', code=-32012)
             b3, pb3 = connect_human(tokens[1])
             require(pb3 == principal_b, 'unaffected reconnect changed principal')
             success(b3, 'memory/store', {'key': key, 'content': value_b})
             require(get_memory(b3, key) == value_b, 'unaffected subject no longer has memory access')
+            b3.close()
             success(local, 'config/set', {'prop': prop, 'value': 'roles'})
             a3, pa3 = connect_human(tokens[0])
             b4, pb4 = connect_human(tokens[1])
@@ -721,8 +744,6 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                 ws.close()
             if local:
                 local.close()
-            self.write_config()
-            self.start_daemon()
 
     def run_cases(self, browser):
         tokens = {}
