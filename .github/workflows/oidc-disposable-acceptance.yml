@@ -38,17 +38,24 @@ jobs:
           shared-key: oidc-disposable-acceptance
       - name: Install linker
         run: bash scripts/ci/apt_install.sh mold
-      - name: Prove enrollment regression and build shipped CLI
+      - name: Verify current regressions and build shipped CLI
         shell: bash
         run: |
           mkdir -p web/dist
           touch web/dist/.gitkeep
-          python3 tests/manual/oidc_enrollment_baseline.py
-          cargo test --locked -p zeroclaw-runtime --lib rpc::tui_identity::tests::config_signing_key_is_used_when_runtime_data_lives_elsewhere -- --exact
+          python3 tests/manual/oidc_exact_regressions.py
+          # Acceptance-only files must be the entire delta from the reviewed PR.
+          git diff --exit-code fb72711ae81f146ba641bcaaee01e2ff6d9c6807 -- . \
+            ':(exclude).github/workflows/oidc-disposable-acceptance.yml' \
+            ':(exclude)tests/manual/oidc_baseline_regressions.py' \
+            ':(exclude)tests/manual/oidc_enrollment_baseline.py' \
+            ':(exclude)tests/manual/oidc_exact_regressions.py' \
+            ':(exclude)tests/manual/oidc_real_providers.py'
           cargo build --locked -p zeroclaw --bin zeroclaw
           mkdir -p acceptance-build
           cp target/debug/zeroclaw acceptance-build/zeroclaw
           git rev-parse HEAD > acceptance-build/source-sha.txt
+          echo fb72711ae81f146ba641bcaaee01e2ff6d9c6807 > acceptance-build/production-source-sha.txt
           sha256sum acceptance-build/zeroclaw > acceptance-build/binary-sha256.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -59,7 +66,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: oidc-enrollment-regression
+          name: oidc-current-regressions
           path: regression-evidence/
           retention-days: 7
 
@@ -84,6 +91,7 @@ jobs:
           python3 -m venv /tmp/oidc-test-venv
           /tmp/oidc-test-venv/bin/pip install playwright==1.58.0 websockets==15.0.1
           /tmp/oidc-test-venv/bin/playwright install --with-deps chromium
+          sha256sum --check acceptance-build/binary-sha256.txt
           chmod +x acceptance-build/zeroclaw
       - name: Exercise shipped CLI and daemon against real provider
         run: /tmp/oidc-test-venv/bin/python tests/manual/oidc_real_providers.py ${{ matrix.provider }} --binary acceptance-build/zeroclaw

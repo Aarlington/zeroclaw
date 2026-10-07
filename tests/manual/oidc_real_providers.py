@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -151,10 +152,13 @@ class Fixture:
             'images': self.images,
             'token_shapes': self.token_shapes,
             'binary_source': (self.binary.parent / 'source-sha.txt').read_text().strip(),
+            'production_source': (self.binary.parent / 'production-source-sha.txt').read_text().strip(),
             'results': self.results,
         }, indent=2))
 
     def start(self):
+        require(os.environ.get('GITHUB_SHA') == (self.binary.parent / 'source-sha.txt').read_text().strip(),
+                'fixture and binary source revisions differ')
         if self.provider == 'keycloak':
             self.setup_keycloak()
         else:
@@ -202,13 +206,14 @@ class Fixture:
                  'accessTokenLifespan': 300,
                  'clients': [client('zc-human', True), client('zc-device', True),
                              client('zc-service', False), client(reserved_id, False)],
-                 'users': [{'username': 'acceptance-user', 'enabled': True,
+                 'users': [{'username': username, 'enabled': True,
                             'emailVerified': True, 'firstName': 'Synthetic', 'lastName': 'User',
-                            'email': 'acceptance@example.invalid',
-                            'credentials': [{'type': 'password', 'value': self.password, 'temporary': False}]}]}
+                            'email': username + '@example.invalid',
+                            'credentials': [{'type': 'password', 'value': self.password, 'temporary': False}]}
+                           for username in ['acceptance-user', 'acceptance-peer']]}
         (self.root / 'realm.json').write_text(json.dumps(realm))
         self.compose.write_text(json.dumps({'services': {'keycloak': {
-            'image': 'quay.io/keycloak/keycloak:26.8.0',
+            'image': 'quay.io/keycloak/keycloak@sha256:b0f60d489d51c5d113390bdf5461d4c06e6051be026c05549f2e1e10ec352bcc',
             'command': ['start-dev', '--import-realm'],
             'ports': ['127.0.0.1:18080:8080'],
             'volumes': [str(self.root / 'realm.json') + ':/opt/keycloak/data/import/realm.json:ro'],
@@ -232,9 +237,9 @@ class Fixture:
                'AUTHENTIK_SECRET_KEY': secrets.token_hex(48), 'AUTHENTIK_BOOTSTRAP_TOKEN': self.bootstrap,
                'AUTHENTIK_BOOTSTRAP_PASSWORD_HASH': password_hash.replace('$', '$$'),
                'AUTHENTIK_BOOTSTRAP_EMAIL': 'bootstrap@example.invalid', 'AUTHENTIK_ERROR_REPORTING__ENABLED': 'false'}
-        image = 'ghcr.io/goauthentik/server:2026.8.3'
+        image = 'ghcr.io/goauthentik/server@sha256:ab9b4e8cc4ab3f8d1198d2db6aeea66bafea1963b3f2843589e0d163f97d9849'
         self.compose.write_text(json.dumps({'services': {
-            'postgres': {'image': 'postgres:16-alpine',
+            'postgres': {'image': 'postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea',
                          'environment': {'POSTGRES_DB': 'authentik', 'POSTGRES_USER': 'authentik', 'POSTGRES_PASSWORD': pg_secret},
                          'healthcheck': {'test': ['CMD-SHELL', 'pg_isready -U authentik'], 'interval': '5s', 'retries': 40},
                          'volumes': ['database:/var/lib/postgresql/data']},
@@ -290,7 +295,7 @@ class Fixture:
                 entry['secret'] = self.secret
             self.entries.append(entry)
 
-    def write_config(self, validation='jwks', audience=None, cap=300, map_service=True):
+    def write_config(self, validation='jwks', audience=None, cap=300, map_service=True, participants=False, participant_subject=None):
         q = json.dumps
         text = '''schema_version = 3
 [providers.models.ollama.default]
@@ -301,8 +306,13 @@ model = "acceptance-unused-model"
 model_provider = "ollama.default"
 risk_profile = "default"
 runtime_profile = "default"
+[memory]
+backend = "sqlite"
 [permission_profiles.reader]
 grants = { sessions = ["read"] }
+[permission_profiles.participant]
+allowed_agents = ["default"]
+grants = { sessions = ["create", "read", "update", "delete"], memory = ["create", "read", "delete"] }
 [wss]
 enabled = true
 bind = "127.0.0.1"
@@ -321,7 +331,11 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
             if 'secret' in entry:
                 text += 'client_secret = ' + q(entry['secret']) + '\n'
             text += 'interactive_clients = ["zc-human", "zc-device"]\nservice_clients = ["zc-service"]\n'
-            text += 'profile_map = { reader = "reader" }\n'
+            profile = 'participant' if participants and entry['alias'] == 'human' else 'reader'
+            mapping = {'reader': profile}
+            if participants and entry['alias'] == 'human' and participant_subject:
+                mapping.update({'zeroclaw': 'reader', participant_subject: 'participant'})
+            text += 'profile_map = { ' + ', '.join(q(k) + ' = ' + q(v) for k, v in mapping.items()) + ' }\n'
             text += 'service_profile_map = ' + ('{ "zc-service" = "reader" }' if map_service else '{}') + '\n'
             text += 'max_auth_lifetime_secs = ' + str(cap) + '\nrevalidation_secs = 5\n'
         self.config.write_text(text)
@@ -411,7 +425,7 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         finally:
             ws.close()
 
-    def enroll(self, alias, browser=None, device=False):
+    def enroll(self, alias, browser=None, device=False, username='acceptance-user'):
         args = [str(self.binary), 'oidc', 'login' if browser else 'token', alias]
         if browser and not device:
             args.append('--browser')
@@ -455,7 +469,7 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                 user = page.locator('input[name="username"], input[name="uidField"], input[autocomplete="username"]').first
                 password = page.locator('input[type="password"]').first
                 if user.is_visible():
-                    user.fill('acceptance-user')
+                    user.fill(username)
                 if password.is_visible():
                     password.fill(self.password)
                 button = page.locator('button[type="submit"], input[type="submit"]').first
@@ -499,6 +513,217 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         error = response.get('error', {})
         return self.scrub(str(error.get('code')) + ': ' + str(error.get('message')))
 
+    def principal_boundaries(self, browser):
+        """Equal grants force ownership checks to decide, at real RPC/storage boundaries."""
+        self.write_config(participants=True)
+        self.start_daemon()
+        tokens = [self.enroll('human', browser, username=user)
+                  for user in ['acceptance-user', 'acceptance-peer']]
+        subjects = [json.loads(base64.urlsafe_b64decode(token.split('.')[1] + '==='))['sub']
+                    for token in tokens]
+        require(subjects[0] != subjects[1], 'provider issued the same subject to both users')
+        # Prepare both mapping destinations before the measured live-change
+        # phase. Compound mapping fields are not config/set scalar properties.
+        self.write_config(participants=True, participant_subject=subjects[1])
+        self.start_daemon()
+        connections = []
+        identities = {}
+        local = None
+
+        def success(ws, method, params=None):
+            response = self.call(ws, method, params)
+            require('result' in response and 'error' not in response,
+                    method + ' positive control failed: ' + self.error_detail(response))
+            return response['result']
+
+        def forbidden(ws, method, params):
+            response = self.call(ws, method, params)
+            require(response.get('error', {}).get('code') == -32012,
+                    method + ' foreign/policy request not forbidden: ' + self.error_detail(response))
+
+        def connect_human(token, continuity=None):
+            ws, response = self.rpc(token, 'oidc.human', continuity)
+            connections.append(ws)
+            require('result' in response, 'participant initialize failed: ' + self.error_detail(response))
+            principal = response['result'].get('principal_id')
+            require(bool(principal), 'participant initialized without a principal')
+            identities[principal] = {name: response['result'].get(name) for name in ['tui_id', 'tui_sig']}
+            require(all(identities[principal].values()), 'participant has no signed continuity')
+            forbidden(ws, 'config/set', {'prop': 'wss.port', 'value': 19782})
+            return ws, principal
+
+        def get_memory(ws, key):
+            return success(ws, 'memory/get', {'key': key})['entry']['content']
+
+        def missing_memory(ws, key):
+            response = self.call(ws, 'memory/get', {'key': key})
+            require(response.get('error', {}).get('code') == -32603
+                    and response.get('error', {}).get('message') == f'Memory key `{key}` not found',
+                    'missing private memory did not match the missing-key contract')
+
+        checked = []
+        try:
+            a, principal_a = connect_human(tokens[0])
+            b, principal_b = connect_human(tokens[1])
+            require(principal_a != principal_b, 'distinct provider users collapsed to one principal')
+            checked.append('distinct non-admin principals with equal grants')
+
+            # The same public key is safe to reuse: principal identity chooses
+            # the private namespace, never a caller-supplied owner field.
+            key = 'acceptance-private-' + secrets.token_hex(8)
+            value_a, value_b = 'private alpha sentinel', 'private beta sentinel'
+            require(success(a, 'memory/store', {'key': key, 'content': value_a})['stored'] is True,
+                    'owner memory store was not acknowledged')
+            require(get_memory(a, key) == value_a, 'owner memory store was not observable')
+            missing_memory(b, 'never-stored-' + secrets.token_hex(8))
+            missing_memory(b, key)
+            for method, params in [('memory/list', {}), ('memory/search', {'query': 'sentinel'})]:
+                own = success(a, method, params)['entries']
+                foreign = success(b, method, params)['entries']
+                require(any(row['key'] == key and row['content'] == value_a for row in own),
+                        method + ' failed to expose the owner sentinel')
+                require(all(row['key'] != key and value_a not in row['content'] for row in foreign),
+                        method + ' disclosed the foreign sentinel')
+            success(b, 'memory/delete', {'key': key})  # Missing private key: documented no-op.
+            require(get_memory(a, key) == value_a, 'foreign private delete changed owner data')
+            success(b, 'memory/store', {'key': key, 'content': value_b})
+            require(get_memory(a, key) == value_a and get_memory(b, key) == value_b,
+                    'same-key writes crossed principal namespaces')
+            for ws in [a, b]:
+                forbidden(ws, 'memory/get', {'key': key, 'plane': 'shared'})
+                forbidden(ws, 'memory/store', {'key': key, 'content': 'shared overwrite', 'plane': 'shared'})
+            success(b, 'memory/delete', {'key': key})
+            missing_memory(b, key)
+            require(get_memory(a, key) == value_a, 'peer own deletion changed owner data')
+            checked.append('private memory read/search/list/store/delete and shared-plane refusal')
+
+            # Independent TUI registrations would reject at the transport
+            # owner gate and could mask a missing principal gate. Share genuine
+            # signed continuity sequentially, never reuse an epoch superseded
+            # by a reconnect, and require distinct principals after each login.
+            shared_continuity = identities[principal_a]
+            created_a = success(a, 'session/new', {'agent_alias': 'default', 'keep_siblings': True})
+            require(bool(created_a.get('session_id')), 'owner session creation returned no identifier')
+            success(a, 'session/configure', {'session_id': created_a['session_id'],
+                                             'overrides': {'temperature': 0.2}})
+            a.close()
+            b.close()
+            b, pb = connect_human(tokens[1], shared_continuity)
+            require(pb == principal_b, 'shared continuity changed peer identity')
+            created_b = success(b, 'session/new', {'agent_alias': 'default', 'keep_siblings': True})
+            require(bool(created_b.get('session_id')), 'peer session creation returned no identifier')
+            success(b, 'session/configure', {'session_id': created_b['session_id'],
+                                             'overrides': {'temperature': 0.2}})
+            sessions = [created_a['session_id'], created_b['session_id']]
+            require(sessions[0] != sessions[1], 'new sessions reused the same identifier')
+            for index in [1, 0]:
+                if index == 0:
+                    b.close()
+                    a, pa = connect_human(tokens[0], shared_continuity)
+                    require(pa == principal_a, 'shared continuity changed owner identity')
+                owner = b if index else a
+                own, foreign = sessions[index], sessions[1 - index]
+                listed = success(owner, 'session/list')['sessions']
+                require(any(row['session_id'] == own for row in listed), 'own session absent from list')
+                require(all(row['session_id'] != foreign for row in listed), 'foreign session listed')
+                success(owner, 'session/messages', {'session_id': own})
+                configured = success(owner, 'session/configure',
+                                     {'session_id': own, 'overrides': {}})
+                require(configured['overrides']['temperature'] == 0.2, 'owner configure had no effect')
+                forbidden(owner, 'session/messages', {'session_id': foreign})
+                forbidden(owner, 'session/configure', {'session_id': foreign, 'overrides': {'temperature': 0.9}})
+                forbidden(owner, 'session/new', {'agent_alias': 'default', 'session_id': foreign})
+                forbidden(owner, 'session/delete', {'session_id': foreign})
+                owner.close()
+            # Read each owner's unchanged session under the same transport
+            # registration, after the other principal tried to mutate/delete it.
+            for index, token in enumerate(tokens):
+                owner, principal = connect_human(token, shared_continuity)
+                require(principal == [principal_a, principal_b][index], 'owner continuity rebound identity')
+                unchanged = success(owner, 'session/configure', {'session_id': sessions[index], 'overrides': {}})
+                require(unchanged['overrides']['temperature'] == 0.2,
+                        'denied configure changed the live owner session')
+                success(owner, 'session/messages', {'session_id': sessions[index]})
+                owner.close()
+            checked.append('bidirectional session isolation with shared signed TUI continuity')
+            a, _ = connect_human(tokens[0])
+            b, _ = connect_human(tokens[1])
+
+            # Narrow authority through the supported local RPC and verify its
+            # durable value. Policy publication invalidates old OIDC bindings;
+            # fresh handshakes then prove the narrower method grants.
+            local = LocalConnection(self.root / 'rpc.sock')
+            success(local, 'initialize')
+            prop = 'oidc.human.claim_path'
+            success(local, 'config/set', {'prop': prop, 'value': 'aud'})
+            persisted = tomllib.loads(self.config.read_text())
+            require(persisted['oidc']['human']['claim_path'] == 'aud',
+                    'live mapping narrowing was not persisted')
+            for ws in [a, b]:
+                response = self.call(ws, 'memory/get', {'key': key})
+                require(response.get('error', {}).get('code') == -32010,
+                        'old OIDC connection retained authority after policy publication')
+            ar, _ = connect_human(tokens[0])
+            br, _ = connect_human(tokens[1])
+            for ws in [ar, br]:
+                success(ws, 'session/list')
+                forbidden(ws, 'memory/get', {'key': key})
+                forbidden(ws, 'memory/store', {'key': key, 'content': 'revoked overwrite'})
+            success(local, 'config/set', {'prop': prop, 'value': 'roles'})
+            restored, pa = connect_human(tokens[0])
+            require(pa == principal_a and get_memory(restored, key) == value_a,
+                    'revoked write changed owner data or mapping did not restore')
+            checked.append('live mapping narrows fresh grants and invalidates existing OIDC connections')
+
+            # Only B's actual subject is mapped. Changing OIDC configuration
+            # expires ALL old OIDC bindings; the unaffected user must reconnect
+            # with the same valid token after the accepted config publication.
+            a2, pa2 = connect_human(tokens[0])
+            b2, pb2 = connect_human(tokens[1])
+            require((pa2, pb2) == (principal_a, principal_b), 'reconnect changed canonical identity')
+            require(get_memory(a2, key) == value_a, 'reconnected owner lost private memory')
+            success(local, 'config/set', {'prop': prop, 'value': 'sub'})
+            persisted = tomllib.loads(self.config.read_text())
+            require(persisted['oidc']['human']['claim_path'] == 'sub',
+                    'selective subject mapping was not persisted')
+            for ws in [a2, b2]:
+                response = self.call(ws, 'memory/get', {'key': key})
+                require(response.get('error', {}).get('code') == -32010,
+                        'old OIDC connection retained authority after provider reconfiguration')
+            self.denied(tokens[0], 'oidc.human', code=-32012)
+            b3, pb3 = connect_human(tokens[1])
+            require(pb3 == principal_b, 'unaffected reconnect changed principal')
+            success(b3, 'memory/store', {'key': key, 'content': value_b})
+            require(get_memory(b3, key) == value_b, 'unaffected subject no longer has memory access')
+            success(local, 'config/set', {'prop': prop, 'value': 'roles'})
+            a3, pa3 = connect_human(tokens[0])
+            b4, pb4 = connect_human(tokens[1])
+            require((pa3, pb4) == (principal_a, principal_b), 'restored principals changed identity')
+            require(get_memory(a3, key) == value_a and get_memory(b4, key) == value_b,
+                    'selective revocation/restoration crossed private namespaces')
+            checked.append('selective subject revocation plus unaffected and restored reconnect controls')
+            a3.close()
+            b4.close()
+            for token, sid in zip(tokens, sessions):
+                ws, _ = connect_human(token, shared_continuity)
+                success(ws, 'session/new', {'agent_alias': 'default', 'session_id': sid, 'keep_siblings': True})
+                require(success(ws, 'session/delete', {'session_id': sid})['deleted'] is True,
+                        'owner delete was not acknowledged')
+                require(all(row['session_id'] != sid for row in success(ws, 'session/list')['sessions']),
+                        'owner session deletion had no observable effect')
+                success(ws, 'memory/delete', {'key': key})
+                missing_memory(ws, key)
+                ws.close()
+            checked.append('owner deletion controls after reconnect')
+            return {'verified_boundaries': checked, 'daemon_restarted_during_checks': False}
+        finally:
+            for ws in connections:
+                ws.close()
+            if local:
+                local.close()
+            self.write_config()
+            self.start_daemon()
+
     def run_cases(self, browser):
         tokens = {}
         def flow(name, alias, device=False):
@@ -521,6 +746,8 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         device_alias = 'device' if self.provider == 'keycloak' else 'human'
         for name, alias, device in [('client-credentials', 'service', False), ('browser-pkce', 'human', False), ('device', device_alias, True)]:
             self.record(name + '-cli-through-mtls-rpc', lambda n=name, a=alias, d=device: flow(n, a, d))
+        if self.provider == 'keycloak':
+            self.record('two-real-principals-isolation-and-live-revocation', lambda: self.principal_boundaries(browser))
         self.record('mtls-without-bearer-denied', lambda: self.denied())
         self.record('bad-bearer-denied', lambda: self.denied('invalid-token', 'oidc.service'))
         self.record('native-token-wrong-provider-no-fallback', lambda: self.denied(self.native, 'oidc.service'))
