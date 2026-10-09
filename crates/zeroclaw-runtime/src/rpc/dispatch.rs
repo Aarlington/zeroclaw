@@ -8506,7 +8506,7 @@ impl RpcDispatcher {
                 {
                     return Err(self.stale_session_incarnation_error());
                 }
-                let authorize = |owner| {
+                let authorize = |owner: Option<&str>| {
                     self.durable_effect_lease(Method::SessionAppend, expected_owner, owner)
                         .map(|lease| {
                             Box::new(lease)
@@ -8570,7 +8570,7 @@ impl RpcDispatcher {
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
         let expected_owner = record.as_ref().and_then(|record| record.owner.as_deref());
         let key = Self::durable_chat_key(record.clone(), Method::SessionRename)?;
-        let authorize = |owner| {
+        let authorize = |owner: Option<&str>| {
             self.durable_effect_lease(Method::SessionRename, expected_owner, owner)
                 .map(|lease| {
                     Box::new(lease) as Box<dyn zeroclaw_infra::session_backend::SessionEffectGuard>
@@ -20033,7 +20033,7 @@ mod tests {
                 let change = async {
                     entered.notified().await;
                     if revoke {
-                        let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+                        let commit = ctx.config_authority.begin_config_commit().await;
                         let mut changed = ctx.config.read().clone();
                         changed
                             .permission_profiles
@@ -20042,7 +20042,11 @@ mod tests {
                             .admin = false;
                         changed.mark_dirty("permission_profiles.cron-alpha");
                         operator
-                            .save_and_swap_config(changed, &guard)
+                            .save_and_publish_config(
+                                commit,
+                                changed,
+                                RpcConfigCommitEffects::default(),
+                            )
                             .await
                             .unwrap();
                     }
@@ -48040,6 +48044,7 @@ mod tests {
         .await;
         let successor = ctx.sessions.get_generation(sid).await.unwrap();
         assert_ne!(successor, original);
+        let bound = *created.lock();
         let prompt = operator
             .run_session_prompt(
                 SessionPromptParams {
@@ -48048,13 +48053,13 @@ mod tests {
                     client_turn_generation: None,
                     attachments: Vec::new(),
                 },
-                *created.lock(),
+                bound,
             )
             .await;
         assert!(prompt.is_err());
         assert!(
             operator
-                .handle_session_close_bound(&json!({"session_id":sid}), *created.lock())
+                .handle_session_close_bound(&json!({"session_id":sid}), bound)
                 .await
                 .is_err()
         );
