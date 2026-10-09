@@ -20196,7 +20196,7 @@ mod tests {
                         .unwrap();
                     let arrived = waiting.recv_timeout(std::time::Duration::from_secs(3));
                     if arrived.is_ok() && revoke {
-                        let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+                        let commit = ctx.begin_config_commit().await.unwrap();
                         let mut changed = ctx.config.read().clone();
                         changed
                             .permission_profiles
@@ -20205,7 +20205,11 @@ mod tests {
                             .admin = false;
                         changed.mark_dirty("permission_profiles.cron-alpha");
                         operator
-                            .save_and_swap_config(changed, &guard)
+                            .save_and_publish_config(
+                                commit,
+                                changed,
+                                RpcConfigCommitEffects::default(),
+                            )
                             .await
                             .unwrap();
                     }
