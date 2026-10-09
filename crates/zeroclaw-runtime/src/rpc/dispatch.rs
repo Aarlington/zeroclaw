@@ -48184,15 +48184,12 @@ mod tests {
             let mut retained = None;
             if revoke_cleanup {
                 let (entered, release) = ctx.sessions.set_test_removal_signal_pause();
-                let mut request = Box::pin(operator.process_line(&line));
-                tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                    tokio::select! {
-                        _ = &mut request => panic!("run-once returned before cleanup"),
-                        _ = entered.notified() => {},
-                    }
-                })
-                .await
-                .expect("run-once reaches its real close boundary");
+                // Wire dispatch spawns this composite operation and returns;
+                // wait for the spawned handler's real cleanup boundary.
+                operator.process_line(&line).await;
+                tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
+                    .await
+                    .expect("run-once reaches its real close boundary");
                 let generation = ctx.sessions.get_generation("s-once").await.unwrap();
                 let agent = ctx.sessions.get_agent("s-once").await.unwrap();
                 use zeroclaw_infra::session_backend::SessionBackend;
@@ -48212,7 +48209,6 @@ mod tests {
                 });
                 retained = Some((generation, agent, transcript));
                 release.notify_one();
-                request.await;
             } else {
                 operator.process_line(&line).await;
             }
