@@ -1226,13 +1226,16 @@ mod tests {
         let mut config = Config::default();
         config.agents.insert("alpha".into(), Default::default());
         let authority = LiveConfigAuthority::new(config);
-        let mut next = authority.snapshot_config();
-        next.agents.clear();
-        let revision = authority.live.next_revision().unwrap();
         let config = authority.live_handle();
+        // Allocate before holding the effect guard so the worker's only lock
+        // acquisition is the actual publication write, not a preliminary read.
+        let next = authority.live.next_revision().unwrap();
         let held = config.read();
+        let held_revision = held.revision();
         let writer_live = authority.live.clone();
-        let writer = std::thread::spawn(move || writer_live.publish(revision, next).unwrap());
+        let mut replacement = held.clone();
+        replacement.agents.clear();
+        let writer = std::thread::spawn(move || writer_live.publish(next, replacement).unwrap());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while config.try_read().is_some() && std::time::Instant::now() < deadline {
             std::thread::yield_now();
@@ -1248,9 +1251,12 @@ mod tests {
         let captured = received.recv_timeout(std::time::Duration::from_secs(2));
         // Release and join even against the ordinary-read implementation so
         // the regression fails instead of leaving a deadlocked test process.
+        assert_eq!(held.revision(), held_revision);
+        assert!(held.agents.contains_key("alpha"));
         drop(held);
-        writer.join().unwrap();
+        assert_eq!(writer.join().unwrap(), next);
         reader.join().unwrap();
+        assert_eq!(config.revision(), next);
         assert!(queued, "the writer must reach its real config lock");
         assert!(captured.expect("capture must not wait behind the effect guard"));
         assert!(
