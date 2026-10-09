@@ -1,0 +1,57 @@
+name: OIDC stack refresh validation
+on:
+  push:
+    branches: [codex/oidc-refresh-validation-20261009]
+permissions:
+  contents: read
+concurrency:
+  group: oidc-stack-refresh-validation
+  cancel-in-progress: true
+jobs:
+  regression:
+    if: github.repository == 'Aarlington/zeroclaw'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: '-C link-arg=-fuse-ld=mold'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - uses: ./.github/actions/rust-cache
+        with:
+          use-blacksmith: 'false'
+          cache-on-failure: true
+          shared-key: oidc-stack-refresh
+      - name: Install linker
+        run: bash scripts/ci/apt_install.sh mold
+      - name: Verify source and run regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p refresh-evidence web/dist
+          touch web/dist/.gitkeep
+          git rev-parse HEAD > refresh-evidence/validation-sha.txt
+          git rev-parse HEAD^ > refresh-evidence/source-sha.txt
+          git diff --exit-code HEAD^ -- . ':(exclude).github/workflows/oidc-stack-refresh.yml'
+          cargo check --locked -p zeroclaw-runtime --tests 2>&1 | tee refresh-evidence/check.log
+          cargo test --locked -p zeroclaw-config --lib live:: 2>&1 | tee refresh-evidence/config.log
+          cargo test --locked -p zeroclaw-infra --lib session_ 2>&1 | tee refresh-evidence/storage.log
+          cargo test --locked -p zeroclaw-runtime --lib rpc:: 2>&1 | tee refresh-evidence/rpc.log
+          cargo test --locked -p zeroclaw-runtime --lib live_config_authority:: 2>&1 | tee refresh-evidence/authority.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: oidc-stack-refresh-evidence
+          path: refresh-evidence/
+          retention-days: 7
