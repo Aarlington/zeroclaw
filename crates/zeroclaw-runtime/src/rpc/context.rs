@@ -302,7 +302,8 @@ impl RpcContext {
     }
 
     pub fn for_live_test(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
-        let tui_registry = Arc::new(TuiRegistry::from_config(&config));
+        // Same resolver as the daemon, so this harness signs as production does.
+        let tui_registry = Arc::new(TuiRegistry::for_config(&config));
         let data_dir = config.data_dir.clone();
         // Mirrors the daemon: one shared certificate audit logger for the
         // whole context, best-effort like the ACP store above.
