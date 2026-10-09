@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      SOURCE_SHA: 'ac7f4165fd5d7c3126ee4b05577eae30832c5a81'
+      SOURCE_SHA: '0b4b4a94b01acbe55506bf24d16262fa62f287ba'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -53,6 +53,21 @@ jobs:
           cargo test --locked -p zeroclaw-runtime --lib principal 2>&1 | tee refresh-evidence/principal.log
           cargo test --locked -p zeroclaw-runtime --lib steering 2>&1 | tee refresh-evidence/steering.log
           cargo test --locked -p zeroclaw-runtime --lib enrollment 2>&1 | tee refresh-evidence/enrollment.log
+          run_one() {
+            local package="$1" case="$2"
+            cargo test --locked -p "$package" --lib "$case" 2>&1 | tee "refresh-evidence/exact-$case.log"
+            grep -Eq '^running 1 test$' "refresh-evidence/exact-$case.log"
+            grep -Eq '^test result: ok. 1 passed; 0 failed; 0 ignored;' "refresh-evidence/exact-$case.log"
+          }
+          run_one zeroclaw-infra authorized_append_and_rename_hold_authority_through_commit
+          run_one zeroclaw-runtime append_rechecks_authority_and_owner_after_the_real_agent_lock
+          run_one zeroclaw-runtime remote_mutations_refuse_same_generation_tui_transfer
+          run_one zeroclaw-runtime operator_abort_authorizes_after_the_real_cancellation_lock
+          run_one zeroclaw-runtime create_only_retains_its_published_generation_after_late_removal
+          run_one zeroclaw-runtime session_run_once_runs_one_turn_and_closes_its_session
+          for suite in config storage rpc authority principal steering enrollment; do
+            grep -Eq '^test result: ok. [1-9][0-9]* passed; 0 failed;' "refresh-evidence/$suite.log"
+          done
           cargo clippy --locked -p zeroclaw-runtime -p zeroclaw-infra -p zeroclaw-config --all-targets -- -D warnings 2>&1 | tee refresh-evidence/clippy.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
@@ -71,17 +86,17 @@ jobs:
       matrix:
         include:
           - pr: '11408'
-            source: '75a72e84a47d6dfb02e247557a5778a515f7cde5'
+            source: '8b4089e8ab8c2af4fc5659fbb7216d953b417a9f'
           - pr: '11409'
-            source: '0387addcadc0f150a7acaf0bbae28203237149ad'
+            source: '8d1fd73be7db2bb43251b3ef806ea23aa72863e3'
           - pr: '11410'
-            source: 'fef42acd7e77b0eb9b2086f735235a14677b2249'
+            source: '973cd3d2c942ab6f38e55d55e85acc8b928726ca'
           - pr: '11411'
-            source: '7c19f522a5a13383ebfd4fc01eace4044cbd1c15'
+            source: 'a7b46ce85cbd997132d0b1c30c58fbfcf6dd5d4c'
           - pr: '11422'
-            source: '20ae84f4b68d7f929803bc38af5c810fadeef018'
+            source: '083f6dfa5eafc469b4656298c930fc5ec01e4ae8'
           - pr: '11423'
-            source: 'ac7f4165fd5d7c3126ee4b05577eae30832c5a81'
+            source: '0b4b4a94b01acbe55506bf24d16262fa62f287ba'
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
