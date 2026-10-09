@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      SOURCE_SHA: '70a39b766f'
+      SOURCE_SHA: 'ac7f4165fd5d7c3126ee4b05577eae30832c5a81'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -50,9 +50,72 @@ jobs:
           cargo test --locked -p zeroclaw-infra --lib session_ 2>&1 | tee refresh-evidence/storage.log
           cargo test --locked -p zeroclaw-runtime --lib rpc:: 2>&1 | tee refresh-evidence/rpc.log
           cargo test --locked -p zeroclaw-runtime --lib live_config_authority:: 2>&1 | tee refresh-evidence/authority.log
+          cargo test --locked -p zeroclaw-runtime --lib principal 2>&1 | tee refresh-evidence/principal.log
+          cargo test --locked -p zeroclaw-runtime --lib steering 2>&1 | tee refresh-evidence/steering.log
+          cargo test --locked -p zeroclaw-runtime --lib enrollment 2>&1 | tee refresh-evidence/enrollment.log
+          cargo clippy --locked -p zeroclaw-runtime -p zeroclaw-infra -p zeroclaw-config --all-targets -- -D warnings 2>&1 | tee refresh-evidence/clippy.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
           name: oidc-stack-refresh-evidence
+          path: refresh-evidence/
+          retention-days: 7
+
+  branch-check:
+    if: github.repository == 'Aarlington/zeroclaw'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - pr: '11408'
+            source: '75a72e84a47d6dfb02e247557a5778a515f7cde5'
+          - pr: '11409'
+            source: '0387addcadc0f150a7acaf0bbae28203237149ad'
+          - pr: '11410'
+            source: 'fef42acd7e77b0eb9b2086f735235a14677b2249'
+          - pr: '11411'
+            source: '7c19f522a5a13383ebfd4fc01eace4044cbd1c15'
+          - pr: '11422'
+            source: '20ae84f4b68d7f929803bc38af5c810fadeef018'
+          - pr: '11423'
+            source: 'ac7f4165fd5d7c3126ee4b05577eae30832c5a81'
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: '-C link-arg=-fuse-ld=mold'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ matrix.source }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: 1.98.0
+      - uses: ./.github/actions/rust-cache
+        with:
+          use-blacksmith: 'false'
+          cache-on-failure: true
+          shared-key: oidc-stack-refresh
+      - name: Install linker
+        run: bash scripts/ci/apt_install.sh mold
+      - name: Check actual PR source and tests
+        env:
+          EXPECTED_SOURCE: ${{ matrix.source }}
+        run: |
+          set -euo pipefail
+          mkdir -p refresh-evidence web/dist
+          touch web/dist/.gitkeep
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE"
+          git rev-parse HEAD > refresh-evidence/source-sha.txt
+          cargo check --locked -p zeroclaw-runtime --tests 2>&1 | tee refresh-evidence/check.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: oidc-pr-${{ matrix.pr }}-check
           path: refresh-evidence/
           retention-days: 7
