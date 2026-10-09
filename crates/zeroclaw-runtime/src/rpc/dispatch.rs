@@ -48860,9 +48860,11 @@ mod tests {
             let (mut ctx, backend, key) =
                 append_review_fixture(&tmp, sid, owner, change == "demote").await;
             let (events, mut received) = tokio::sync::broadcast::channel(8);
-            Arc::get_mut(&mut ctx)
-                .expect("exclusive fixture context")
-                .event_tx = Some(events);
+            let fixture = Arc::get_mut(&mut ctx).expect("exclusive fixture context");
+            fixture.event_tx = Some(events);
+            // This chat-only fixture must not yield in the unrelated ACP owner
+            // lookup before it reaches the Agent lock we deliberately hold.
+            fixture.acp_session_store = None;
             let (mut alice, _rx) = roster_peer(&ctx, 4242).await;
             if change.starts_with("tui") {
                 alice.access_policy = RpcAccessPolicy::RemoteSessionOwner;
@@ -48887,10 +48889,14 @@ mod tests {
                 .await
                 .unwrap();
             let original_generation = ctx.sessions.get_generation(sid).await;
-            let mut request = Box::pin(alice.handle_session_append(&params));
-            // Every other fixture lock is free. Polling reaches the real Agent
-            // mutex, after owner/queue authorization and before either history write.
+            let mut request = Box::pin(tokio::task::coop::unconstrained(
+                alice.handle_session_append(&params),
+            ));
+            // Every preceding mutex and semaphore is uncontended, ACP I/O is
+            // absent, and cooperative budget cannot introduce an earlier yield.
+            // The first Pending therefore proves we reached the held Agent lock.
             assert!(futures_util::poll!(&mut request).is_pending());
+            assert_eq!(ctx.sessions.session_queue.queue_depth(sid).await, 1);
             assert!(!durable_holds(&backend, &key, APPENDED));
             assert!(received.try_recv().is_err());
             match change {
