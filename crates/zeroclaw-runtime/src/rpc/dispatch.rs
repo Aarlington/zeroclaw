@@ -48447,7 +48447,7 @@ mod tests {
             .to_string();
             let mut retained = None;
             if revoke_cleanup {
-                let (entered, release) = ctx.sessions.set_test_removal_signal_pause();
+                let (entered, release, _) = ctx.sessions.set_test_removal_signal_pause();
                 // Wire dispatch spawns this composite operation and returns;
                 // wait for the spawned handler's real cleanup boundary.
                 operator.process_line(&line).await;
