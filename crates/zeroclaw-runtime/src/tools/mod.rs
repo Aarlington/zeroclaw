@@ -1158,7 +1158,7 @@ pub(crate) fn all_tools_with_runtime_context(
             // resumed on the caller's thread exactly as if it had unwound
             // through the caller's frames.
             Err(panic) => std::panic::resume_unwind(panic),
-        };
+        }?;
         // Child runs and cross-agent SOP steps arrive with already-private
         // memory and never pass through Agent's later session routing. Bind
         // the same delegate instance its canonical name and aliases retain.
