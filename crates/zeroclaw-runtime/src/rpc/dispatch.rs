@@ -20861,7 +20861,7 @@ mod tests {
                 let change = async {
                     entered.notified().await;
                     if revoke {
-                        let commit = ctx.config_authority.begin_config_commit().await;
+                        let commit = ctx.config_authority.begin_config_commit().await.unwrap();
                         let mut changed = ctx.config.read().clone();
                         changed
                             .permission_profiles
