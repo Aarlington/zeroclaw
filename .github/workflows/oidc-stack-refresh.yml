@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
+      SOURCE_SHA: '70a39b766f'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -42,8 +43,8 @@ jobs:
           mkdir -p refresh-evidence web/dist
           touch web/dist/.gitkeep
           git rev-parse HEAD > refresh-evidence/validation-sha.txt
-          git rev-parse HEAD^ > refresh-evidence/source-sha.txt
-          git diff --exit-code HEAD^ -- . ':(exclude).github/workflows/oidc-stack-refresh.yml'
+          git rev-parse "$SOURCE_SHA" > refresh-evidence/source-sha.txt
+          git diff --exit-code "$SOURCE_SHA" -- . ':(exclude).github/workflows/oidc-stack-refresh.yml'
           cargo check --locked -p zeroclaw-runtime --tests 2>&1 | tee refresh-evidence/check.log
           cargo test --locked -p zeroclaw-config --lib live:: 2>&1 | tee refresh-evidence/config.log
           cargo test --locked -p zeroclaw-infra --lib session_ 2>&1 | tee refresh-evidence/storage.log
