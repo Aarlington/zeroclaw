@@ -5684,6 +5684,10 @@ impl RpcDispatcher {
             hooks.fire_session_start(&session_id, "rpc").await;
         }
 
+        self.ctx
+            .sessions
+            .wait_test_effect_pause("session-new-return")
+            .await;
         if let Some(created) = create_only {
             // Still under the admission permit: this is the incarnation this
             // call created, not one a later caller installed.
@@ -8344,21 +8348,37 @@ impl RpcDispatcher {
             let Some(binding) = binding.as_ref() else {
                 return SteeringAdmission::Admitted(SteeringPosture::default());
             };
-            let grants = match current_authority(&inbound, binding, Method::SessionSteer) {
+            // Match publication lock order and resolve the whole steering
+            // decision from one config/accepted-policy view. The lease ends
+            // here, before any asynchronous memory write by the consumer.
+            let config = dispatcher.ctx.config.read();
+            let authority = inbound.hold_authority();
+            let grants = match current_authority_under(&authority, binding, Method::SessionSteer) {
                 Ok(grants) => grants,
                 Err(denied) => {
                     audit_denial(Some(binding), Method::SessionSteer, &denied);
                     return SteeringAdmission::Refused(denied.message);
                 }
             };
-            if let Err(denied) = dispatcher.authorize_admitted_session(
-                Method::SessionSteer,
-                Some(&grants),
-                admitted.as_ref(),
-                &agent_alias,
-                Some(&workspace),
-                has_environment,
-            ) {
+            let checked = dispatcher
+                .require_ownership_under(Some(&grants), admitted.as_ref())
+                .and_then(|()| {
+                    dispatcher.authorize_live_session_binding(
+                        Method::SessionSteer,
+                        Some(&grants),
+                        &config,
+                        &agent_alias,
+                        &workspace,
+                    )
+                })
+                .and_then(|()| {
+                    dispatcher.authorize_session_environment(
+                        Method::SessionSteer,
+                        Some(&grants),
+                        has_environment,
+                    )
+                });
+            if let Err(denied) = checked {
                 return refuse(denied.message);
             }
             SteeringAdmission::Admitted(SteeringPosture {
@@ -8598,7 +8618,11 @@ impl RpcDispatcher {
         let session_id = match req.session_id {
             Some(sid) => {
                 if self
-                    .resolve_session_record_for_mode(&sid, None)
+                    .resolve_session_record_for_mode(
+                        &sid,
+                        None,
+                        self.scoped_principal_id().as_deref(),
+                    )
                     .await?
                     .is_some()
                 {
@@ -47720,6 +47744,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_rechecks_authority_and_owner_after_the_real_agent_lock() {
+        use zeroclaw_infra::session_backend::SessionBackend;
+        for change in ["revoke", "demote", "owner", "unrelated"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let sid = "append-effect";
+            let owner = if change == "demote" {
+                "user:bob"
+            } else {
+                "user:alice"
+            };
+            let (mut ctx, backend, key) =
+                append_review_fixture(&tmp, sid, owner, change == "demote").await;
+            let (events, mut received) = tokio::sync::broadcast::channel(8);
+            Arc::get_mut(&mut ctx)
+                .expect("exclusive fixture context")
+                .event_tx = Some(events);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let agent = ctx.sessions.get_agent(sid).await.unwrap();
+            let held = agent.lock().await;
+            let params = json!({"session_id": sid, "content": APPENDED});
+            let mut request = Box::pin(alice.handle_session_append(&params));
+            // Every other fixture lock is free. Polling reaches the real Agent
+            // mutex, after owner/queue authorization and before either history write.
+            assert!(futures_util::poll!(&mut request).is_pending());
+            assert!(!durable_holds(&backend, &key, APPENDED));
+            assert!(received.try_recv().is_err());
+            match change {
+                "revoke" => republish_session_scoped(&ctx, |profile| {
+                    profile.grants.insert(
+                        zeroclaw_api::grants::Resource::Sessions,
+                        vec![zeroclaw_api::grants::Verb::Read],
+                    );
+                }),
+                "demote" => republish_session_scoped(&ctx, |profile| profile.admin = false),
+                "owner" => backend.set_session_principal(&key, "user:bob").unwrap(),
+                _ => republish_session_scoped(&ctx, |profile| {
+                    profile.grants.insert(
+                        zeroclaw_api::grants::Resource::Memory,
+                        vec![zeroclaw_api::grants::Verb::Read],
+                    );
+                }),
+            }
+            drop(held);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+                .await
+                .expect("append completes after releasing its lock");
+            if change == "unrelated" {
+                result.expect("an unrelated publication preserves permission");
+                assert!(durable_holds(&backend, &key, APPENDED));
+                assert!(live_holds(&ctx, sid, APPENDED).await);
+                assert_eq!(received.try_recv().unwrap()["content"], APPENDED);
+            } else {
+                assert_eq!(result.expect_err(change).code, FORBIDDEN, "{change}");
+                assert!(
+                    !durable_holds(&backend, &key, APPENDED),
+                    "{change}: durable"
+                );
+                assert!(!live_holds(&ctx, sid, APPENDED).await, "{change}: live");
+                assert!(received.try_recv().is_err(), "{change}: event");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn a_queued_append_is_refused_when_its_grant_is_revoked_while_it_waits() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sid = "s-append-revoked";
@@ -47909,6 +47997,71 @@ mod tests {
         assert!(
             ctx.sessions.get_agent(sid).await.is_none(),
             "run-once must not have built or resumed a live session"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_only_retains_its_published_generation_after_late_removal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let (ctx, backend, _acp) = persistence_enforcement_ctx(config);
+        let (operator, _rx) = local_operator(&ctx).await;
+        let sid = "create-only-late-removal";
+        let params = json!({"agent_alias": "test-agent", "session_id": sid, "keep_siblings": true});
+        let created = parking_lot::Mutex::new(None);
+        let (entered, release) = ctx.sessions.set_test_effect_pause("session-new-return");
+        let mut request = Box::pin(operator.session_new_with_mode(&params, Some(&created)));
+        tokio::select! {
+            result = &mut request => panic!("creation returned before the pause: {result:?}"),
+            _ = entered.notified() => {},
+        }
+        let original = ctx.sessions.get_generation(sid).await.unwrap();
+        assert!(ctx.sessions.remove(sid).await);
+        release.notify_one();
+        request
+            .await
+            .expect("creation has already published successfully");
+        assert_eq!(
+            *created.lock(),
+            Some(original),
+            "never degrade the bound call to None"
+        );
+        let (provider, mut handles) = scripted_turn_provider();
+        let workspace = ctx.config.read().agent_workspace_dir("test-agent");
+        install_state_test_session_owned_at(
+            &ctx.sessions,
+            &backend,
+            sid,
+            provider,
+            None,
+            None,
+            &workspace,
+        )
+        .await;
+        let successor = ctx.sessions.get_generation(sid).await.unwrap();
+        assert_ne!(successor, original);
+        let prompt = operator
+            .run_session_prompt(
+                SessionPromptParams {
+                    session_id: sid.into(),
+                    prompt: "must not run".into(),
+                    client_turn_generation: None,
+                    attachments: Vec::new(),
+                },
+                *created.lock(),
+            )
+            .await;
+        assert!(prompt.is_err());
+        assert!(
+            operator
+                .handle_session_close_bound(&json!({"session_id":sid}), *created.lock())
+                .await
+                .is_err()
+        );
+        assert_eq!(ctx.sessions.get_generation(sid).await, Some(successor));
+        assert!(
+            handles.0.try_recv().is_err(),
+            "successor provider was not called"
         );
     }
 

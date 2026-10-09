@@ -3038,6 +3038,91 @@ mod tests {
     }
 
     #[test]
+    fn authorized_append_and_rename_hold_authority_through_commit() {
+        use std::cell::Cell;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .append("rpc_effect", &ChatMessage::user("before"))
+            .unwrap();
+        backend
+            .set_session_principal("rpc_effect", "owner")
+            .unwrap();
+        let held = Cell::new(false);
+        struct Lease<'a>(&'a Cell<bool>);
+        impl Drop for Lease<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let authorize = |owner: Option<&str>| -> std::io::Result<
+            Box<dyn crate::session_backend::SessionEffectGuard + '_>,
+        > {
+            assert_eq!(owner, Some("owner"));
+            held.set(true);
+            Ok(Box::new(Lease(&held)))
+        };
+        let committed = Cell::new(false);
+        let count = backend
+            .append_authorized(
+                "rpc_effect",
+                &ChatMessage::assistant("after"),
+                &authorize,
+                &mut || {
+                    assert!(held.get());
+                    committed.set(true);
+                },
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert!(committed.get());
+        assert!(!held.get());
+        backend
+            .set_session_name_authorized("rpc_effect", "accepted", &authorize)
+            .unwrap();
+        assert_eq!(
+            backend.get_session_name("rpc_effect").unwrap().as_deref(),
+            Some("accepted")
+        );
+        assert!(!held.get());
+        let deny = |_: Option<&str>| -> std::io::Result<Box<dyn crate::session_backend::SessionEffectGuard>> {
+            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "revoked"))
+        };
+        assert!(
+            backend
+                .append_authorized(
+                    "rpc_effect",
+                    &ChatMessage::assistant("denied"),
+                    &deny,
+                    &mut || panic!("denied append must not publish live effects")
+                )
+                .is_err()
+        );
+        assert!(
+            backend
+                .set_session_name_authorized("rpc_effect", "denied", &deny)
+                .is_err()
+        );
+        assert_eq!(backend.load("rpc_effect").len(), 2);
+        assert_eq!(
+            backend.get_session_name("rpc_effect").unwrap().as_deref(),
+            Some("accepted")
+        );
+        backend.delete_session("rpc_effect").unwrap();
+        assert!(
+            backend
+                .append_authorized(
+                    "rpc_effect",
+                    &ChatMessage::assistant("recreated"),
+                    &authorize,
+                    &mut || panic!("deleted row must stay absent")
+                )
+                .is_err()
+        );
+        assert!(!backend.session_exists("rpc_effect"));
+    }
+
+    #[test]
     fn set_session_name_persists() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
