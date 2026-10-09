@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      SOURCE_SHA: '32a84bc8322bd1b39cad3dda365e5b07f21f74a2'
+      SOURCE_SHA: '4b4dc433df6c683d7415199d7cf689849f042c64'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -66,11 +66,13 @@ jobs:
           run_one zeroclaw-runtime operator_abort_authorizes_after_the_real_cancellation_lock
           run_one zeroclaw-runtime create_only_retains_its_published_generation_after_late_removal
           run_one zeroclaw-runtime session_run_once_runs_one_turn_and_closes_its_session
+          run_one zeroclaw-runtime remote_steering_rechecks_tui_binding_before_enqueue_and_consumption
+          run_one zeroclaw-runtime transport_binding_revokes_on_transfer_and_drop_without_aba_revival
           for suite in config storage rpc authority principal steering enrollment; do
             grep -Eq '^test result: ok. [1-9][0-9]* passed; 0 failed;' "refresh-evidence/$suite.log"
           done
           cargo clippy --locked -p zeroclaw-runtime -p zeroclaw-infra -p zeroclaw-config --all-targets -- -D warnings 2>&1 | tee refresh-evidence/clippy.log
-      - name: Verify append regression sensitivity
+      - name: Verify append and steering regression sensitivity
         shell: bash
         run: |
           set -euo pipefail
@@ -89,7 +91,10 @@ jobs:
           b = target.index('                let mut committed = || {', a)
           replacement = "                let authorize = |_: Option<&str>| -> std::io::Result<Box<dyn zeroclaw_infra::session_backend::SessionEffectGuard>> { Ok(Box::new(())) };\n"
           target = target[:a] + replacement + target[b:]
-          p.write_text(s[:start] + target + s[end:])
+          s = s[:start] + target + s[end:]
+          assert s.count('&& owner_revoked.is_cancelled()') == 1
+          s = s.replace('&& owner_revoked.is_cancelled()', '&& false /* sensitivity: disable transport revocation */')
+          p.write_text(s)
           PY
           git diff -- "$source" > refresh-evidence/sensitivity-mutation.diff
           set +e
@@ -100,6 +105,14 @@ jobs:
           grep -Eq '^running 1 test$' refresh-evidence/sensitivity-append.log
           grep -Eq '^test result: FAILED. 0 passed; 1 failed; 0 ignored;' refresh-evidence/sensitivity-append.log
           grep -F 'revoke:' refresh-evidence/sensitivity-append.log
+          set +e
+          cargo test --locked -p zeroclaw-runtime --lib remote_steering_rechecks_tui_binding_before_enqueue_and_consumption 2>&1 | tee refresh-evidence/sensitivity-steering.log
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" -eq 101
+          grep -Eq '^running 1 test$' refresh-evidence/sensitivity-steering.log
+          grep -Eq '^test result: FAILED. 0 passed; 1 failed; 0 ignored;' refresh-evidence/sensitivity-steering.log
+          grep -F 'queued:' refresh-evidence/sensitivity-steering.log
           cp "$backup" "$source"
           git diff --exit-code "$SOURCE_SHA" -- . ':(exclude).github/workflows/oidc-stack-refresh.yml'
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -119,17 +132,17 @@ jobs:
       matrix:
         include:
           - pr: '11408'
-            source: 'f00fe86148ce4f2ea17c1613acfd6019475a8c1f'
+            source: '9c7cfd98236e5f6fb26df5c6b17e040046c1bad4'
           - pr: '11409'
-            source: 'e4301c09e239963000c17f3987816ac1ffe7cbc7'
+            source: 'eae7be34898bfc21e6642b755a5235bb219a9989'
           - pr: '11410'
-            source: '328b217a8553d2086c48451a561eff2aadbd6efd'
+            source: '8933aa143771873b4a963c7e2c85525ca1b11db7'
           - pr: '11411'
-            source: '949c0bf70183d5a0be7885a302c81db10f44de55'
+            source: 'f2b8078325fd96b1f12b2fbaff38f28dba2cb4c1'
           - pr: '11422'
-            source: '9e1bcf0ec73455ebc70660963ab57533ba42bc7c'
+            source: '3da86343bd945bf3125fb76a2ca7b06010b2aff1'
           - pr: '11423'
-            source: '32a84bc8322bd1b39cad3dda365e5b07f21f74a2'
+            source: '4b4dc433df6c683d7415199d7cf689849f042c64'
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
