@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      SOURCE_SHA: '03c816d8f5a0a25f1f9acafc3c41585091e4a837'
+      SOURCE_SHA: '29b123f08874cdc28f74e2b2338a8e4bc4eb5231'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -68,6 +68,7 @@ jobs:
           run_one zeroclaw-runtime session_run_once_runs_one_turn_and_closes_its_session
           run_one zeroclaw-runtime remote_steering_rechecks_tui_binding_before_enqueue_and_consumption
           run_one zeroclaw-runtime transport_binding_revokes_on_transfer_and_drop_without_aba_revival
+          run_one zeroclaw-runtime config_signing_key_is_used_when_runtime_data_lives_elsewhere
           for suite in config storage rpc authority principal steering enrollment; do
             grep -Eq '^test result: ok. [1-9][0-9]* passed; 0 failed;' "refresh-evidence/$suite.log"
           done
@@ -132,17 +133,17 @@ jobs:
       matrix:
         include:
           - pr: '11408'
-            source: '08033c25a4f21a6b1fbfb7a8b63dff84a308dedc'
+            source: '2e6c2b7835abe169fb0cbaf6ecceafb0e21faefc'
           - pr: '11409'
-            source: '6b0d2afa90eab3d17254f1bd673fefae2515beec'
+            source: '16240123d24f896d37f58c4fcf2486adaebe0e77'
           - pr: '11410'
-            source: '18e16ff5acadeaafeacac15e4f1b1120121e86b6'
+            source: 'c7eb5b26facd22a8ad278e33b9a1f60495b90f58'
           - pr: '11411'
-            source: '84d9b5eecc7ce42fbed8583c266a7fe6dc4ef6f2'
+            source: '8f7ecfaad29dcf1f6f465831938a31990d648bc3'
           - pr: '11422'
-            source: '4f5d7108a2d1c3d10299ed193c160488e642f096'
+            source: '92bfff06da18590ccbca8167b1818c898e09b4a9'
           - pr: '11423'
-            source: '03c816d8f5a0a25f1f9acafc3c41585091e4a837'
+            source: '29b123f08874cdc28f74e2b2338a8e4bc4eb5231'
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
