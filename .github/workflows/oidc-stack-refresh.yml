@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      SOURCE_SHA: 'df2bdcc64c3de0145204f5e0a59e85362ffa90de'
+      SOURCE_SHA: '32a84bc8322bd1b39cad3dda365e5b07f21f74a2'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -59,6 +59,7 @@ jobs:
             grep -Eq '^running 1 test$' "refresh-evidence/exact-$case.log"
             grep -Eq '^test result: ok. 1 passed; 0 failed; 0 ignored;' "refresh-evidence/exact-$case.log"
           }
+          run_one zeroclaw-infra guarded_jsonl_append_requires_existing_authorized_session
           run_one zeroclaw-infra authorized_append_and_rename_hold_authority_through_commit
           run_one zeroclaw-runtime append_rechecks_authority_and_owner_after_the_real_agent_lock
           run_one zeroclaw-runtime remote_mutations_refuse_same_generation_tui_transfer
@@ -69,6 +70,38 @@ jobs:
             grep -Eq '^test result: ok. [1-9][0-9]* passed; 0 failed;' "refresh-evidence/$suite.log"
           done
           cargo clippy --locked -p zeroclaw-runtime -p zeroclaw-infra -p zeroclaw-config --all-targets -- -D warnings 2>&1 | tee refresh-evidence/clippy.log
+      - name: Verify append regression sensitivity
+        shell: bash
+        run: |
+          set -euo pipefail
+          source=crates/zeroclaw-runtime/src/rpc/dispatch.rs
+          backup=$(mktemp)
+          cp "$source" "$backup"
+          trap 'cp "$backup" "$source"; rm -f "$backup"' EXIT
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/zeroclaw-runtime/src/rpc/dispatch.rs')
+          s = p.read_text()
+          start = s.index('    async fn handle_session_append(')
+          end = s.index('    async fn handle_session_rename(', start)
+          target = s[start:end]
+          a = target.index('                let authorize = |owner: Option<&str>| {')
+          b = target.index('                let mut committed = || {', a)
+          replacement = "                let authorize = |_: Option<&str>| -> std::io::Result<Box<dyn zeroclaw_infra::session_backend::SessionEffectGuard>> { Ok(Box::new(())) };\n"
+          target = target[:a] + replacement + target[b:]
+          p.write_text(s[:start] + target + s[end:])
+          PY
+          git diff -- "$source" > refresh-evidence/sensitivity-mutation.diff
+          set +e
+          cargo test --locked -p zeroclaw-runtime --lib append_rechecks_authority_and_owner_after_the_real_agent_lock 2>&1 | tee refresh-evidence/sensitivity-append.log
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" -eq 101
+          grep -Eq '^running 1 test$' refresh-evidence/sensitivity-append.log
+          grep -Eq '^test result: FAILED. 0 passed; 1 failed; 0 ignored;' refresh-evidence/sensitivity-append.log
+          grep -F 'revoke:' refresh-evidence/sensitivity-append.log
+          cp "$backup" "$source"
+          git diff --exit-code "$SOURCE_SHA" -- . ':(exclude).github/workflows/oidc-stack-refresh.yml'
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
@@ -86,17 +119,17 @@ jobs:
       matrix:
         include:
           - pr: '11408'
-            source: '8b4089e8ab8c2af4fc5659fbb7216d953b417a9f'
+            source: 'f00fe86148ce4f2ea17c1613acfd6019475a8c1f'
           - pr: '11409'
-            source: '8d1fd73be7db2bb43251b3ef806ea23aa72863e3'
+            source: 'e4301c09e239963000c17f3987816ac1ffe7cbc7'
           - pr: '11410'
-            source: '60318baca0c7bc7dccde7d5b580f8bf178c25c1a'
+            source: '328b217a8553d2086c48451a561eff2aadbd6efd'
           - pr: '11411'
-            source: 'c1115ac9f6686317c44cd9e72d617eabf29406c6'
+            source: '949c0bf70183d5a0be7885a302c81db10f44de55'
           - pr: '11422'
-            source: 'b8ac3b54d3c8e2fcafcb4c46a8b31238ad9fcd8e'
+            source: '9e1bcf0ec73455ebc70660963ab57533ba42bc7c'
           - pr: '11423'
-            source: 'df2bdcc64c3de0145204f5e0a59e85362ffa90de'
+            source: '32a84bc8322bd1b39cad3dda365e5b07f21f74a2'
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
