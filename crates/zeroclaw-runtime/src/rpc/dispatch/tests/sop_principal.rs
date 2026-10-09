@@ -138,7 +138,7 @@ async fn sop_entry_tools_and_aliases_cannot_escape_principal_ceilings() {
                 // Exercise live narrowing of an already-assembled registry and
                 // its captured skill wrappers through the real prompt handler.
                 {
-                    let mut config = ctx.config.snapshot();
+                    let mut config = ctx.config_authority.snapshot_config();
                     let profile = config
                         .permission_profiles
                         .get_mut("principal-test")

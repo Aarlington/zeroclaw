@@ -19,7 +19,7 @@ async fn principal_cron_rpc_refuses_agent_jobs_but_keeps_shell_jobs() {
         let patch = json!({"id": job.id, "agent": "alpha", "prompt": "read foreign history"});
         if posture == "demoted" {
             {
-                let mut cfg = ctx.config.snapshot();
+                let mut cfg = ctx.config_authority.snapshot_config();
                 cfg.permission_profiles.get_mut("cron-alpha").unwrap().admin = false;
                 ctx.auth.refresh_from_config(&cfg).unwrap();
                 ctx.config_authority.publish_for_test(cfg);
@@ -65,11 +65,9 @@ async fn principal_cron_rpc_refuses_agent_jobs_but_keeps_shell_jobs() {
             before,
             "denial must not modify, claim, or execute the job"
         );
-        assert!(
-            crate::cron::list_runs(&config, &job.id, 10)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(crate::cron::list_runs(&config, &job.id, 10)
+            .unwrap()
+            .is_empty());
 
         // The same caller's existing shell-job grants remain usable through
         // the real dispatcher, including persistence and output.
@@ -99,12 +97,10 @@ async fn principal_cron_rpc_refuses_agent_jobs_but_keeps_shell_jobs() {
         assert!(patched.get("error").is_none(), "{patched}");
         let triggered = rpc(&mut caller, &mut rx, 6, "cron/trigger", json!({"id":shell})).await;
         assert_eq!(triggered["result"]["success"], json!(true), "{triggered}");
-        assert!(
-            triggered["result"]["output"]
-                .as_str()
-                .unwrap()
-                .contains("permitted-shell")
-        );
+        assert!(triggered["result"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("permitted-shell"));
 
         // A current administrator can still edit the agent job. Trigger
         // execution itself is covered by the existing scheduler tests.
@@ -312,7 +308,7 @@ async fn principal_sessions_refuse_headless_tools_and_captured_aliases() {
                 control.output
             );
             drop(guard);
-            let mut cfg = operator.ctx.config.snapshot();
+            let mut cfg = operator.ctx.config_authority.snapshot_config();
             cfg.permission_profiles
                 .get_mut("principal-test")
                 .unwrap()
