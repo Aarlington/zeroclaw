@@ -17054,12 +17054,13 @@ mod tests {
         }
 
         {
-            let mut cfg = dispatcher.ctx.config.write();
+            let mut cfg = dispatcher.ctx.config_authority.snapshot_config();
             cfg.permission_profiles
                 .get_mut("principal-test")
                 .unwrap()
                 .admin = false;
             dispatcher.ctx.auth.refresh_from_config(&cfg).unwrap();
+            dispatcher.ctx.config_authority.publish_for_test(cfg);
         }
         let current = dispatcher.current_prompt_authority().unwrap();
         let grants = current
@@ -17152,7 +17153,7 @@ mod tests {
                 if arrival.is_ok() {
                     match scenario {
                         "agent-demotion" | "shell-revocation" => {
-                            let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+                            let commit = ctx.begin_config_commit().await.unwrap();
                             let mut changed = ctx.config.read().clone();
                             let profile =
                                 changed.permission_profiles.get_mut("cron-alpha").unwrap();
@@ -17166,7 +17167,11 @@ mod tests {
                             }
                             changed.mark_dirty("permission_profiles.cron-alpha");
                             operator
-                                .save_and_swap_config(changed, &guard)
+                                .save_and_publish_config(
+                                    commit,
+                                    changed,
+                                    RpcConfigCommitEffects::default(),
+                                )
                                 .await
                                 .unwrap();
                         }
