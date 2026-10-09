@@ -65,9 +65,11 @@ async fn principal_cron_rpc_refuses_agent_jobs_but_keeps_shell_jobs() {
             before,
             "denial must not modify, claim, or execute the job"
         );
-        assert!(crate::cron::list_runs(&config, &job.id, 10)
-            .unwrap()
-            .is_empty());
+        assert!(
+            crate::cron::list_runs(&config, &job.id, 10)
+                .unwrap()
+                .is_empty()
+        );
 
         // The same caller's existing shell-job grants remain usable through
         // the real dispatcher, including persistence and output.
@@ -97,10 +99,12 @@ async fn principal_cron_rpc_refuses_agent_jobs_but_keeps_shell_jobs() {
         assert!(patched.get("error").is_none(), "{patched}");
         let triggered = rpc(&mut caller, &mut rx, 6, "cron/trigger", json!({"id":shell})).await;
         assert_eq!(triggered["result"]["success"], json!(true), "{triggered}");
-        assert!(triggered["result"]["output"]
-            .as_str()
-            .unwrap()
-            .contains("permitted-shell"));
+        assert!(
+            triggered["result"]["output"]
+                .as_str()
+                .unwrap()
+                .contains("permitted-shell")
+        );
 
         // A current administrator can still edit the agent job. Trigger
         // execution itself is covered by the existing scheduler tests.
