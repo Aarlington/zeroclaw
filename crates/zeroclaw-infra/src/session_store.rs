@@ -487,6 +487,27 @@ impl SessionBackend for SessionStore {
         self.append(session_key, message)
     }
 
+    fn append_authorized(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+        committed: &mut dyn FnMut(),
+    ) -> std::io::Result<usize> {
+        let _guard = self.mutation_guard()?;
+        if !is_regular_jsonl_session_file(&self.session_path(session_key)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Session not found",
+            ));
+        }
+        let _authority = authorize(None)?;
+        let count = self.try_load(session_key)?.len() + 1;
+        self.append_unlocked(session_key, message)?;
+        committed();
+        Ok(count)
+    }
+
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
         self.remove_last(session_key)
     }
