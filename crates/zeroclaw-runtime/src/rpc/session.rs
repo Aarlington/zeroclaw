@@ -99,6 +99,30 @@ pub struct UploadEntry {
     pub size_bytes: u64,
 }
 
+/// Canonical transport owner plus revocation for steering already queued by it.
+/// Dropping the binding revokes it on every removal and replacement path.
+#[derive(Default)]
+struct SessionOwnerBinding {
+    tui_id: Option<String>,
+    revoked: tokio_util::sync::CancellationToken,
+}
+
+impl SessionOwnerBinding {
+    fn rebind(&mut self, tui_id: Option<String>) {
+        if self.tui_id != tui_id {
+            self.revoked.cancel();
+            self.revoked = tokio_util::sync::CancellationToken::new();
+            self.tui_id = tui_id;
+        }
+    }
+}
+
+impl Drop for SessionOwnerBinding {
+    fn drop(&mut self) {
+        self.revoked.cancel();
+    }
+}
+
 pub struct RpcSession {
     pub agent: Arc<Mutex<Agent>>,
     lifecycle_lease: Option<crate::live_config_authority::AgentSessionLease>,
@@ -119,7 +143,7 @@ pub struct RpcSession {
     pub plan: Vec<PlanEntry>,
     pub chat_mode: crate::rpc::types::ChatMode,
     pub interaction_surface: Option<crate::agent::prompt::InteractionSurface>,
-    pub owner_tui_id: Option<String>,
+    owner_binding: SessionOwnerBinding,
     /// Monotonic generation counter stamped by `SessionStore::insert`.
     /// Provider-refresh callers capture this before building a provider box
     /// and pass it to `SessionStore::apply_model_provider` so stale work
@@ -237,7 +261,7 @@ impl RpcSession {
             plan: Vec::new(),
             chat_mode,
             interaction_surface: None,
-            owner_tui_id: None,
+            owner_binding: SessionOwnerBinding::default(),
             generation: 0,
             pending_generation: None,
             owner_principal_id: None,
@@ -255,8 +279,12 @@ impl RpcSession {
 
     /// Bind this session to a TUI owner.
     pub fn with_owner(mut self, tui_id: Option<String>) -> Self {
-        self.owner_tui_id = tui_id;
+        self.owner_binding.rebind(tui_id);
         self
+    }
+
+    pub fn owner_tui_id(&self) -> Option<&str> {
+        self.owner_binding.tui_id.as_deref()
     }
 
     pub fn with_interaction_surface(
@@ -626,7 +654,7 @@ impl SessionStore {
         let mut sessions = self.sessions.lock().await;
         if let Some((generation, owner)) = expected_access
             && !sessions.get(&id).is_some_and(|current| {
-                current.generation == generation && current.owner_tui_id.as_deref() == owner
+                current.generation == generation && current.owner_tui_id() == owner
             })
         {
             return Err(failure("session changed during preparation"));
@@ -786,7 +814,7 @@ impl SessionStore {
         }
         if let Some((expected_generation, expected_owner)) = expected_access
             && (session.generation != expected_generation
-                || session.owner_tui_id.as_deref() != expected_owner)
+                || session.owner_tui_id() != expected_owner)
         {
             return Err(ResumeExistingError::StaleIncarnation);
         }
@@ -810,7 +838,7 @@ impl SessionStore {
         };
 
         if owner_tui_id.is_some() {
-            session.owner_tui_id = owner_tui_id;
+            session.owner_binding.rebind(owner_tui_id);
         }
         session.last_active = Instant::now();
         let message_count = session
@@ -847,11 +875,22 @@ impl SessionStore {
         id: &str,
         generation: u64,
         owner: Option<&str>,
-    ) -> Option<(String, String, bool, crate::tools::PerToolChannelHandle)> {
+        expected_access: Option<(u64, Option<&str>)>,
+    ) -> Option<(
+        String,
+        String,
+        bool,
+        crate::tools::PerToolChannelHandle,
+        tokio_util::sync::CancellationToken,
+    )> {
         let sessions = self.sessions.lock().await;
-        let session = sessions
-            .get(id)
-            .filter(|s| s.generation == generation && s.owner_principal_id.as_deref() == owner)?;
+        let session = sessions.get(id).filter(|s| {
+            s.generation == generation
+                && s.owner_principal_id.as_deref() == owner
+                && expected_access.is_none_or(|(expected, tui)| {
+                    s.generation == expected && s.owner_tui_id() == tui
+                })
+        })?;
         Some((
             session.agent_alias.clone(),
             session.workspace_dir.clone(),
@@ -860,6 +899,7 @@ impl SessionStore {
                 .as_ref()
                 .is_some_and(|env| !env.is_empty()),
             Arc::clone(&session.reaction_channels),
+            session.owner_binding.revoked.clone(),
         ))
     }
 
@@ -1810,7 +1850,7 @@ impl SessionStore {
             .iter()
             .filter(|(key, s)| {
                 key.as_str() != except_id
-                    && s.owner_tui_id.as_deref() == Some(tui_id)
+                    && s.owner_tui_id() == Some(tui_id)
                     && &s.chat_mode == chat_mode
                     && !in_flight.contains(key.as_str())
             })
@@ -1838,7 +1878,9 @@ impl SessionStore {
     /// created by an anonymous connection), `Some(Some(id))` if owned by `id`.
     pub async fn session_owner_tui_id(&self, session_id: &str) -> Option<Option<String>> {
         let sessions = self.sessions.lock().await;
-        sessions.get(session_id).map(|s| s.owner_tui_id.clone())
+        sessions
+            .get(session_id)
+            .map(|s| s.owner_tui_id().map(str::to_owned))
     }
 
     /// Read the owning-principal stamp from a LIVE session. Same tri-state
@@ -1856,9 +1898,12 @@ impl SessionStore {
     /// successor.
     pub async fn session_access_snapshot(&self, session_id: &str) -> Option<(u64, Option<String>)> {
         let sessions = self.sessions.lock().await;
-        sessions
-            .get(session_id)
-            .map(|session| (session.generation, session.owner_tui_id.clone()))
+        sessions.get(session_id).map(|session| {
+            (
+                session.generation,
+                session.owner_tui_id().map(str::to_owned),
+            )
+        })
     }
 
     pub async fn list_ids(&self) -> Vec<String> {
@@ -1870,7 +1915,7 @@ impl SessionStore {
             .lock()
             .await
             .iter()
-            .filter(|(_, session)| session.owner_tui_id.as_deref() == Some(owner_tui_id))
+            .filter(|(_, session)| session.owner_tui_id() == Some(owner_tui_id))
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -2268,8 +2313,7 @@ impl SessionStore {
         if current.map(|session| session.generation) != generation
             || expected_access.is_some_and(|(expected_generation, owner)| {
                 !current.is_some_and(|session| {
-                    session.generation == expected_generation
-                        && session.owner_tui_id.as_deref() == owner
+                    session.generation == expected_generation && session.owner_tui_id() == owner
                 })
             })
         {
@@ -2492,6 +2536,32 @@ impl SessionStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transport_binding_revokes_on_transfer_and_drop_without_aba_revival() {
+        let mut binding = super::SessionOwnerBinding::default();
+        binding.rebind(Some("alice-tui".into()));
+        let original = binding.revoked.clone();
+        binding.rebind(Some("alice-tui".into()));
+        assert!(
+            !original.is_cancelled(),
+            "same-TUI reconnect preserves queued steering"
+        );
+        binding.rebind(Some("other-tui".into()));
+        assert!(original.is_cancelled());
+        binding.rebind(Some("alice-tui".into()));
+        assert!(
+            original.is_cancelled(),
+            "returning to the owner cannot revive old input"
+        );
+        let current = binding.revoked.clone();
+        assert!(!current.is_cancelled());
+        drop(binding);
+        assert!(
+            current.is_cancelled(),
+            "session removal/replacement revokes its binding"
+        );
+    }
+
     use super::*;
 
     fn make_store(max: usize) -> SessionStore {
