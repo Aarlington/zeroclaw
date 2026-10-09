@@ -6942,6 +6942,15 @@ impl RpcDispatcher {
             .has_forwarded_environment(sid)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        // These lookups can wait too. Resolve again before attachment effects.
+        let grants = match self.recheck_authority_after_admission(Method::SessionPrompt) {
+            Ok(grants) => grants,
+            Err(denied) => {
+                return Err(self
+                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                    .await);
+            }
+        };
         if let Err(denied) = self.authorize_admitted_session(
             Method::SessionPrompt,
             grants.as_ref(),
@@ -7120,47 +7129,6 @@ impl RpcDispatcher {
             }
         };
 
-        // The two waits above can each hold this prompt after admission, and
-        // policy can change meanwhile. Re-resolve before executing: the turn
-        // runs under this resolution, so ownership, the forwarded environment
-        // and the tool ceiling below are all judged by it rather than by the
-        // grants resolved before these waits. The permit keeps the incarnation
-        // fixed, so its live owner is the one to compare.
-        let grants = match self.recheck_authority_after_admission(Method::SessionPrompt) {
-            Ok(grants) => grants,
-            Err(denied) => {
-                return Err(self
-                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
-                    .await);
-            }
-        };
-        if let Some(mine) = self.scoped_principal_id_from(grants.as_ref())
-            && self
-                .ctx
-                .sessions
-                .session_owner_principal(sid)
-                .await
-                .flatten()
-                != Some(mine)
-        {
-            let denied = rpc_err(
-                FORBIDDEN,
-                "Session not found or not owned by this principal",
-            );
-            return Err(self
-                .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
-                .await);
-        }
-        if let Err(denied) = self.authorize_session_environment(
-            Method::SessionPrompt,
-            grants.as_ref(),
-            has_environment,
-        ) {
-            return Err(self
-                .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
-                .await);
-        }
-
         // Resolve the canonical Agent only after admission and reconciliation;
         // this prevents executing through an orphaned predecessor handle.
         let agent = self
@@ -7192,12 +7160,13 @@ impl RpcDispatcher {
                     self.with_live_effect(Method::SessionPrompt, session, |_| ())
                 })
                 .await;
+            let (_, model_provider, model) = agent_guard.attribution_fields();
+            drop(agent_guard);
             if let Err(denied) = checked {
                 return Err(self
                     .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
                     .await);
             }
-            let (_, model_provider, model) = agent_guard.attribution_fields();
             (model_provider, model)
         };
         self.ctx.sessions.wait_test_prompt_execution_pause().await;
@@ -7331,7 +7300,7 @@ impl RpcDispatcher {
             cost_context,
             self.connection_activity.clone(),
             Some(steering_rx),
-            None,
+            None, // Preparation judges authority under the final storage lock.
             (prepare, move |event| {
                 let rpc = rpc.clone();
                 let sid = sid_owned.clone();
@@ -8646,14 +8615,12 @@ impl RpcDispatcher {
         // makes it hold against a concurrent creator. A scoped caller naming
         // another principal's session gets the uniform ownership denial
         // first, so run-once cannot probe which ids exist.
+        let grants = self.recheck_authority_after_admission(Method::SessionRunOnce)?;
+        let scope = self.scoped_principal_id_from(grants.as_ref());
         let session_id = match req.session_id {
             Some(sid) => {
                 if self
-                    .resolve_session_record_for_mode(
-                        &sid,
-                        None,
-                        self.scoped_principal_id().as_deref(),
-                    )
+                    .resolve_session_record_for_mode(&sid, None, scope.as_deref())
                     .await?
                     .is_some()
                 {
@@ -17114,12 +17081,13 @@ mod tests {
         }
 
         {
-            let mut cfg = dispatcher.ctx.config.write();
+            let mut cfg = dispatcher.ctx.config_authority.snapshot_config();
             cfg.permission_profiles
                 .get_mut("principal-test")
                 .unwrap()
                 .admin = false;
             dispatcher.ctx.auth.refresh_from_config(&cfg).unwrap();
+            dispatcher.ctx.config_authority.publish_for_test(cfg);
         }
         let current = dispatcher.current_prompt_authority().unwrap();
         let grants = current
@@ -17212,7 +17180,7 @@ mod tests {
                 if arrival.is_ok() {
                     match scenario {
                         "agent-demotion" | "shell-revocation" => {
-                            let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+                            let commit = ctx.begin_config_commit().await.unwrap();
                             let mut changed = ctx.config.read().clone();
                             let profile =
                                 changed.permission_profiles.get_mut("cron-alpha").unwrap();
@@ -17226,7 +17194,11 @@ mod tests {
                             }
                             changed.mark_dirty("permission_profiles.cron-alpha");
                             operator
-                                .save_and_swap_config(changed, &guard)
+                                .save_and_publish_config(
+                                    commit,
+                                    changed,
+                                    RpcConfigCommitEffects::default(),
+                                )
                                 .await
                                 .unwrap();
                         }
@@ -20171,7 +20143,7 @@ mod tests {
     }
 
     fn allow_all_sop_agents(ctx: &RpcContext) {
-        let mut config = ctx.config.snapshot();
+        let mut config = ctx.config_authority.snapshot_config();
         config
             .permission_profiles
             .get_mut("cron-alpha")
@@ -20224,7 +20196,7 @@ mod tests {
                         .unwrap();
                     let arrived = waiting.recv_timeout(std::time::Duration::from_secs(3));
                     if arrived.is_ok() && revoke {
-                        let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+                        let commit = ctx.begin_config_commit().await.unwrap();
                         let mut changed = ctx.config.read().clone();
                         changed
                             .permission_profiles
@@ -20233,7 +20205,11 @@ mod tests {
                             .admin = false;
                         changed.mark_dirty("permission_profiles.cron-alpha");
                         operator
-                            .save_and_swap_config(changed, &guard)
+                            .save_and_publish_config(
+                                commit,
+                                changed,
+                                RpcConfigCommitEffects::default(),
+                            )
                             .await
                             .unwrap();
                     }
@@ -20309,7 +20285,7 @@ mod tests {
     }
 
     fn grant_sop_admin(ctx: &RpcContext) {
-        let mut config = ctx.config.snapshot();
+        let mut config = ctx.config_authority.snapshot_config();
         config
             .permission_profiles
             .get_mut("cron-alpha")
@@ -20890,7 +20866,7 @@ mod tests {
                 let change = async {
                     entered.notified().await;
                     if revoke {
-                        let commit = ctx.config_authority.begin_config_commit().await.unwrap();
+                        let commit = ctx.begin_config_commit().await.unwrap();
                         let mut changed = ctx.config.read().clone();
                         changed
                             .permission_profiles
@@ -23912,7 +23888,7 @@ mod tests {
     /// Grant or revoke alice's administrator profile and publish the policy,
     /// as an accepted permission-profile edit does.
     fn set_alice_administrator(ctx: &Arc<RpcContext>, admin: bool) {
-        let mut config = ctx.config.snapshot();
+        let mut config = ctx.config_authority.snapshot_config();
         config
             .permission_profiles
             .get_mut("administrator")
