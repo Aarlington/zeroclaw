@@ -229,9 +229,11 @@ impl LiveConfigHandle {
         }
     }
 
-    /// Read while an enclosing effect already holds a read lease on this
-    /// storage. Recursive reads must not wait behind a writer blocked by that
-    /// enclosing lease. This grants no publication authority.
+    /// One short paired read that may re-enter while an outer effect guard
+    /// already holds this storage. Unlike `read`, it cannot park behind a
+    /// writer waiting for that outer guard. Use only for bounded nested reads:
+    /// recurring recursive readers can starve publication. The returned guard
+    /// remains read-only, paired with its revision, and must not cross an await.
     pub fn read_recursive(&self) -> LiveConfigReadGuard<'_> {
         LiveConfigReadGuard {
             guard: self.pair.read_recursive(),
