@@ -1451,10 +1451,19 @@ rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
 
 cron-agent-job-failed = The scheduled task could not be completed. Please try again or ask an administrator to check the logs.
 
+# Principal-owned delegation
+delegate-owned-background-unavailable = Background delegation and task management are unavailable in principal-owned sessions until task results enforce principal ownership. Use synchronous delegation instead.
+
 # Atomic RPC configuration batches
 rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
 rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
+
+cli-sop-run-unavailable = SOP run unavailable in this session.
+rpc-cron-agent-principal-required = Agent cron jobs do not carry principal restrictions; only administrators may modify or trigger them.
+
+sop-rpc-run-admin-required = Global procedure run data requires an administrator; use the session-scoped SOP status tool for your own runs.
+cron-rpc-requested-agent-forbidden = The principal is not entitled to the requested agent.
 sop-store-busy = SOP storage is busy or unavailable; retry the request.
 sop-store-nonblocking-unavailable = SOP storage cannot provide immediate access; this request was refused.
 sop-rpc-definition-unavailable = The procedure definition is no longer available.

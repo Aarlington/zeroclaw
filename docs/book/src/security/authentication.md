@@ -383,8 +383,62 @@ If either the principal's tool selector or agent selector is constrained,
 `sop_execute`, `sop_approve`, and `sop_advance` are unavailable, including skill
 aliases wrapping those tools. These nested
 paths do not yet carry both current principal ceilings; the ordinary parent
-turn remains usable. Admin principals and principals with both selectors set
-to `"*"` keep their agent's configured nested capabilities.
+turn remains usable. Admin principals keep their agent's configured nested
+capabilities. Principals with both selectors set to `"*"` keep `delegate`
+itself, but lose its skill aliases, `spawn_subagent`, and `execute_pipeline`
+with the session-data tools below.
+
+The session-data tools `sessions_list`, `sessions_history`, and
+`sessions_send` list, read, and append to other sessions without checking
+who owns them, so no principal without `admin` holds them in its sessions,
+whatever its selectors name, `"*"` included. Skill aliases of those tools go
+with them, and so do `spawn_subagent` and `execute_pipeline` (with their
+skill aliases), whose nested runs would hold them again. A retained
+`delegate` withholds the same tools from every bounded, independent,
+background, and parallel child it builds. `sessions_current`, which reports
+only the caller's own session, stays. The withholding is applied at session
+creation, at rehydration, and before every prompt, so an administrator
+demoted mid-session loses the tools at the next prompt. Like selector
+narrowing, it never gives them back to a live session. Admin principals and
+the shared operator keep them.
+
+A queued prompt resolves authority again on the exact Agent that will execute
+the turn, after provider reconciliation and Agent/task waits. The same admission
+applies withholding and protects prompt checkpoint or running-state writes
+after storage contention. A refused admission does not call the provider or
+persist a terminal turn. This is a turn-admission boundary, not continuous
+revocation of a turn that is already running.
+
+The model-facing tools `cron_add`, `cron_update`, `cron_run`, `cron_list`,
+`cron_runs`, `cron_remove`, `schedule`, and `send_message_to_peer` are also
+withheld from every non-admin principal, including their skill aliases and
+copies in delegated registries. Scheduled and peer turns do not carry the
+calling principal's restrictions, and cron rows and run output are shared by
+agent rather than owned by the calling principal. The same creation,
+rehydration, and prompt-admission checks apply; administrator and shared
+operator sessions keep their configured tools. Existing jobs keep running.
+
+RPC `cron/patch` and `cron/trigger` also refuse agent jobs for non-admins,
+including wildcard selectors. These jobs cannot carry the caller's session
+restrictions. Patches acquire SQLite's writer transaction, reload the job,
+then hold current authority through validation and commit. A revocation,
+owner change, or job-type change while queued cannot reuse the earlier
+admission. Shell jobs retain their grant and current command-policy checks. Cron reads,
+deletion, and jobs already scheduled by an operator are unchanged.
+
+The model-facing `sop_execute`, `sop_approve`, and `sop_advance` tools and
+their aliases are also withheld from non-admin RPC sessions. The owner
+recorded on a private SOP run protects its status, output, run counts, and
+control operations at tool execution, including captured pipeline tools.
+An owned session can access only its exact principal, agent, namespace,
+and tenant plane. Legacy runs without an owner are not public. Unowned
+operator tools retain assistance access, while completion audit records
+remain on the run's original owner's plane. Global metrics are omitted
+from owned `sop_status` queries.
+
+Global RPC run summaries, detail, and overlays require an administrator;
+remote WSS run detail retains its existing refusal. Procedure definitions
+remain governed by their separate read and authoring grants.
 
 RPC `sops/run` and `sops/decide` require administrator grants, including
 when a non-admin has wildcard tool and agent selectors. Headless steps do
@@ -402,10 +456,20 @@ the shared resolver's grants at prompt admission.
 
 That composition does not cover every route to an agent's tools. Cron jobs
 and SOP authoring check only the agent selector. A constrained principal
-holding cron grants can create a shell job for its agent, or give an
-existing agent job a new prompt and trigger it, and one holding SOP create
-or update grants can save a procedure whose trigger runs it later. Treat
+holding cron grants can create a shell job for its agent, and one holding
+SOP create or update grants can save a procedure whose trigger runs it
+later. Agent cron patching and manual triggering require admin. Treat
 cron and SOP authoring grants as grants of the agent's tools.
+
+Principal-owned sessions may use synchronous and parallel delegation when
+their grants allow it. Background delegation and its `check_result`,
+`list_results`, `cancel_task`, and `await_sessions` actions are refused,
+including calls through skill aliases and nested delegates. Those task rows
+and result files currently use agent-alias visibility, which cannot protect
+one principal's private output from another principal using the same agent.
+This refusal includes administrator-owned sessions; their private memory is
+still private. Shared operator delegation remains available. Existing shared
+result artifacts are not migrated or removed by this restriction.
 
 ## Breaking change: remote WSS requires authentication
 
@@ -661,6 +725,11 @@ the restored file without a migration step.
 Consolidation and governance derive shared-plane rows and do not run for
 private sessions, and administrative access into another principal's
 private memory has no surfaced pathway yet (deny-by-default).
+The session-data tools have no principal-aware view yet, so they are
+withheld from principals without `admin` (see
+[Permission profiles](#permission-profiles)) instead of being scoped to the
+caller's own sessions, and scheduled agent jobs, SOP runs, and peer turns can
+still call them unless the agent's risk profile excludes them.
 `sops/runs` and `sops/run-detail` return the run history of every
 procedure to a principal holding `Sops:Read`, whichever agents it ran as,
 unlike cron history. Gateway HTTP routes keep their existing pairing

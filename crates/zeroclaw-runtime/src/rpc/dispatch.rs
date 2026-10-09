@@ -2398,6 +2398,10 @@ impl RpcDispatcher {
         {
             agent.disable_principal_unaware_nested_tools();
         }
+        // Wildcard selectors do not grant access to other principals' sessions.
+        if !grants.admin {
+            agent.withhold_principal_unaware_session_tools();
+        }
     }
 
     /// Queued prompts must not execute with the transport-time grants clone.
@@ -8001,44 +8005,42 @@ impl RpcDispatcher {
             None
         };
 
+        let update = built_model_provider.map(
+            |(
+                model_provider,
+                model_provider_name,
+                model_name,
+                model_route_resolver,
+                tool_dispatcher,
+                config_generation,
+            )| crate::rpc::session::ModelProviderUpdate {
+                model_provider,
+                model_provider_name,
+                model_name,
+                model_route_resolver,
+                tool_dispatcher,
+                config_generation: Arc::clone(&config_generation),
+                temperature: None,
+                multimodal_config: config_generation.multimodal.clone(),
+            },
+        );
         let merged = self
             .ctx
             .sessions
-            .set_overrides_gated(&req.session_id, session_generation, req.overrides)
-            .await
+            .configure_authorized(
+                &req.session_id,
+                session_generation,
+                merged,
+                update,
+                |session| {
+                    self.session_effect_lease(
+                        Method::SessionConfigure,
+                        session.owner_principal_id.as_deref(),
+                    )
+                },
+            )
+            .await?
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-
-        if let Some((
-            model_provider,
-            model_provider_name,
-            model_name,
-            model_route_resolver,
-            tool_dispatcher,
-            config_generation,
-        )) = built_model_provider
-        {
-            self.ctx
-                .sessions
-                .apply_model_provider(
-                    &req.session_id,
-                    session_generation,
-                    crate::rpc::session::ModelProviderUpdate {
-                        model_provider,
-                        model_provider_name,
-                        model_name,
-                        model_route_resolver,
-                        tool_dispatcher,
-                        config_generation: Arc::clone(&config_generation),
-                        // Temperature is already committed through
-                        // `set_overrides_gated` on this path.
-                        temperature: None,
-                        multimodal_config: config_generation.multimodal.clone(),
-                    },
-                )
-                .await
-                .then_some(())
-                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        }
 
         to_result(SessionConfigureResult {
             session_id: req.session_id,
@@ -9711,6 +9713,27 @@ impl RpcDispatcher {
 
     // ── Cron handlers ────────────────────────────────────────────
 
+    fn authorize_cron_agent_execution(
+        &self,
+        method: Method,
+        job: &crate::cron::CronJob,
+    ) -> Result<(), JsonRpcError> {
+        if job.job_type != crate::cron::JobType::Agent {
+            return Ok(());
+        }
+        if self
+            .recheck_authority_after_admission(method)?
+            .is_some_and(|grants| grants.admin)
+        {
+            return Ok(());
+        }
+        let denied = crate::rpc::auth::AuthDenied::forbidden(crate::i18n::get_required_cli_string(
+            "rpc-cron-agent-principal-required",
+        ));
+        self.audit_auth_denial(method, &denied);
+        Err(rpc_err(denied.code, denied.message))
+    }
+
     async fn handle_cron_list(&self) -> RpcResult {
         let config = self.ctx.config.read().clone();
         let mut jobs = crate::cron::list_jobs(&config)
@@ -9775,27 +9798,68 @@ impl RpcDispatcher {
             name: req.name,
             ..Default::default()
         };
-        // The ownership test rides in the `UPDATE` itself for a scoped
-        // principal, so an agent rename landing between the check and the
-        // write cannot open a window. An operator-level principal patches
-        // any row, including the ownerless legacy ones.
-        let owner = self.authorize_cron_job(Method::CronPatch, &config, &req.id)?;
-        // Validate a replacement command under the owning agent's policy before
-        // it is persisted. `cron/add` validates on the way in; without the same
-        // check here an invalid command can replace a working job through the
-        // patch path, and the job only fails later, at execution.
-        if let Some(command) = patch.command.as_deref()
-            && !command.trim().is_empty()
-        {
-            crate::cron::validate_shell_command(&config, &owner.agent_alias, command, true)
-                .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron patch rejected: {e}")))?;
+        // Keep the opaque initial ownership refusal, but repeat all authority
+        // and row checks under the actual writer transaction below.
+        self.authorize_cron_job(Method::CronPatch, &config, &req.id)?;
+        let command = patch.command.clone();
+        let denied = parking_lot::Mutex::new(None);
+        let job = crate::cron::update_job_authorized(&config, &req.id, None, patch, |job| {
+            let authorize = || -> Result<_, JsonRpcError> {
+                // Storage first, then config -> accepted authority -> pairing,
+                // with no further storage acquisition or await after resolution.
+                let live = self.ctx.config.read();
+                let lease = self.ctx.auth.hold_authority();
+                let auth = self
+                    .auth
+                    .as_ref()
+                    .ok_or_else(|| rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"))?;
+                let grants = current_authority_under(&lease, auth, Method::CronPatch)
+                    .map_err(|error| rpc_err(error.code, error.message))?;
+                if !grants.may_use_agent(&req.agent)
+                    || (!grants.admin && !live.agents.contains_key(&req.agent))
+                {
+                    return Err(rpc_err(
+                        FORBIDDEN,
+                        crate::i18n::get_required_cli_string("cron-rpc-requested-agent-forbidden"),
+                    ));
+                }
+                if !grants.may_use_agent(&job.agent_alias) {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        format!(
+                            "Cron job not found: {}",
+                            crate::cron::job_not_found(&req.id)
+                        ),
+                    ));
+                }
+                if job.job_type == crate::cron::JobType::Agent && !grants.admin {
+                    return Err(rpc_err(
+                        FORBIDDEN,
+                        crate::i18n::get_required_cli_string("rpc-cron-agent-principal-required"),
+                    ));
+                }
+                if let Some(command) = command
+                    .as_deref()
+                    .filter(|command| !command.trim().is_empty())
+                {
+                    crate::cron::validate_shell_command(&live, &job.agent_alias, command, true)
+                        .map_err(|error| {
+                            rpc_err(INVALID_PARAMS, format!("Cron patch rejected: {error}"))
+                        })?;
+                }
+                Ok((lease, live))
+            };
+            authorize().map_err(|error| {
+                let message = error.message.clone();
+                *denied.lock() = Some(error);
+                anyhow::Error::msg(message)
+            })
+        });
+        if let Some(error) = denied.into_inner() {
+            return Err(error);
         }
-        let job = if self.has_admin_grants() {
-            crate::cron::update_job(&config, &req.id, patch)
-        } else {
-            crate::cron::update_job_for_agent(&config, &req.id, &owner.agent_alias, patch)
-        }
-        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron patch failed: {e}")))?;
+        let job =
+            job.map_err(|error| rpc_err(INTERNAL_ERROR, format!("Cron patch failed: {error}")))?;
         to_result(job)
     }
 
@@ -9844,6 +9908,7 @@ impl RpcDispatcher {
         .capture_selection();
         let config = self.ctx.config.read().clone();
         let job = self.authorize_cron_job(Method::CronTrigger, &config, &req.id)?;
+        self.authorize_cron_agent_execution(Method::CronTrigger, &job)?;
         let event_tx = self.ctx.event_tx.clone();
         let result = crate::cron::scheduler::run_manual_job_with_selection(
             &config,
@@ -12821,15 +12886,35 @@ impl RpcDispatcher {
         ))
     }
 
+    fn sop_run_read_lease(
+        &self,
+        method: Method,
+    ) -> Result<crate::rpc::auth::AuthorityLease<'_>, JsonRpcError> {
+        let lease = self.ctx.auth.hold_authority();
+        if let Some(auth) = self.auth.as_ref() {
+            let grants = current_authority_under(&lease, auth, method)
+                .map_err(|error| rpc_err(error.code, error.message))?;
+            if !grants.admin {
+                return Err(rpc_err(
+                    FORBIDDEN,
+                    crate::i18n::get_required_cli_string("sop-rpc-run-admin-required"),
+                ));
+            }
+        }
+        Ok(lease)
+    }
+
     fn handle_sops_runs(&self, params: &Value) -> RpcResult {
+        drop(self.sop_run_read_lease(Method::SopsRuns)?);
         let req: SopRunsRequest = parse_params(params)?;
         let engine = self
             .ctx
             .sop_engine
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        let runs = crate::sop::run_summaries_for(engine, req.sop.as_deref())
-            .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
+        let runs = crate::sop::run_summaries_for(engine, req.sop.as_deref());
+        let _authority = self.sop_run_read_lease(Method::SopsRuns)?;
+        let runs = runs.map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
         to_result(serde_json::json!({ "runs": runs }))
     }
 
@@ -12853,13 +12938,18 @@ impl RpcDispatcher {
                  authenticated principal to authorize run contents against",
             ));
         }
+        drop(self.sop_run_read_lease(Method::SopsRunDetail)?);
         let req: SopRunDetailRequest = parse_params(params)?;
         let engine = self
             .ctx
             .sop_engine
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        let (run, active) = crate::sop::run_detail_for(engine, &req.run_id).map_err(|e| {
+        let result = crate::sop::run_detail_for(engine, &req.run_id);
+        // Recheck before either success or error projection: a missing-run
+        // response must not become an existence oracle after revocation.
+        let _authority = self.sop_run_read_lease(Method::SopsRunDetail)?;
+        let (run, active) = result.map_err(|e| {
             let msg = e.to_string();
             let code = if msg.contains("not found") {
                 INVALID_PARAMS
@@ -12873,6 +12963,7 @@ impl RpcDispatcher {
     }
 
     fn handle_sops_run_overlay(&self, params: &Value) -> RpcResult {
+        drop(self.sop_run_read_lease(Method::SopsRunOverlay)?);
         let req: SopRunOverlayRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
         let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
@@ -12882,7 +12973,9 @@ impl RpcDispatcher {
             .sop_engine
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        let overlay = crate::sop::run_overlay_for(&sop, engine, &req.run_id).map_err(|e| {
+        let result = crate::sop::run_overlay_for(&sop, engine, &req.run_id);
+        let _authority = self.sop_run_read_lease(Method::SopsRunOverlay)?;
+        let overlay = result.map_err(|e| {
             let msg = e.to_string();
             let code = if msg.contains("not found") {
                 INVALID_PARAMS
@@ -14530,6 +14623,7 @@ pub(crate) mod connection_test_support {
 
 #[cfg(test)]
 mod tests {
+    mod principal_headless;
     mod sop_principal;
 
     use zeroclaw_api::model_provider::ChatMessage;
@@ -15210,6 +15304,7 @@ mod tests {
             revision: 0,
             revision_base: 0,
             initiating_agent: None,
+            memory_owner: None,
             decided_mode: None,
             decisions: std::collections::BTreeMap::new(),
         };
@@ -16515,7 +16610,16 @@ mod tests {
     async fn cron_patch_rejects_a_command_the_owner_policy_refuses() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = cron_roster_config_in(&tmp, 4242);
-        let job = seed_cron_job(&config, "alpha", "alpha-job");
+        let job = crate::cron::add_shell_job_with_approval(
+            &config,
+            "alpha",
+            Some("alpha-job".into()),
+            Schedule::Every { every_ms: 3600000 },
+            "echo original",
+            None,
+            true,
+        )
+        .unwrap();
         let ctx = enforcement_ctx(config.clone());
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
 
@@ -16543,6 +16647,603 @@ mod tests {
             "a rejected patch must leave the stored command unchanged"
         );
         assert_eq!(reread.name.as_deref(), job.name.as_deref());
+    }
+
+    struct PrincipalHistoryProbe {
+        calls: std::sync::atomic::AtomicUsize,
+        results: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for PrincipalHistoryProbe {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "principal-history-probe"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for PrincipalHistoryProbe {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".into())
+        }
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let first = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            if !first {
+                *self.results.lock().unwrap() = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .filter(|message| message.role == "tool")
+                    .take(4)
+                    .map(|message| message.content.clone())
+                    .collect();
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: (!first).then(|| "probe complete".into()),
+                tool_calls: if first {
+                    [
+                        ("sessions_history", json!({"session_id":"rpc_victim"})),
+                        ("peek__history", json!({"session_id":"rpc_victim"})),
+                        ("calculator", json!({"function":"add", "values":[2,2]})),
+                        ("sessions_current", json!({})),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (name, args))| zeroclaw_providers::ToolCall {
+                        id: format!("probe-{index}"),
+                        name: name.into(),
+                        arguments: args.to_string(),
+                        extra_content: None,
+                    })
+                    .collect()
+                } else {
+                    Vec::new()
+                },
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    async fn install_principal_history_probe(
+        agent: &Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
+    ) -> Arc<std::sync::Mutex<Vec<String>>> {
+        let results = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut guard = agent.lock().await;
+        guard.set_tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher));
+        guard.set_model_provider(Box::new(PrincipalHistoryProbe {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            results: Arc::clone(&results),
+        }));
+        results
+    }
+
+    async fn assert_session_data_tools_withheld(
+        agent: &Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
+        foreign_session_key: &str,
+    ) {
+        let agent = agent.lock().await;
+        for name in zeroclaw_tools::PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES {
+            assert!(
+                agent.execute_tool_for_test(name, json!({})).await.is_none(),
+                "{name} must be withheld"
+            );
+        }
+        let send = agent
+            .dispatch_tool_for_test(
+                "sessions_send",
+                json!({"session_id": foreign_session_key, "message": "harmless probe"}),
+            )
+            .await;
+        assert!(!send.success);
+        assert_eq!(send.output, "Unknown tool: sessions_send");
+        let history = agent
+            .dispatch_tool_for_test(
+                "sessions_history",
+                json!({"session_id": foreign_session_key}),
+            )
+            .await;
+        assert!(!history.success);
+        assert_eq!(history.output, "Unknown tool: sessions_history");
+        let names = agent.tool_names();
+        assert!(names.contains(&"sessions_current"), "{names:?}");
+        assert!(!names.contains(&"spawn_subagent"), "{names:?}");
+        assert!(names.contains(&"delegate"), "{names:?}");
+        assert!(
+            agent
+                .delegate_tool
+                .as_ref()
+                .expect("the registry built a delegate")
+                .withholds_session_data_tools(),
+            "the retained delegate must withhold the tools from its children"
+        );
+    }
+
+    #[tokio::test]
+    async fn principal_native_history_uses_final_admission_and_monotonic_withholding() {
+        for boundary in ["provider", "prompt-agent", "prompt-task"] {
+            for demote in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let mut config = two_user_config_with_administrator_alice(&tmp);
+                config
+                    .permission_profiles
+                    .get_mut("member")
+                    .unwrap()
+                    .grants
+                    .insert(
+                        zeroclaw_api::grants::Resource::Tools,
+                        vec![zeroclaw_api::grants::Verb::Execute],
+                    );
+                let risk = config.risk_profiles.get_mut("test-profile").unwrap();
+                risk.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
+                risk.allowed_tools.extend(
+                    [
+                        "sessions_history",
+                        "sessions_current",
+                        "calculator",
+                        "delegate",
+                        "peek__history",
+                    ]
+                    .map(str::to_owned),
+                );
+                let bundle = tmp.path().join("skills");
+                std::fs::create_dir_all(bundle.join("peek")).unwrap();
+                std::fs::write(bundle.join("peek/SKILL.toml"), "[skill]\nname='peek'\ndescription='History boundary fixture'\n[[tools]]\nname='history'\ndescription='Read history'\nkind='builtin'\ncommand=''\ntarget='sessions_history'\n").unwrap();
+                config.skill_bundles.insert(
+                    "probe".into(),
+                    zeroclaw_config::schema::SkillBundleConfig {
+                        directory: Some(bundle.to_string_lossy().into_owned()),
+                        ..Default::default()
+                    },
+                );
+                config.agents.get_mut("test-agent").unwrap().skill_bundles = vec!["probe".into()];
+                let data_dir = config.data_dir.clone();
+                let (fixture, sessions, backend, _) =
+                    make_persistence_test_dispatcher(config, &data_dir);
+                let ctx = Arc::clone(&fixture.ctx);
+                scoped_dispatcher(&ctx, 4343).await.handle_session_new_for_test(&json!({"agent_alias":"test-agent", "session_id":"victim", "chat_mode":"chat"})).await.unwrap();
+                backend
+                    .append(
+                        "rpc_victim",
+                        &ChatMessage::assistant("foreign-history-marker"),
+                    )
+                    .unwrap();
+                let before = backend.load("rpc_victim");
+                let alice = Arc::new(scoped_dispatcher(&ctx, 4242).await);
+                alice.handle_session_new_for_test(&json!({"agent_alias":"test-agent", "session_id":"actor", "chat_mode":"chat"})).await.unwrap();
+                let agent = sessions.get_agent("actor").await.unwrap();
+                assert!(
+                    agent.lock().await.tool_names().contains(&"peek__history"),
+                    "the real registry must install the alias; loaded skills: {:?}",
+                    crate::skills::load_skills_for_agent_from_config(
+                        &ctx.config.read(),
+                        "test-agent"
+                    )
+                );
+                let results = install_principal_history_probe(&agent).await;
+                let provider_guard = if boundary == "provider" {
+                    Some(sessions.lock_model_provider_update("actor").await.unwrap())
+                } else {
+                    None
+                };
+                let provider_wait = sessions.model_provider_update_waiting();
+                let provider_arrived = provider_wait.notified();
+                let pause = if boundary == "provider" {
+                    None
+                } else {
+                    Some(sessions.set_test_effect_pause(boundary))
+                };
+                let call = Arc::clone(&alice);
+                let prompt = zeroclaw_spawn::spawn!(async move {
+                    call.handle_session_prompt(
+                        &json!({"session_id":"actor", "prompt":"probe foreign history"}),
+                    )
+                    .await
+                });
+                if let Some((arrived, _)) = &pause {
+                    tokio::time::timeout(std::time::Duration::from_secs(10), arrived.notified())
+                        .await
+                        .unwrap();
+                } else {
+                    tokio::time::timeout(std::time::Duration::from_secs(10), provider_arrived)
+                        .await
+                        .unwrap();
+                }
+                if demote {
+                    set_alice_administrator(&ctx, false);
+                }
+                drop(provider_guard);
+                if let Some((_, release)) = pause {
+                    release.notify_one();
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(10), prompt)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let output = results.lock().unwrap().clone();
+                assert_eq!(output.len(), 4, "{boundary}: {output:?}");
+                assert_eq!(
+                    output
+                        .iter()
+                        .filter(|text| text.contains("foreign-history-marker"))
+                        .count(),
+                    if demote { 0 } else { 2 },
+                    "{boundary}: {output:?}"
+                );
+                assert!(
+                    output.iter().any(|text| {
+                        let result: serde_json::Value = serde_json::from_str(text).unwrap();
+                        result["tool_call_id"] == "probe-2" && result["content"] == "4"
+                    }),
+                    "calculator remains executable: {output:?}"
+                );
+                assert!(
+                    output.iter().any(|text| text.contains("actor")),
+                    "sessions_current remains executable: {output:?}"
+                );
+                assert_eq!(
+                    serde_json::to_value(backend.load("rpc_victim")).unwrap(),
+                    serde_json::to_value(&before).unwrap()
+                );
+                if demote {
+                    assert_session_data_tools_withheld(&agent, "rpc_victim").await;
+                    set_alice_administrator(&ctx, true);
+                    let regrant = install_principal_history_probe(&agent).await;
+                    alice
+                        .handle_session_prompt(
+                            &json!({"session_id":"actor", "prompt":"regrant stays narrowed"}),
+                        )
+                        .await
+                        .unwrap();
+                    assert!(
+                        !regrant
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|text| text.contains("foreign-history-marker"))
+                    );
+                    assert_session_data_tools_withheld(&agent, "rpc_victim").await;
+                    sessions.remove("actor").await;
+                    alice.handle_session_new_for_test(&json!({"agent_alias":"test-agent", "session_id":"actor", "chat_mode":"chat"})).await.unwrap();
+                    let restored = sessions.get_agent("actor").await.unwrap();
+                    assert!(!Arc::ptr_eq(&agent, &restored));
+                    let promoted = install_principal_history_probe(&restored).await;
+                    alice
+                        .handle_session_prompt(
+                            &json!({"session_id":"actor", "prompt":"rehydrated admin control"}),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        promoted
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|text| text.contains("foreign-history-marker"))
+                            .count(),
+                        2
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_principals_cannot_reach_session_data_tools_even_with_wildcard_selectors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = two_user_config(&tmp);
+        // Hold the coarse `tools:execute` grant so the wildcard tool selector
+        // is in force instead of narrowing every tool away.
+        config
+            .permission_profiles
+            .get_mut("member")
+            .unwrap()
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Tools,
+                vec![zeroclaw_api::grants::Verb::Execute],
+            );
+        let data_dir = config.data_dir.clone();
+        let (operator, sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&operator.ctx);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let bob = scoped_dispatcher(&ctx, 4343).await;
+
+        bob.handle_session_new_for_test(&json!({
+            "agent_alias": "test-agent",
+            "session_id": "bob-chat",
+        }))
+        .await
+        .expect("bob creates his chat session");
+        let bob_key = "rpc_bob-chat";
+        chat_backend
+            .append(bob_key, &ChatMessage::user("bob private marker"))
+            .unwrap();
+        let bob_transcript = serde_json::to_value(chat_backend.load(bob_key)).unwrap();
+
+        for (sid, chat_mode) in [("alice-acp", "acp"), ("alice-chat", "chat")] {
+            alice
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "session_id": sid,
+                    "chat_mode": chat_mode,
+                }))
+                .await
+                .expect("alice creates her session");
+            let agent = sessions
+                .get_agent(sid)
+                .await
+                .expect("alice's session is live");
+            assert_session_data_tools_withheld(&agent, bob_key).await;
+        }
+
+        assert!(sessions.remove("alice-acp").await);
+        let rehydrated = alice
+            .rehydrate_reaped_session("alice-acp", alice.stamped_grants())
+            .await
+            .expect("alice may rehydrate her own session")
+            .expect("the reaped session rehydrates");
+        assert_session_data_tools_withheld(&rehydrated, bob_key).await;
+
+        assert_eq!(
+            serde_json::to_value(chat_backend.load(bob_key)).unwrap(),
+            bob_transcript,
+            "bob's transcript must be unchanged"
+        );
+
+        // The shared operator keeps the tools, and its delegate withholds
+        // nothing from its children.
+        operator
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "operator-acp",
+                "chat_mode": "acp",
+            }))
+            .await
+            .expect("the operator creates a session");
+        let operator_agent = sessions.get_agent("operator-acp").await.unwrap();
+        let operator_agent = operator_agent.lock().await;
+        let names = operator_agent.tool_names();
+        for name in zeroclaw_tools::PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES
+            .iter()
+            .chain(&["sessions_current", "spawn_subagent"])
+        {
+            assert!(names.contains(name), "the operator keeps {name}: {names:?}");
+        }
+        assert!(
+            !operator_agent
+                .delegate_tool
+                .as_ref()
+                .expect("the registry built a delegate")
+                .withholds_session_data_tools()
+        );
+    }
+
+    #[tokio::test]
+    async fn demoted_principal_loses_session_data_tools_at_its_next_prompt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = principal_test_config(&tmp, &["*"], &["*"]);
+        config
+            .risk_profiles
+            .get_mut("test-profile")
+            .unwrap()
+            .allowed_tools
+            .extend(
+                zeroclaw_tools::PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES
+                    .iter()
+                    .chain(&["sessions_current"])
+                    .map(|name| (*name).to_string()),
+            );
+        config
+            .permission_profiles
+            .get_mut("principal-test")
+            .unwrap()
+            .admin = true;
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+        let dispatcher = bind_test_principal(dispatcher).await;
+        dispatcher
+            .handle_session_new_for_test(
+                &json!({"agent_alias":"test-agent","session_id":"principal-demoted"}),
+            )
+            .await
+            .unwrap();
+        let handle = sessions.get_agent("principal-demoted").await.unwrap();
+        {
+            let agent = handle.lock().await;
+            let names = agent.tool_names();
+            for name in zeroclaw_tools::PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES
+                .iter()
+                .chain(&["spawn_subagent"])
+            {
+                assert!(
+                    names.contains(name),
+                    "an administrator keeps {name}: {names:?}"
+                );
+            }
+        }
+
+        {
+            let mut cfg = dispatcher.ctx.config.write();
+            cfg.permission_profiles
+                .get_mut("principal-test")
+                .unwrap()
+                .admin = false;
+            dispatcher.ctx.auth.refresh_from_config(&cfg).unwrap();
+        }
+        let current = dispatcher.current_prompt_authority().unwrap();
+        let grants = current
+            .stamped_grants()
+            .expect("the refreshed handle carries grants")
+            .clone();
+        let mut agent = handle.lock().await;
+        current.apply_principal_grants_to_agent(&grants, &mut agent);
+        let names = agent.tool_names();
+        for name in zeroclaw_tools::PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES
+            .iter()
+            .chain(&["spawn_subagent"])
+        {
+            assert!(
+                !names.contains(name),
+                "a demoted principal keeps {name}: {names:?}"
+            );
+        }
+        for name in ["sessions_current", "calculator", "delegate"] {
+            assert!(names.contains(&name), "{name} stays: {names:?}");
+        }
+        assert!(
+            agent
+                .delegate_tool
+                .as_ref()
+                .expect("the registry built a delegate")
+                .withholds_session_data_tools()
+        );
+    }
+
+    #[test]
+    fn cron_patch_rechecks_authority_and_row_after_sqlite_writer_wait() {
+        run_on_a_large_stack(|| async {
+            for scenario in [
+                "agent-demotion",
+                "shell-revocation",
+                "owner-change",
+                "type-change",
+                "agent-control",
+                "shell-control",
+            ] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let mut config = cron_roster_config_in(&tmp, 4242);
+                let agent = scenario.starts_with("agent-");
+                config
+                    .permission_profiles
+                    .get_mut("cron-alpha")
+                    .unwrap()
+                    .admin = agent;
+                let job = if agent {
+                    seed_cron_job(&config, "alpha", "original")
+                } else {
+                    crate::cron::add_shell_job_with_approval(
+                        &config,
+                        "alpha",
+                        Some("original".into()),
+                        Schedule::Every { every_ms: 3600000 },
+                        "echo original",
+                        None,
+                        true,
+                    )
+                    .unwrap()
+                };
+                let ctx = enforcement_ctx(config.clone());
+                let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+                let (operator, _) = local_operator(&ctx).await;
+                let writer =
+                    rusqlite::Connection::open(config.data_dir.join("cron/jobs.db")).unwrap();
+                writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+                let (arrived, waiting) = std::sync::mpsc::channel();
+                let id = job.id.clone();
+                let worker = std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        crate::cron::notify_patch_writer_wait_for_test(arrived);
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap()
+                            .block_on(rpc(
+                                &mut alice,
+                                &mut rx,
+                                1,
+                                "cron/patch",
+                                json!({"id":id,"agent":"alpha","name":"patched"}),
+                            ))
+                    })
+                    .unwrap();
+                let arrival = waiting.recv_timeout(std::time::Duration::from_secs(3));
+                if arrival.is_ok() {
+                    match scenario {
+                        "agent-demotion" | "shell-revocation" => {
+                            let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+                            let mut changed = ctx.config.read().clone();
+                            let profile =
+                                changed.permission_profiles.get_mut("cron-alpha").unwrap();
+                            profile.admin = false;
+                            if scenario == "shell-revocation" {
+                                profile
+                                    .grants
+                                    .get_mut(&zeroclaw_api::grants::Resource::Cron)
+                                    .unwrap()
+                                    .retain(|verb| *verb != zeroclaw_api::grants::Verb::Update);
+                            }
+                            changed.mark_dirty("permission_profiles.cron-alpha");
+                            operator
+                                .save_and_swap_config(changed, &guard)
+                                .await
+                                .unwrap();
+                        }
+                        "owner-change" => {
+                            writer
+                                .execute(
+                                    "UPDATE cron_jobs SET agent_alias='beta' WHERE id=?1",
+                                    [&job.id],
+                                )
+                                .unwrap();
+                        }
+                        "type-change" => {
+                            writer.execute("UPDATE cron_jobs SET job_type='agent', prompt='private' WHERE id=?1", [&job.id]).unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+                writer.execute_batch("COMMIT").unwrap();
+                let response = worker.join().unwrap();
+                arrival.expect("patch must enter the real SQLite writer wait");
+                let stored = crate::cron::get_job(&config, &job.id).unwrap();
+                if scenario.ends_with("control") {
+                    assert!(response.get("error").is_none(), "{scenario}: {response}");
+                    assert_eq!(stored.name.as_deref(), Some("patched"));
+                } else {
+                    assert_eq!(
+                        response["error"]["code"],
+                        json!(if scenario == "owner-change" {
+                            INVALID_PARAMS
+                        } else {
+                            FORBIDDEN
+                        }),
+                        "{scenario}: {response}"
+                    );
+                    assert_eq!(stored.name.as_deref(), Some("original"), "{scenario}");
+                    assert_eq!(stored.command, job.command);
+                    assert_eq!(stored.next_run, job.next_run);
+                }
+                assert!(stored.last_run.is_none());
+                assert!(
+                    crate::cron::list_runs(&config, &job.id, 10)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        });
     }
 
     #[tokio::test]
@@ -19451,6 +20152,133 @@ mod tests {
         ctx.config_authority.publish_for_test(config);
     }
 
+    #[tokio::test]
+    async fn sop_run_reads_recheck_after_contention_for_success_and_missing_results() {
+        for method in ["sops/runs", "sops/run-detail", "sops/run-overlay"] {
+            for missing in [false, true] {
+                for revoke in [false, true] {
+                    let tmp = tempfile::TempDir::new().unwrap();
+                    let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
+                    grant_sop_admin(&ctx);
+                    let run_id = park_sop_run(&engine, "alpha-sop");
+                    let (alice, _) = roster_peer(&ctx, 4242).await;
+                    let (operator, _) = local_operator(&ctx).await;
+                    let requested = if missing {
+                        "absent".to_string()
+                    } else {
+                        run_id
+                    };
+                    let (locked, acquired) = std::sync::mpsc::channel();
+                    let (release, released) = std::sync::mpsc::channel();
+                    let holder = std::thread::spawn(move || {
+                        let _held = engine.lock().unwrap();
+                        locked.send(()).unwrap();
+                        // Dropping the sender also releases the lock if a test
+                        // assertion fails before the ordinary release signal.
+                        let _ = released.recv();
+                    });
+                    acquired
+                        .recv_timeout(std::time::Duration::from_secs(3))
+                        .unwrap();
+                    let (entered, waiting) = std::sync::mpsc::channel();
+                    let worker = std::thread::Builder::new()
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(move || {
+                            crate::sop::notify_run_read_wait_for_test(entered);
+                            let params = json!({"name":"alpha-sop", "run_id":requested});
+                            match method {
+                                "sops/runs" => alice.handle_sops_runs(&params),
+                                "sops/run-detail" => alice.handle_sops_run_detail(&params),
+                                _ => alice.handle_sops_run_overlay(&params),
+                            }
+                        })
+                        .unwrap();
+                    let arrived = waiting.recv_timeout(std::time::Duration::from_secs(3));
+                    if arrived.is_ok() && revoke {
+                        let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+                        let mut changed = ctx.config.read().clone();
+                        changed
+                            .permission_profiles
+                            .get_mut("cron-alpha")
+                            .unwrap()
+                            .admin = false;
+                        changed.mark_dirty("permission_profiles.cron-alpha");
+                        operator
+                            .save_and_swap_config(changed, &guard)
+                            .await
+                            .unwrap();
+                    }
+                    release.send(()).unwrap();
+                    holder.join().unwrap();
+                    let response = worker.join().unwrap();
+                    arrived
+                        .expect("read must pass initial admission and reach the real engine wait");
+                    if revoke {
+                        let error = response.unwrap_err();
+                        assert_eq!(error.code, FORBIDDEN, "{method}, missing={missing}");
+                        assert_eq!(
+                            error.message,
+                            crate::i18n::get_required_cli_string("sop-rpc-run-admin-required")
+                        );
+                    } else if missing && method != "sops/runs" {
+                        assert_eq!(response.unwrap_err().code, INVALID_PARAMS, "{method}");
+                    } else {
+                        assert!(response.is_ok(), "{method}: {response:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sop_global_run_reads_refuse_roster_users_before_lookup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
+        allow_all_sop_agents(&ctx);
+        let run_id = park_sop_run(&engine, "alpha-sop");
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        for (method, params) in [
+            ("sops/runs", json!({})),
+            ("sops/run-detail", json!({"run_id":run_id})),
+            ("sops/run-detail", json!({"run_id":"missing"})),
+            (
+                "sops/run-overlay",
+                json!({"name":"alpha-sop","run_id":run_id}),
+            ),
+            (
+                "sops/run-overlay",
+                json!({"name":"missing","run_id":"missing"}),
+            ),
+        ] {
+            let response = rpc(&mut alice, &mut rx, 1, method, params).await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(FORBIDDEN),
+                "{method}: {response}"
+            );
+            assert_eq!(
+                response["error"]["message"],
+                json!(crate::i18n::get_required_cli_string(
+                    "sop-rpc-run-admin-required"
+                ))
+            );
+        }
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        let response = rpc(
+            &mut operator,
+            &mut op_rx,
+            2,
+            "sops/run-detail",
+            json!({"run_id":run_id}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["run"]["run_id"],
+            json!(run_id),
+            "{response}"
+        );
+    }
+
     fn grant_sop_admin(ctx: &RpcContext) {
         let mut config = ctx.config.snapshot();
         config
@@ -20033,7 +20861,7 @@ mod tests {
                 let change = async {
                     entered.notified().await;
                     if revoke {
-                        let commit = ctx.config_authority.begin_config_commit().await;
+                        let commit = ctx.config_authority.begin_config_commit().await.unwrap();
                         let mut changed = ctx.config.read().clone();
                         changed
                             .permission_profiles
@@ -24348,48 +25176,73 @@ mod tests {
     #[tokio::test]
     async fn configure_refuses_an_incarnation_replaced_under_the_lock() {
         use crate::rpc::types::ChatMode;
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = two_user_config(&tmp);
-        let data_dir = config.data_dir.clone();
-        let (fixture, sessions, _chat_backend, _acp_store) =
-            make_persistence_test_dispatcher(config, &data_dir);
-        let ctx = Arc::clone(&fixture.ctx);
-        install_live_session_owned_by(&sessions, "cfg", Some("user:alice"), ChatMode::Chat).await;
-        let alice = scoped_dispatcher(&ctx, 4242).await;
-        let lock = sessions
-            .lock_model_provider_update("cfg")
-            .await
-            .expect("the live session has an update lock");
-        let params = json!({"session_id": "cfg", "overrides": {"temperature": 0.2}});
-        let waiting = sessions.model_provider_update_waiting();
-        let operation = alice.handle_session_configure(&params);
-        let replace = async {
-            // Replace only once configure is parked on the update lock, after
-            // its generation capture; a fixed delay cannot promise that under
-            // parallel test load.
-            tokio::time::timeout(std::time::Duration::from_secs(5), waiting.notified())
+        for (owner, replace_session) in [
+            ("user:alice", false),
+            ("user:alice", true),
+            ("user:bob", true),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = two_user_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (fixture, sessions, _chat_backend, _acp_store) =
+                make_persistence_test_dispatcher(config, &data_dir);
+            let ctx = Arc::clone(&fixture.ctx);
+            install_live_session_owned_by(&sessions, "cfg", Some("user:alice"), ChatMode::Chat)
+                .await;
+            let alice = scoped_dispatcher(&ctx, 4242).await;
+            let lock = sessions
+                .lock_model_provider_update("cfg")
                 .await
-                .expect("configure must reach the provider update lock");
-            assert!(sessions.remove("cfg").await);
-            let successor =
-                install_live_session_owned_by(&sessions, "cfg", Some("user:bob"), ChatMode::Chat)
-                    .await;
-            drop(lock);
-            successor
-        };
-        let (result, successor) = tokio::join!(operation, replace);
-        let err = result.expect_err("a replaced session cannot be configured by the old owner");
-        assert_eq!(err.code, SESSION_NOT_FOUND, "{}", err.message);
-        assert!(err.message.contains("Session changed while queued"));
-        assert_eq!(sessions.get_generation("cfg").await, Some(successor));
-        assert_eq!(
-            sessions
-                .get_overrides("cfg")
-                .await
-                .and_then(|o| o.temperature),
-            None,
-            "bob's successor keeps its own overrides"
-        );
+                .expect("the live session has an update lock");
+            let params = json!({"session_id": "cfg", "overrides": {"temperature": 0.2}});
+            let operation = alice.handle_session_configure(&params);
+            let waiting = sessions.model_provider_update_waiting();
+            let replace = async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), waiting.notified())
+                    .await
+                    .expect("configure must wait at the provider-update lock");
+                let successor = if replace_session {
+                    assert!(sessions.remove("cfg").await);
+                    install_live_session_owned_by(&sessions, "cfg", Some(owner), ChatMode::Chat)
+                        .await
+                } else {
+                    sessions.get_generation("cfg").await.unwrap()
+                };
+                drop(lock);
+                successor
+            };
+            let (result, successor) = tokio::join!(operation, replace);
+            if !replace_session {
+                result.expect("the unchanged owner's configure must succeed after the same wait");
+            } else {
+                let err =
+                    result.expect_err("a replaced session cannot be configured by the old owner");
+                // The original incarnation was captured before the proven
+                // lock wait. Either replacement must first fail its generation
+                // fence, regardless of who owns the successor.
+                assert_eq!(err.code, SESSION_NOT_FOUND, "{}", err.message);
+                assert_eq!(err.message, "Session changed while queued");
+                if owner != "user:alice" {
+                    // A fresh request has not captured the old incarnation:
+                    // admission must instead hide the foreign session.
+                    let fresh = alice.handle_session_configure(&params).await.unwrap_err();
+                    assert_eq!(fresh.code, FORBIDDEN, "{}", fresh.message);
+                    assert_eq!(
+                        fresh.message,
+                        "Session not found or not owned by this principal"
+                    );
+                }
+            }
+            assert_eq!(sessions.get_generation("cfg").await, Some(successor));
+            assert_eq!(
+                sessions
+                    .get_overrides("cfg")
+                    .await
+                    .and_then(|o| o.temperature),
+                if replace_session { None } else { Some(0.2) },
+                "a successor keeps its own overrides; the unchanged owner's update succeeds"
+            );
+        }
     }
 
     /// The waits between configure's ownership check and its generation
@@ -45663,6 +46516,87 @@ mod tests {
     /// generation, enters the gated method, then the session is removed and
     /// recreation starts while the stale configure is paused. The stale work must be
     /// rejected and the successor must remain untouched.
+    #[tokio::test]
+    async fn session_configure_revoked_at_commit_changes_neither_overrides_nor_agent() {
+        for model_change in [false, true] {
+            for revoke in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let mut config = make_model_refresh_test_config(&tmp);
+                config.gateway.paired_tokens = vec!["zc_configure_test".into()];
+                let mut dispatcher = make_config_set_test_dispatcher(config);
+                dispatcher
+                    .handle_initialize(&json!({"auth_token":"zc_configure_test"}))
+                    .await
+                    .unwrap();
+                let sid = create_model_refresh_test_session(&dispatcher, &tmp).await;
+                let sessions = Arc::clone(&dispatcher.ctx.sessions);
+                let before_overrides = sessions
+                    .preview_overrides(&sid, &Default::default())
+                    .await
+                    .unwrap();
+                let before_model = model_name_for_session(&dispatcher, &sid).await;
+                let before_temperature = temperature_for_session(&dispatcher, &sid).await;
+                let (entered, release, _) = sessions.set_test_gated_op_pause();
+                let mut overrides = json!({"temperature":0.99});
+                if model_change {
+                    overrides["model_provider"] = json!("openai.test-provider");
+                    overrides["model"] = json!("configured-model");
+                }
+                let params = json!({"session_id":sid,"overrides":overrides});
+                let request = dispatcher.handle_session_configure(&params);
+                let change = async {
+                    entered.notified().await;
+                    if revoke {
+                        assert!(
+                            dispatcher
+                                .ctx
+                                .auth
+                                .pairing()
+                                .revoke_token("zc_configure_test")
+                        );
+                    }
+                    release.notify_one();
+                };
+                let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(request, change)
+                })
+                .await
+                .expect("configure reaches and leaves its final commit boundary");
+                sessions.clear_test_gated_op_pause();
+                if revoke {
+                    assert_eq!(result.unwrap_err().code, AUTH_REQUIRED);
+                    let after = sessions
+                        .preview_overrides(&sid, &Default::default())
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(after).unwrap(),
+                        serde_json::to_value(before_overrides).unwrap()
+                    );
+                    assert_eq!(
+                        model_name_for_session(&dispatcher, &sid).await,
+                        before_model
+                    );
+                    assert_eq!(
+                        temperature_for_session(&dispatcher, &sid).await,
+                        before_temperature
+                    );
+                } else {
+                    assert!(result.is_ok(), "{result:?}");
+                    assert_eq!(temperature_for_session(&dispatcher, &sid).await, Some(0.99));
+                    assert_eq!(
+                        model_name_for_session(&dispatcher, &sid).await,
+                        if model_change {
+                            "configured-model"
+                        } else {
+                            before_model.as_str()
+                        }
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn session_configure_stale_gen_replaced_during_provider_build() {
         let tmp = tempfile::TempDir::new().unwrap();
