@@ -74,7 +74,7 @@ restart, and an OIDC connection must initialize again. The dashboard's
 pending-reload flag still covers daemon-owned subsystems that need rebuilding;
 it does not delay this authorization publication. Edits made outside the
 daemon, directly in `config.toml` or with `zeroclaw config set`, still apply
-at the next daemon reload or restart. The CLI currently saves to disk without
+at the next daemon reload or restart. These authorization CLI writes save to disk without
 publishing to the running daemon or triggering its reload.
 Revoking a gateway pairing token through the gateway's pairing controls
 invalidates connections authenticated with it before their next operation.
