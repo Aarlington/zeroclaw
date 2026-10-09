@@ -901,6 +901,66 @@ impl SessionBackend for SqliteSessionBackend {
         Self::append_on(&conn, session_key, message, &now).map_err(std::io::Error::other)
     }
 
+    fn append_authorized(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+        committed: &mut dyn FnMut(),
+    ) -> std::io::Result<usize> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        // Missing is not an ownerless row: never recreate a deleted session.
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .map_err(std::io::Error::other)?;
+        let _authority = authorize(owner.as_deref())?;
+        Self::append_on(&tx, session_key, message, &Utc::now().to_rfc3339())
+            .map_err(std::io::Error::other)?;
+        let count: usize = tx
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        committed();
+        Ok(count)
+    }
+
+    fn set_session_name_authorized(
+        &self,
+        session_key: &str,
+        name: &str,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .map_err(std::io::Error::other)?;
+        let _authority = authorize(owner.as_deref())?;
+        tx.execute(
+            "UPDATE session_metadata SET name = ?1 WHERE session_key = ?2",
+            params![name, session_key],
+        )
+        .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)
+    }
+
     fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(std::io::Error::other)?;
