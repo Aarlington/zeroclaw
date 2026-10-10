@@ -1,0 +1,107 @@
+name: OIDC admission and stack refresh validation
+on:
+  push:
+    branches: [codex/oidc-adoption-validation-20261010]
+permissions:
+  contents: read
+concurrency:
+  group: oidc-adoption-validation-20261010
+  cancel-in-progress: true
+jobs:
+  validate:
+    if: github.repository == 'Aarlington/zeroclaw'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: canonical-admission
+            source: cce2fa7da737bb68f14715e290ee3bf26cfa0181
+          - name: combined-stack
+            source: 7d5d8f566d14cf3b7e4dc90446711d7a6c6c7fb7
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: never
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: '-C link-arg=-fuse-ld=mold'
+      SOURCE_SHA: ${{ matrix.source }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ matrix.source }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - uses: ./.github/actions/rust-cache
+        with:
+          use-blacksmith: 'false'
+          cache-on-failure: true
+          shared-key: oidc-stack-refresh
+      - name: Install linker
+        run: bash scripts/ci/apt_install.sh mold
+      - name: Check source and formatting
+        run: |
+          set -euo pipefail
+          mkdir -p adoption-evidence web/dist
+          touch web/dist/.gitkeep
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git rev-parse HEAD > adoption-evidence/source-sha.txt
+          cargo fmt --all -- --check 2>&1 | tee adoption-evidence/fmt.log
+      - name: Compile and run effect-boundary suites
+        run: |
+          set -euo pipefail
+          cargo check --locked -p zeroclaw-runtime --tests 2>&1 | tee adoption-evidence/check.log
+          timeout 480s cargo test --locked -p zeroclaw-config --lib live:: 2>&1 | tee adoption-evidence/config.log
+          timeout 480s cargo test --locked -p zeroclaw-infra --lib session_ 2>&1 | tee adoption-evidence/storage.log
+          timeout 480s cargo test --locked -p zeroclaw-runtime --lib rpc:: 2>&1 | tee adoption-evidence/rpc.log
+          timeout 480s cargo test --locked -p zeroclaw-runtime --lib live_config_authority:: 2>&1 | tee adoption-evidence/authority.log
+          timeout 480s cargo test --locked -p zeroclaw-runtime --lib principal 2>&1 | tee adoption-evidence/principal.log
+          timeout 480s cargo test --locked -p zeroclaw-runtime --lib steering 2>&1 | tee adoption-evidence/steering.log
+          for suite in config storage rpc authority principal steering; do
+            grep -Eq '^test result: ok. [1-9][0-9]* passed; 0 failed;' "adoption-evidence/$suite.log"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, re
+          names = [
+              'queued_operations_lose_the_admin_bypass_when_the_administrator_is_demoted',
+              'queued_prompt_rechecks_ownership_after_its_provider_waits',
+              'demoted_administrator_cannot_resume_a_foreign_session_with_a_stale_stamp',
+              'final_prompt_effect_waits_recheck_current_authority',
+              'removal_effect_waits_preserve_foreign_session_after_demotion',
+              'restore_effect_waits_preserve_retained_checkpoint_after_demotion',
+              'deferred_approval_install_rechecks_after_agent_wait',
+              'messages_frame_capacity_wait_rechecks_authority_before_disclosure',
+              'resume_plan_capacity_wait_rechecks_authority_and_incarnation',
+              'resume_plan_empty_and_closed_writer_preserve_resume',
+              'remote_resume_admission_wait_uses_current_principal',
+              'remote_resume_rechecks_channels_at_final_agent_install',
+              'history_wait_releases_map_and_refuses_replaced_incarnation',
+              'session_run_once_runs_one_turn_and_closes_its_session',
+          ]
+          lines=Path('adoption-evidence/rpc.log').read_text().splitlines()
+          records=[]
+          for name in names:
+              hits=[line for line in lines if re.search(r'::'+re.escape(name)+r' \.\.\. ok$',line)]
+              assert len(hits)==1,(name,hits)
+              records.append({'test':name,'pass_line':hits[0]})
+          Path('adoption-evidence/selected.json').write_text(json.dumps(records,indent=2)+'\n')
+          print('Verified exactly one PASS for each of 14 selected RPC regressions.')
+          PY
+      - name: Lint changed Rust owners
+        run: |
+          set -euo pipefail
+          cargo clippy --locked -p zeroclaw-runtime -p zeroclaw-infra -p zeroclaw-config --all-targets -- -D warnings 2>&1 | tee adoption-evidence/clippy.log
+          git diff --exit-code
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: oidc-${{ matrix.name }}-evidence
+          path: adoption-evidence/
+          retention-days: 7
