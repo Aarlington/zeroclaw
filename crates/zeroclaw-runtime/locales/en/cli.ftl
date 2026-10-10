@@ -723,6 +723,7 @@ cli-quickstart-esc-return-checklist = {" "}(Esc to return to checklist)
 cli-quickstart-personality-file-prompt = {$filename}{$position} — what next?{$back_hint}
 cli-quickstart-next-agent-command = {"  "}zeroclaw agent -a {$alias}  # chat with this agent in your terminal
 cli-quickstart-fix-and-rerun = Your existing config is untouched. Fix the following and run quickstart again:
+cli-quickstart-partial-personality-failure = The agent config for {$alias} was saved, but installing its personality files failed. Repair the reported paths or permissions, then create or edit the intended personality files in this existing agent's workspace. Do not rerun Quickstart for this saved alias.
 cli-quickstart-could-not-finish = quickstart could not finish: {$count} problem(s) to fix
 cli-quickstart-pick-preset = Pick a preset
 cli-quickstart-pick-existing-prompt = Pick an existing {$prompt}
@@ -737,6 +738,7 @@ cli-quickstart-step-agent = Agent
 cli-quickstart-error-internal-no-result = internal error: apply_into returned no result despite no validation errors
 cli-quickstart-error-completion-flag = failed to flip quickstart-completed: {$err}
 cli-quickstart-error-persist-config = failed to persist config: {$err}
+cli-quickstart-error-publish-config = failed to publish quickstart config: {$err}
 cli-quickstart-error-auth-validation = authorization config rejected before persistence: {$err}
 cli-quickstart-error-not-type-alias-ref = `{$reference}` is not a `<type>.<alias>` reference
 cli-quickstart-error-no-configured-path = no `{$path}` configured
@@ -1310,6 +1312,7 @@ cli-enroll-confirm-sas-line-1 = this one-time pairing code and confirm the short
 cli-enroll-confirm-sas-line-2 = matches on both ends before trusting the daemon:
 cli-enroll-pairing-code = {"    "}pairing code : {$code}
 cli-enroll-sas = {"    "}SAS          : {$sas}
+cli-tunnel-tcp-service-published = {"  "}🔒 Tunnel {$service} (TLS passthrough): {$endpoint}
 
 # ── Context window (doctor update-context-windows, agent interactive) ──
 cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: model provider returned an invalid semantic completion.
@@ -1465,3 +1468,5 @@ cron-rpc-requested-agent-forbidden = The principal is not entitled to the reques
 sop-store-busy = SOP storage is busy or unavailable; retry the request.
 sop-store-nonblocking-unavailable = SOP storage cannot provide immediate access; this request was refused.
 sop-rpc-definition-unavailable = The procedure definition is no longer available.
+
+skill-http-request-timeout = HTTP request timed out
