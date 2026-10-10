@@ -6,7 +6,7 @@ permissions:
   contents: read
 concurrency:
   group: oidc-adoption-validation-20261010
-  cancel-in-progress: true
+  cancel-in-progress: false
 jobs:
   validate:
     if: github.repository == 'Aarlington/zeroclaw'
@@ -17,9 +17,7 @@ jobs:
       matrix:
         include:
           - name: canonical-admission
-            source: cce2fa7da737bb68f14715e290ee3bf26cfa0181
-          - name: combined-stack
-            source: 7d5d8f566d14cf3b7e4dc90446711d7a6c6c7fb7
+            source: 847646a0dee49d17b66974551acd2dd2f03116ef
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_TERM_COLOR: never
