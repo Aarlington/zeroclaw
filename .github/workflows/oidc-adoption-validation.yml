@@ -17,7 +17,7 @@ jobs:
       matrix:
         include:
           - name: canonical-admission
-            source: 847646a0dee49d17b66974551acd2dd2f03116ef
+            source: 35e82e621dd52d77db203b9decf2552ae9ea301a
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_TERM_COLOR: never
