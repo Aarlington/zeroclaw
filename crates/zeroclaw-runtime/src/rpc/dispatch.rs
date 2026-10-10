@@ -22344,7 +22344,7 @@ mod tests {
     /// Grant or revoke alice's administrator profile and publish the policy,
     /// as an accepted permission-profile edit does.
     fn set_alice_administrator(ctx: &Arc<RpcContext>, admin: bool) {
-        let mut config = ctx.config.write();
+        let mut config = ctx.config_authority.snapshot_config();
         config
             .permission_profiles
             .get_mut("administrator")
@@ -22353,6 +22353,7 @@ mod tests {
         ctx.auth
             .refresh_from_config(&config)
             .expect("the edited policy compiles");
+        ctx.config_authority.publish_for_test(config);
     }
 
     #[tokio::test]
