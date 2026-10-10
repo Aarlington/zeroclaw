@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 import subprocess
+from oidc_acceptance_contract import exact_cargo_pass
 
 TESTS = [
     'security::auth_provider::enrollment::tests::enrollment_basic_credentials_round_trip_on_every_endpoint',
@@ -19,8 +20,7 @@ for index, name in enumerate(TESTS):
                             capture_output=True, text=True)
     output = result.stdout + result.stderr
     (evidence / f'current-{index}.log').write_text(output)
-    verified = (result.returncode == 0 and 'running 1 test' in output
-                and f'test {name} ... ok' in output and 'test result: ok. 1 passed; 0 failed;' in output)
+    verified = exact_cargo_pass(name, result.returncode, output)
     record = {'source': source, 'test': name, 'exit': result.returncode,
               'exact_pass_verified': verified}
     (evidence / f'current-{index}.json').write_text(json.dumps(record, indent=2))

@@ -2,7 +2,7 @@ name: OIDC disposable acceptance
 
 on:
   push:
-    branches: [codex/oidc-two-provider-acceptance]
+    branches: [codex/oidc-acceptance-lifecycle-20261010]
 
 permissions:
   contents: read
@@ -43,19 +43,22 @@ jobs:
         run: |
           mkdir -p web/dist
           touch web/dist/.gitkeep
-          python3 tests/manual/oidc_exact_regressions.py
           # Acceptance-only files must be the entire delta from the reviewed PR.
-          git diff --exit-code fb72711ae81f146ba641bcaaee01e2ff6d9c6807 -- . \
+          git diff --exit-code 7d5d8f566d14cf3b7e4dc90446711d7a6c6c7fb7 -- . \
             ':(exclude).github/workflows/oidc-disposable-acceptance.yml' \
             ':(exclude)tests/manual/oidc_baseline_regressions.py' \
             ':(exclude)tests/manual/oidc_enrollment_baseline.py' \
             ':(exclude)tests/manual/oidc_exact_regressions.py' \
-            ':(exclude)tests/manual/oidc_real_providers.py'
+            ':(exclude)tests/manual/oidc_real_providers.py' \
+            ':(exclude)tests/manual/oidc_acceptance_contract.py' \
+            ':(exclude)tests/manual/test_oidc_acceptance.py'
+          python3 -m unittest discover -s tests/manual -p test_oidc_acceptance.py -v
+          python3 tests/manual/oidc_exact_regressions.py
           cargo build --locked -p zeroclaw --bin zeroclaw
           mkdir -p acceptance-build
           cp target/debug/zeroclaw acceptance-build/zeroclaw
           git rev-parse HEAD > acceptance-build/source-sha.txt
-          echo fb72711ae81f146ba641bcaaee01e2ff6d9c6807 > acceptance-build/production-source-sha.txt
+          echo 7d5d8f566d14cf3b7e4dc90446711d7a6c6c7fb7 > acceptance-build/production-source-sha.txt
           sha256sum acceptance-build/zeroclaw > acceptance-build/binary-sha256.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

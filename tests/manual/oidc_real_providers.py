@@ -26,8 +26,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from playwright.sync_api import TimeoutError as BrowserTimeoutError, sync_playwright
-from websockets.sync.client import connect
+from oidc_acceptance_contract import evaluate
 
 
 class CheckError(Exception):
@@ -109,6 +108,7 @@ class Fixture:
         self.images = []
         self.token_shapes = {}
         self.daemon = None
+        self.daemon_starts = 0
         self.entries = []
         self.compose = root / 'compose.json'
         self.project = 'zc-oidc-' + secrets.token_hex(5)
@@ -143,18 +143,18 @@ class Fixture:
             if isinstance(exc, CheckError):
                 result['detail'] = str(exc)
             if name == 'real-provider-and-daemon-setup' and self.compose.exists():
-                # Setup has not issued any OAuth tokens yet. Keep only error
-                # diagnostics, redact fixture credentials and URLs, never env.
+                # Even setup logs may echo database passwords or bootstrap
+                # credentials. Retain a count, never provider-controlled text.
                 logs = self.docker('logs', '--no-color', '--tail', '60')
-                result['setup_errors'] = [self.scrub(line) for line in logs.stdout.splitlines()
-                                          if re.search(r'error|exception|failed|fatal', line, re.I)][-12:]
+                result['setup_error_lines'] = sum(bool(re.search(r'error|exception|failed|fatal', line, re.I))
+                                                  for line in logs.stdout.splitlines())
         result['seconds'] = round(time.monotonic() - started, 2)
         self.results.append(result)
         print(json.dumps(result), flush=True)
         self.save()
         return result['status'] == 'passed'
 
-    def save(self):
+    def save(self, complete=False):
         self.evidence.mkdir(exist_ok=True)
         (self.evidence / f'{self.provider}.json').write_text(json.dumps({
             'provider': self.provider, 'source': os.environ.get('GITHUB_SHA'),
@@ -163,6 +163,9 @@ class Fixture:
             'token_shapes': self.token_shapes,
             'binary_source': (self.binary.parent / 'source-sha.txt').read_text().strip(),
             'production_source': (self.binary.parent / 'production-source-sha.txt').read_text().strip(),
+            'receipt_version': 2,
+            'acceptance': evaluate(self.provider, self.results, complete=complete),
+            'daemon_starts': self.daemon_starts,
             'results': self.results,
         }, indent=2))
 
@@ -191,7 +194,8 @@ class Fixture:
                     'redirectUris': ['http://127.0.0.1/callback', 'http://127.0.0.1:*'],
                     'attributes': {'oauth2.device.authorization.grant.enabled': 'true',
                                    'access.token.header.type.rfc9068': 'true',
-                                   **({'pkce.code.challenge.method': 'S256'} if name == 'zc-human' else {})},
+                                   **({'pkce.code.challenge.method': 'S256'} if name == 'zc-human' else {}),
+                                   **({'access.token.lifespan': '12'} if name == 'zc-expiry' else {})},
                     'protocolMappers': [
                         {'name': 'client identity', 'protocol': 'openid-connect',
                          'protocolMapper': 'oidc-hardcoded-claim-mapper',
@@ -215,7 +219,7 @@ class Fixture:
         realm = {'realm': 'zc-test', 'enabled': True, 'sslRequired': 'none',
                  'accessTokenLifespan': 300,
                  'clients': [client('zc-human', True), client('zc-device', True),
-                             client('zc-service', False), client(reserved_id, False)],
+                             client('zc-service', False), client(reserved_id, False), client('zc-expiry', False)],
                  'users': [{'username': username, 'enabled': True,
                             'emailVerified': True, 'firstName': 'Synthetic', 'lastName': 'User',
                             'email': username + '@example.invalid',
@@ -235,7 +239,8 @@ class Fixture:
         self.entries = [dict(alias='human', issuer=issuer, audience='zeroclaw', client='zc-human'),
                         dict(alias='device', issuer=issuer, audience='zeroclaw', client='zc-device'),
                         dict(alias='service', issuer=issuer, audience='zeroclaw', client='zc-service', secret=self.secret),
-                        dict(alias='reserved', issuer=issuer, audience='zeroclaw', client=reserved_id, secret=self.secret)]
+                        dict(alias='reserved', issuer=issuer, audience='zeroclaw', client=reserved_id, secret=self.secret),
+                        dict(alias='expiry', issuer=issuer, audience='zeroclaw', client='zc-expiry', secret=self.secret)]
 
     def setup_authentik(self):
         pg_secret = secrets.token_hex(24)
@@ -340,13 +345,14 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                 text += key + ' = ' + q(val) + '\n'
             if 'secret' in entry:
                 text += 'client_secret = ' + q(entry['secret']) + '\n'
-            text += 'interactive_clients = ["zc-human", "zc-device"]\nservice_clients = ["zc-service"]\n'
+            service_clients = ['zc-expiry'] if entry['alias'] == 'expiry' else ['zc-service']
+            text += 'interactive_clients = ["zc-human", "zc-device"]\nservice_clients = ' + q(service_clients) + '\n'
             profile = 'participant' if participants and entry['alias'] == 'human' else 'reader'
             mapping = {'reader': profile}
             if participants and entry['alias'] == 'human' and participant_subject:
                 mapping.update({'zeroclaw': 'reader', participant_subject: 'participant'})
             text += 'profile_map = { ' + ', '.join(q(k) + ' = ' + q(v) for k, v in mapping.items()) + ' }\n'
-            text += 'service_profile_map = ' + ('{ "zc-service" = "reader" }' if map_service else '{}') + '\n'
+            text += 'service_profile_map = ' + ('{ ' + q(service_clients[0]) + ' = "reader" }' if map_service else '{}') + '\n'
             text += 'max_auth_lifetime_secs = ' + str(cap) + '\nrevalidation_secs = 5\n'
         self.config.write_text(text)
         self.config.chmod(0o600)
@@ -359,6 +365,7 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         self.daemon_log = open(self.root / 'daemon.log', 'w')
         self.daemon = subprocess.Popen([str(self.binary), 'daemon'], env=self.env,
                                         stdout=self.daemon_log, stderr=subprocess.STDOUT)
+        self.daemon_starts += 1
         def ready():
             require(self.daemon.poll() is None, 'daemon exited before readiness')
             with socket.create_connection(('127.0.0.1', 19781), timeout=1):
@@ -392,7 +399,19 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
             self.daemon_log.close()
             self.daemon = None
 
+    def daemon_identity(self):
+        require(self.daemon is not None and self.daemon.poll() is None, 'measured daemon is not alive')
+        # Linux starttime, not PID alone: a reused PID is not continuity.
+        stat = Path('/proc') / str(self.daemon.pid) / 'stat'
+        start_ticks = int(stat.read_text().rsplit(')', 1)[1].split()[19])
+        return {'pid': self.daemon.pid, 'start_ticks': start_ticks, 'starts': self.daemon_starts}
+
+    def same_daemon(self, before):
+        require(self.daemon_identity() == before, 'daemon changed during the measured phase')
+        return before
+
     def rpc(self, token=None, provider=None, continuity=None):
+        from websockets.sync.client import connect
         ws = connect('wss://127.0.0.1:19781', ssl=self.tls, open_timeout=10, proxy=None)
         params = {}
         if token is not None:
@@ -401,8 +420,12 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
             params['auth_provider'] = provider
         if continuity:
             params.update(continuity)
-        response = self.call(ws, 'initialize', params)
-        return ws, response
+        try:
+            response = self.call(ws, 'initialize', params)
+            return ws, response
+        except BaseException:
+            ws.close()
+            raise
 
     @staticmethod
     def call(ws, method, params=None):
@@ -436,6 +459,7 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
             ws.close()
 
     def enroll(self, alias, browser=None, device=False, username='acceptance-user'):
+        from playwright.sync_api import TimeoutError as BrowserTimeoutError
         args = [str(self.binary), 'oidc', 'login' if browser else 'token', alias]
         if browser and not device:
             args.append('--browser')
@@ -445,10 +469,8 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
             return self.check_token_output(result.stdout)
         proc = subprocess.Popen(args, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         messages = queue.Queue()
-        stderr_lines = []
         def drain():
             for line in proc.stderr:
-                stderr_lines.append(line)
                 messages.put(line)
         reader = threading.Thread(target=drain, daemon=True)
         reader.start()
@@ -465,7 +487,7 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                     require(proc.poll() is None, 'interactive CLI exited before sign-in URL')
                     continue
                 if 'Error:' in line:
-                    raise CheckError('interactive CLI failed: ' + self.scrub(line.strip()))
+                    raise CheckError('interactive CLI failed before presenting the sign-in URL')
                 match = re.search(r'https?://[^\s\x1b]+', line)
                 if match:
                     url = match.group().rstrip('.,')
@@ -492,8 +514,7 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                 page.wait_for_timeout(700)
             require(proc.poll() is not None, 'interactive browser flow timed out')
             reader.join(timeout=2)
-            errors = [self.scrub(line.strip()) for line in stderr_lines if 'Error:' in line]
-            require(proc.returncode == 0, 'CLI rejected completed browser flow: ' + '; '.join(errors))
+            require(proc.returncode == 0, 'CLI rejected completed browser flow')
             return self.check_token_output(proc.stdout.read())
         except BrowserTimeoutError:
             if proc.poll() == 0:
@@ -521,7 +542,10 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
 
     def error_detail(self, response):
         error = response.get('error', {})
-        return self.scrub(str(error.get('code')) + ': ' + str(error.get('message')))
+        code = error.get('code')
+        # Peer error messages may reflect opaque credentials, which cannot be
+        # safely recognized by a JWT-shaped redactor.
+        return 'RPC code ' + (str(code) if type(code) is int else 'absent')
 
     def principal_boundaries(self, browser):
         try:
@@ -544,6 +568,7 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         # phase. Compound mapping fields are not config/set scalar properties.
         self.write_config(participants=True, participant_subject=subjects[1])
         self.start_daemon()
+        measured_daemon = self.daemon_identity()
         connections = []
         identities = {}
         local = None
@@ -738,12 +763,132 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                 missing_memory(ws, key)
                 ws.close()
             checked.append('owner deletion controls after reconnect')
-            return {'verified_boundaries': checked, 'daemon_restarted_during_checks': False}
+            return {'verified_boundaries': checked, 'continuous_daemon': self.same_daemon(measured_daemon)}
         finally:
             for ws in connections:
                 ws.close()
             if local:
                 local.close()
+
+    def populated_storage_restart(self, browser):
+        """Seed through RPC, restart the real daemon, then attack both owners' data."""
+        self.write_config(participants=True)
+        self.start_daemon()
+        connections = []
+        try:
+            tokens = [self.enroll('human', browser, username=user)
+                      for user in ['acceptance-user', 'acceptance-peer']]
+            principals, sessions, transcripts = [], [], []
+            continuity = None
+            key = 'restart-private-' + secrets.token_hex(8)
+            markers = ['restart alpha sentinel', 'restart beta sentinel']
+
+            def success(ws, method, params=None):
+                response = self.call(ws, method, params)
+                require('result' in response and 'error' not in response,
+                        method + ' restart control failed: ' + self.error_detail(response))
+                return response['result']
+
+            def login(token):
+                ws, response = self.rpc(token, 'oidc.human', continuity)
+                connections.append(ws)
+                require('result' in response, 'restart participant initialize failed')
+                require(bool(response['result'].get('principal_id')), 'restart participant has no principal')
+                return ws, response['result']
+
+            for index, token in enumerate(tokens):
+                ws, identity = login(token)
+                if continuity is None:
+                    continuity = {name: identity.get(name) for name in ['tui_id', 'tui_sig']}
+                    require(all(continuity.values()), 'restart has no signed continuity')
+                principals.append(identity['principal_id'])
+                sid = success(ws, 'session/new', {'agent_alias': 'default', 'keep_siblings': True})['session_id']
+                sessions.append(sid)
+                success(ws, 'session/append', {'session_id': sid, 'content': markers[index]})
+                history = success(ws, 'session/messages', {'session_id': sid})['messages']
+                require(any(row.get('content') == markers[index] for row in history), 'seeded transcript is empty')
+                transcripts.append(history)
+                success(ws, 'memory/store', {'key': key, 'content': markers[index]})
+                ws.close()
+            require(principals[0] != principals[1] and sessions[0] != sessions[1], 'restart owners or sessions collided')
+            before = self.daemon_identity()
+            self.start_daemon()
+            after = self.daemon_identity()
+            require(after != before and after['starts'] == before['starts'] + 1, 'daemon restart was not observed')
+            for index, token in enumerate(tokens):
+                ws, identity = login(token)
+                require(identity['principal_id'] == principals[index], 'restart changed canonical principal')
+                own, foreign = sessions[index], sessions[1 - index]
+                # Restore the owner through the supported session front door.
+                success(ws, 'session/new', {'agent_alias': 'default', 'session_id': own, 'keep_siblings': True})
+                require(success(ws, 'session/messages', {'session_id': own})['messages'] == transcripts[index],
+                        'restart did not restore the exact owner transcript')
+                require(success(ws, 'memory/get', {'key': key})['entry']['content'] == markers[index],
+                        'restart lost or crossed private memory')
+                require(all(row['session_id'] != foreign for row in success(ws, 'session/list')['sessions']),
+                        'restart listed foreign session')
+                for method, params in [
+                    ('session/messages', {'session_id': foreign}),
+                    ('session/append', {'session_id': foreign, 'content': 'forbidden restart overwrite'}),
+                    ('session/new', {'agent_alias': 'default', 'session_id': foreign, 'keep_siblings': True}),
+                    ('session/delete', {'session_id': foreign}),
+                ]:
+                    response = self.call(ws, method, params)
+                    require(response.get('error', {}).get('code') == -32012,
+                            method + ' foreign persisted session not forbidden')
+                ws.close()
+            # Re-read both owners after every attempted foreign mutation.
+            for index, token in enumerate(tokens):
+                ws, _ = login(token)
+                require(success(ws, 'session/messages', {'session_id': sessions[index]})['messages'] == transcripts[index],
+                        'denied mutation changed restored owner transcript')
+                require(success(ws, 'memory/get', {'key': key})['entry']['content'] == markers[index],
+                        'owner private memory changed after restart attacks')
+                success(ws, 'session/delete', {'session_id': sessions[index]})
+                success(ws, 'memory/delete', {'key': key})
+                ws.close()
+            return {'before_restart': before, 'after_restart': self.same_daemon(after),
+                    'owners': 2, 'nonempty_transcripts_restored': 2}
+        finally:
+            for ws in connections:
+                ws.close()
+            self.write_config()
+            self.start_daemon()
+
+    def provider_expiry(self):
+        before = self.daemon_identity()
+        token = self.enroll('expiry')
+        claims = json.loads(base64.urlsafe_b64decode(token.split('.')[1] + '==='))
+        remaining = claims['exp'] - time.time()
+        require(2 < remaining <= 15, 'provider did not issue the configured short-lived token')
+        ws, initialized = self.rpc(token, 'oidc.expiry')
+        try:
+            require('result' in initialized, 'fresh short-lived token was refused')
+            principal = initialized['result'].get('principal_id')
+            require(bool(principal) and 'result' in self.call(ws, 'session/list'), 'expiry positive control failed')
+            time.sleep(max(0, claims['exp'] - time.time()) + 2)
+            require(self.call(ws, 'session/list').get('error', {}).get('code') == -32010,
+                    'established connection retained authority after provider expiry')
+        finally:
+            ws.close()
+        stale, response = self.rpc(token, 'oidc.expiry')
+        try:
+            require('result' in response or response.get('error', {}).get('code') == -32010,
+                    'expired reconnect returned an unexpected result')
+            require(self.call(stale, 'session/list').get('error', {}).get('code') == -32010,
+                    'expired reconnect could read protected data')
+        finally:
+            stale.close()
+        fresh = self.enroll('expiry')
+        require(fresh != token, 'reenrollment reused the expired credential')
+        renewed, response = self.rpc(fresh, 'oidc.expiry')
+        try:
+            require(response.get('result', {}).get('principal_id') == principal,
+                    'reenrollment changed the canonical principal')
+            require('result' in self.call(renewed, 'session/list'), 'reenrollment did not restore permitted access')
+        finally:
+            renewed.close()
+        return {'continuous_daemon': self.same_daemon(before), 'provider_lifetime_seconds': claims['exp'] - claims['iat']}
 
     def run_cases(self, browser):
         tokens = {}
@@ -754,8 +899,7 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                 require(status == 200, 'device discovery failed')
                 status, response = http(discovery['device_authorization_endpoint'],
                                          {'client_id': entry['client'], 'scope': 'openid'}, form=True)
-                self.token_shapes['device-endpoint-probe'] = {'status': status, 'error': response.get('error'),
-                    'description': self.scrub(response.get('error_description', ''))}
+                self.token_shapes['device-endpoint-probe'] = {'status': status, 'has_error': 'error' in response}
             token = self.enroll(alias, browser if alias in ['human', 'device'] else None, device)
             tokens[name] = token
             parts = token.split('.')
@@ -769,6 +913,8 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
             self.record(name + '-cli-through-mtls-rpc', lambda n=name, a=alias, d=device: flow(n, a, d))
         if self.provider == 'keycloak':
             self.record('two-real-principals-isolation-and-live-revocation', lambda: self.principal_boundaries(browser))
+            self.record('populated-principal-storage-survives-daemon-restart', lambda: self.populated_storage_restart(browser))
+            self.record('provider-expiry-established-connection-and-reenrollment', self.provider_expiry)
         self.record('mtls-without-bearer-denied', lambda: self.denied())
         self.record('bad-bearer-denied', lambda: self.denied('invalid-token', 'oidc.service'))
         self.record('native-token-wrong-provider-no-fallback', lambda: self.denied(self.native, 'oidc.service'))
@@ -902,12 +1048,18 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         self.record('native-control-after-rollback', native_control)
         def local_recovery():
             local = LocalConnection(self.root / 'rpc.sock')
+            previous, response = self.rpc(self.native, 'native')
+            measured_daemon = self.daemon_identity()
             try:
+                require('result' in response and 'result' in self.call(previous, 'session/list'),
+                        'pre-rotation established native control failed')
                 require('result' in self.call(local, 'initialize'), 'trusted daemon UID refused')
                 rotated = command([str(self.binary), 'gateway', 'get-paircode', '--rotate', '--json'], env=self.env)
                 require(rotated.returncode == 0, 'supported local pairing rotation failed')
                 code = json.loads(rotated.stdout).get('pairing_code')
                 require(bool(code), 'local rotation returned no recovery code')
+                require(self.call(previous, 'session/list').get('error', {}).get('code') == -32010,
+                        'established native connection survived pairing revocation')
                 self.denied(self.native, 'native')
                 require('result' in self.call(local, 'config/set', {'prop': 'security.trust_daemon_uid', 'value': True}),
                         'trusted local UID lost config repair access')
@@ -916,7 +1068,9 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                 self.native = paired['token']
                 native_control()
                 self.denied()
+                return {'continuous_daemon': self.same_daemon(measured_daemon)}
             finally:
+                previous.close()
                 local.close()
         self.record('local-uid-recovery-after-remote-lockout', local_recovery)
         def config_rollback():
@@ -947,10 +1101,11 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         if self.compose.exists():
             result = self.docker('down', '--volumes', '--remove-orphans')
             self.results.append({'case': 'disposable-container-cleanup', 'status': 'passed' if result.returncode == 0 else 'failed'})
-        self.save()
+        self.save(complete=True)
 
 
 def main():
+    from playwright.sync_api import sync_playwright
     parser = argparse.ArgumentParser()
     parser.add_argument('provider', choices=['keycloak', 'authentik'])
     parser.add_argument('--binary', type=Path, required=True)
@@ -968,7 +1123,7 @@ def main():
                         browser.close()
         finally:
             fixture.close()
-    raise SystemExit(any(row['status'] == 'failed' for row in fixture.results))
+    raise SystemExit(not evaluate(args.provider, fixture.results, complete=True)['passed'])
 
 
 if __name__ == '__main__':
