@@ -17,7 +17,7 @@ jobs:
       matrix:
         include:
           - name: canonical-admission
-            source: 35e82e621dd52d77db203b9decf2552ae9ea301a
+            source: 677961e7d73f17c36a7d21742095ea0292d605d8
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_TERM_COLOR: never
@@ -82,6 +82,7 @@ jobs:
               'remote_resume_rechecks_channels_at_final_agent_install',
               'history_wait_releases_map_and_refuses_replaced_incarnation',
               'session_run_once_runs_one_turn_and_closes_its_session',
+              'append_rechecks_authority_after_admitted_lookup',
           ]
           lines=Path('adoption-evidence/rpc.log').read_text().splitlines()
           records=[]
@@ -90,12 +91,39 @@ jobs:
               assert len(hits)==1,(name,hits)
               records.append({'test':name,'pass_line':hits[0]})
           Path('adoption-evidence/selected.json').write_text(json.dumps(records,indent=2)+'\n')
-          print('Verified exactly one PASS for each of 14 selected RPC regressions.')
+          print('Verified exactly one PASS for each of 15 selected RPC regressions.')
           PY
       - name: Lint changed Rust owners
         run: |
           set -euo pipefail
           cargo clippy --locked -p zeroclaw-runtime -p zeroclaw-infra -p zeroclaw-config --all-targets -- -D warnings 2>&1 | tee adoption-evidence/clippy.log
+          git diff --exit-code
+      - name: Prove append regression detects removal of post-lookup checkpoint
+        run: |
+          set -euo pipefail
+          source=crates/zeroclaw-runtime/src/rpc/dispatch.rs
+          trap 'git restore -- "$source"' EXIT
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('crates/zeroclaw-runtime/src/rpc/dispatch.rs')
+          text=p.read_text()
+          start=text.index('    async fn handle_session_append(')
+          end=text.index('    async fn handle_session_rename(', start)
+          section=text[start:end]
+          checkpoint='        let grants = self.recheck_authority_after_admission(Method::SessionAppend)?;\n'
+          assert section.count(checkpoint)==2
+          at=section.rindex(checkpoint)
+          section=section[:at]+section[at+len(checkpoint):]
+          p.write_text(text[:start]+section+text[end:])
+          PY
+          set +e
+          timeout 480s cargo test --locked -p zeroclaw-runtime --lib rpc::dispatch::tests::append_rechecks_authority_after_admitted_lookup -- --exact 2>&1 | tee adoption-evidence/append-mutation.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -eq 101
+          grep -F 'test result: FAILED. 0 passed; 1 failed;' adoption-evidence/append-mutation.log
+          grep -F 'authority changed during lookup' adoption-evidence/append-mutation.log
+          git restore -- "$source"
           git diff --exit-code
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
