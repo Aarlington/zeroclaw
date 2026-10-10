@@ -8471,6 +8471,14 @@ impl RpcDispatcher {
                 self.scoped_principal_id_from(grants.as_ref()).as_deref(),
             )
             .await?;
+        #[cfg(test)]
+        self.ctx
+            .sessions
+            .wait_test_effect_pause("append-admitted")
+            .await;
+        // Revalidation can itself wait for the session map or durable store.
+        // Preserve the post-lookup authority checkpoint before either write.
+        let grants = self.recheck_authority_after_admission(Method::SessionAppend)?;
         self.require_ownership_under(grants.as_ref(), admitted.as_ref())?;
         let key = Self::rpc_chat_writer_key(sid, admitted)?;
         let message = zeroclaw_providers::ChatMessage::assistant(&req.content);
@@ -47038,6 +47046,56 @@ mod tests {
             change,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn append_rechecks_authority_after_admitted_lookup() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_backend::SessionBackend;
+
+        for (owner, revoke_update, allowed) in [
+            ("user:bob", false, false),
+            ("user:alice", false, true),
+            ("user:alice", true, false),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let sid = "s-append-post-lookup";
+            let (ctx, backend, key) = append_review_fixture(&tmp, sid, owner, true).await;
+            let before = serde_json::to_value(backend.load(&key)).unwrap();
+            let (arrived, release) = ctx.sessions.set_test_effect_pause("append-admitted");
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let request = zeroclaw_spawn::spawn!(async move {
+                alice
+                    .handle_session_append(&json!({"session_id": sid, "content": APPENDED}))
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), arrived.notified())
+                .await
+                .unwrap();
+            republish_session_scoped(&ctx, |profile| {
+                profile.admin = false;
+                if revoke_update {
+                    profile.grants.insert(Resource::Sessions, vec![Verb::Read]);
+                }
+            });
+            release.notify_one();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), request)
+                .await
+                .unwrap()
+                .unwrap();
+            if allowed {
+                result.expect("demotion retains permission to append to one's own session");
+                assert!(durable_holds(&backend, &key, APPENDED));
+                assert!(live_holds(&ctx, sid, APPENDED).await);
+            } else {
+                assert_eq!(
+                    result.expect_err("authority changed during lookup").code,
+                    FORBIDDEN
+                );
+                assert_eq!(serde_json::to_value(backend.load(&key)).unwrap(), before);
+                assert!(!live_holds(&ctx, sid, APPENDED).await, "no live write");
+            }
+        }
     }
 
     #[tokio::test]
