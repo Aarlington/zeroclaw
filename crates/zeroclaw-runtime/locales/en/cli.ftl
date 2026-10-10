@@ -1462,3 +1462,5 @@ rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop 
 sop-store-busy = SOP storage is busy or unavailable; retry the request.
 sop-store-nonblocking-unavailable = SOP storage cannot provide immediate access; this request was refused.
 sop-rpc-definition-unavailable = The procedure definition is no longer available.
+
+skill-http-request-timeout = HTTP request timed out
