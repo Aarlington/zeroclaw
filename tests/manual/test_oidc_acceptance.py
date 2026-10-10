@@ -1,5 +1,6 @@
 """Adversarial tests of evidence and failure paths, without provider dependencies."""
 import contextlib
+import base64
 import io
 import json
 from pathlib import Path
@@ -18,7 +19,7 @@ class ReceiptTests(unittest.TestCase):
         return [{'case': name, 'status': 'passed'} for name in expected_cases(provider)]
 
     def test_complete_provider_matrices_pass(self):
-        for provider, count in [('keycloak', 22), ('authentik', 18)]:
+        for provider, count in [('keycloak', 23), ('authentik', 19)]:
             with self.subTest(provider=provider):
                 result = evaluate(provider, self.receipts(provider), complete=True)
                 self.assertEqual(result['expected_count'], count)
@@ -112,6 +113,49 @@ class FixtureTests(unittest.TestCase):
         self.assertTrue(receipt['acceptance']['complete'])
         self.assertFalse(receipt['acceptance']['passed'])
         self.assertIn('disposable-container-cleanup', receipt['acceptance']['nonpassing'])
+
+    def expiry_fixture(self, calls, renewed_principal='subject-a'):
+        encoded = base64.urlsafe_b64encode(json.dumps({'iat': 100, 'exp': 112}).encode()).decode()
+        old, fresh = 'header.' + encoded + '.old', 'header.' + encoded + '.new'
+        self.fixture.enroll = Mock(side_effect=[old, fresh])
+        self.fixture.daemon_identity = Mock(return_value={'pid': 1, 'start_ticks': 2, 'starts': 1})
+        self.fixture.rpc = Mock(side_effect=[
+            (Mock(), {'result': {'principal_id': 'subject-a'}}),
+            (Mock(), {'error': {'code': -32010}}),
+            (Mock(), {'result': {'principal_id': renewed_principal}}),
+        ])
+        self.fixture.call = Mock(side_effect=calls)
+
+    def test_expiry_scenario_requires_denials_and_reenrollment_positive_control(self):
+        self.expiry_fixture([{'result': {}}, {'error': {'code': -32010}},
+                             {'error': {'code': -32010}}, {'result': {}}])
+        with patch('oidc_real_providers.time.time', return_value=100), patch('oidc_real_providers.time.sleep'):
+            self.assertEqual(self.fixture.provider_expiry()['provider_lifetime_seconds'], 12)
+
+    def test_expiry_scenario_catches_established_connection_still_authorized(self):
+        self.expiry_fixture([{'result': {}}, {'result': {}}])
+        with patch('oidc_real_providers.time.time', return_value=100), patch('oidc_real_providers.time.sleep'):
+            with self.assertRaisesRegex(CheckError, 'established connection retained authority'):
+                self.fixture.provider_expiry()
+
+    def test_expiry_scenario_catches_reconnect_still_authorized(self):
+        self.expiry_fixture([{'result': {}}, {'error': {'code': -32010}}, {'result': {}}])
+        with patch('oidc_real_providers.time.time', return_value=100), patch('oidc_real_providers.time.sleep'):
+            with self.assertRaisesRegex(CheckError, 'expired reconnect could read'):
+                self.fixture.provider_expiry()
+
+    def test_expiry_scenario_cannot_pass_when_all_access_is_denied(self):
+        self.expiry_fixture([{'error': {'code': -32010}}])
+        with patch('oidc_real_providers.time.time', return_value=100):
+            with self.assertRaisesRegex(CheckError, 'positive control failed'):
+                self.fixture.provider_expiry()
+
+    def test_reenrollment_must_keep_the_same_principal(self):
+        self.expiry_fixture([{'result': {}}, {'error': {'code': -32010}},
+                             {'error': {'code': -32010}}], renewed_principal='different-subject')
+        with patch('oidc_real_providers.time.time', return_value=100), patch('oidc_real_providers.time.sleep'):
+            with self.assertRaisesRegex(CheckError, 'reenrollment changed the canonical principal'):
+                self.fixture.provider_expiry()
 
 
 class CargoReceiptTests(unittest.TestCase):

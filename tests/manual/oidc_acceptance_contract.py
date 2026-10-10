@@ -20,6 +20,7 @@ COMMON_CASES = (
     'native-control-after-rollback',
     'local-uid-recovery-after-remote-lockout',
     'oidc-config-removal-and-restore-keeps-remote-closed',
+    'legacy-nevis-retirement-and-protected-config-restore',
     'disposable-container-cleanup',
 )
 KEYCLOAK_CASES = (

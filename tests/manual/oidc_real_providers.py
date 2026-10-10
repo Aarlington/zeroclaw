@@ -357,10 +357,11 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         self.config.write_text(text)
         self.config.chmod(0o600)
 
-    def start_daemon(self):
+    def start_daemon(self, persist_config=True):
         self.stop_daemon()
-        saved = command([str(self.binary), 'config', 'set', 'security.trust_daemon_uid', 'true', '--no-interactive', '--json'], env=self.env)
-        require(saved.returncode == 0, 'CLI config save failed')
+        if persist_config:
+            saved = command([str(self.binary), 'config', 'set', 'security.trust_daemon_uid', 'true', '--no-interactive', '--json'], env=self.env)
+            require(saved.returncode == 0, 'CLI config save failed')
         require((self.config.parent / '.secret_key').exists(), 'CLI config save did not provision signing key')
         self.daemon_log = open(self.root / 'daemon.log', 'w')
         self.daemon = subprocess.Popen([str(self.binary), 'daemon'], env=self.env,
@@ -770,6 +771,68 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
             if local:
                 local.close()
 
+    def legacy_config_restore(self):
+        entries = self.entries
+        backup = self.root / 'protected-legacy-config.toml'
+        try:
+            self.stop_daemon()
+            self.entries = []
+            self.write_config()
+            prepared = command([str(self.binary), 'config', 'set', 'security.trust_daemon_uid', 'true', '--no-interactive', '--json'], env=self.env)
+            require(prepared.returncode == 0, 'legacy fixture canonical config save failed')
+            # Nevis is retired and inert, not an automatically converted OIDC
+            # identity. Keep this synthetic secret only in the private fixture.
+            prefix = self.config.read_text().replace('backend = "sqlite"', 'backend = "sqlite" # preserve unrelated legacy comment')
+            require('# preserve unrelated legacy comment' in prefix, 'legacy comment sentinel was not seeded')
+            legacy = prefix + '\n[security.nevis]\nenabled = true\nclient_secret = ' + json.dumps(self.secret) + '\n'
+            self.config.write_text(legacy)
+            backup.write_bytes(self.config.read_bytes())
+            backup.chmod(0o600)
+            expected_backup = hashlib.sha256(backup.read_bytes()).digest()
+
+            def compatible_and_closed():
+                native, response = self.rpc(self.native, 'native')
+                try:
+                    require('result' in response and 'result' in self.call(native, 'session/list'),
+                            'legacy-config native WSS compatibility failed')
+                finally:
+                    native.close()
+                self.denied()
+                self.denied(self.secret)
+                self.denied(self.secret, 'nevis')
+                require(not tomllib.loads(self.config.read_text()).get('oidc'),
+                        'legacy Nevis silently became an OIDC provider')
+
+            self.start_daemon(persist_config=False)
+            compatible_and_closed()
+            before_save = self.daemon_identity()
+            local = LocalConnection(self.root / 'rpc.sock')
+            try:
+                require('result' in self.call(local, 'initialize'), 'legacy-config local recovery denied')
+                require('result' in self.call(local, 'config/set', {'prop': 'security.trust_daemon_uid', 'value': True}),
+                        'legacy-config incremental save failed')
+            finally:
+                local.close()
+            saved = self.config.read_text()
+            require('nevis' not in tomllib.loads(saved).get('security', {}), 'incremental save retained retired Nevis')
+            require(self.secret not in saved, 'retired Nevis credential survived incremental save')
+            require(saved.rstrip() == prefix.rstrip(), 'Nevis retirement changed unrelated configuration bytes')
+            compatible_and_closed()
+            self.same_daemon(before_save)
+            require(hashlib.sha256(backup.read_bytes()).digest() == expected_backup, 'protected backup changed')
+            self.stop_daemon()
+            self.config.write_bytes(backup.read_bytes())
+            require('nevis' in tomllib.loads(self.config.read_text())['security'], 'backup did not restore retired table')
+            self.start_daemon(persist_config=False)
+            compatible_and_closed()
+            require(self.config.read_bytes() == backup.read_bytes(), 'loading the protected restore changed its bytes')
+            return {'native_wss_before_and_after_restore': True, 'protected_copy_restored': True,
+                    'rollback_scope': 'configuration bytes on the same binary; not binary downgrade'}
+        finally:
+            self.entries = entries
+            self.write_config()
+            self.start_daemon()
+
     def populated_storage_restart(self, browser):
         """Seed through RPC, restart the real daemon, then attack both owners' data."""
         self.write_config(participants=True)
@@ -1095,6 +1158,7 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
             if service:
                 self.accepted(service, 'service')
         self.record('oidc-config-removal-and-restore-keeps-remote-closed', config_rollback)
+        self.record('legacy-nevis-retirement-and-protected-config-restore', self.legacy_config_restore)
 
     def close(self):
         self.stop_daemon()
