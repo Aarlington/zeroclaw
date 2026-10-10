@@ -8458,15 +8458,19 @@ impl RpcDispatcher {
             .acquire(sid)
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
-        let admitted = self
-            .revalidate_admitted_session(sid, authorized.as_ref())
-            .await?;
         // The queue wait can be as long as the turn ahead of it. Re-resolve
         // the caller's authority against the policy in force now: a revoked
         // grant or credential refuses the append before either write, and a
         // principal that lost administrator scope while it waited is held to
         // ownership again.
         let grants = self.recheck_authority_after_admission(Method::SessionAppend)?;
+        let admitted = self
+            .revalidate_admitted_session(
+                sid,
+                authorized.as_ref(),
+                self.scoped_principal_id_from(grants.as_ref()).as_deref(),
+            )
+            .await?;
         self.require_ownership_under(grants.as_ref(), admitted.as_ref())?;
         let key = Self::rpc_chat_writer_key(sid, admitted)?;
         let message = zeroclaw_providers::ChatMessage::assistant(&req.content);
