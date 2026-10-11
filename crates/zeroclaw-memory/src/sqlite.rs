@@ -1168,7 +1168,7 @@ impl SqliteMemory {
             };
 
             // Merge results based on search mode
-            let merged = if cosine_only {
+            let merged = if cosine_only || keyword_results.is_empty() {
                 // Only raw vector evidence can authorize supersession. In
                 // particular, an empty vector result must not fall back to FTS.
                 vector_results
@@ -1194,16 +1194,6 @@ impl SqliteMemory {
                         vector_score: None,
                         keyword_score: Some(score),
                         final_score: score,
-                    })
-                    .collect::<Vec<_>>()
-            } else if keyword_results.is_empty() {
-                vector_results
-                    .iter()
-                    .map(|(id, score)| vector::ScoredResult {
-                        id: id.clone(),
-                        vector_score: Some(*score),
-                        keyword_score: None,
-                        final_score: *score,
                     })
                     .collect::<Vec<_>>()
             } else {

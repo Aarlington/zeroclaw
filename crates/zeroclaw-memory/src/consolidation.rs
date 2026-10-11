@@ -1669,7 +1669,11 @@ mod consolidate_turn_tests {
                     store_core_fact(&memory, "existing", old).await;
                     let prior = memory.recall(update, 10, None, None, None).await.unwrap();
                     assert_eq!(prior.len(), 1);
-                    assert_eq!(prior[0].score, Some(1.0), "search still ranks keyword matches");
+                    assert_eq!(
+                        prior[0].score,
+                        Some(1.0),
+                        "search still ranks keyword matches"
+                    );
                     let reply = serde_json::json!({
                         "history_entry": history,
                         "memory_update": if typed { None } else { Some(update) },
@@ -1688,7 +1692,10 @@ mod consolidate_turn_tests {
                         superseded_by(&conn, "existing").is_none(),
                         "{old} / {update} / {history} / typed={typed}"
                     );
-                    let core = memory.list(Some(&MemoryCategory::Core), None).await.unwrap();
+                    let core = memory
+                        .list(Some(&MemoryCategory::Core), None)
+                        .await
+                        .unwrap();
                     assert_eq!(core.len(), 2);
                     assert!(core.iter().any(|entry| entry.key == "existing"));
                     assert!(core.iter().any(|entry| entry.content == update));
