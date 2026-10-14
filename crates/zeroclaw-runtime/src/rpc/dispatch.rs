@@ -23634,6 +23634,296 @@ mod tests {
         dispatcher
     }
 
+    async fn seed_remote_chat_restore(ctx: &Arc<RpcContext>, uid: u32, sid: &str) -> Value {
+        let owner = scoped_dispatcher(ctx, uid).await;
+        owner
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent", "session_id": sid, "keep_siblings": true,
+            }))
+            .await
+            .unwrap();
+        owner
+            .handle_session_append(
+                &json!({"session_id": sid, "content": format!("private history for {sid}")}),
+            )
+            .await
+            .unwrap();
+        owner
+            .handle_session_messages_for_test(&json!({"session_id": sid}))
+            .await
+            .unwrap()
+    }
+
+    async fn remote_chat_restore_peer(ctx: &Arc<RpcContext>, uid: u32) -> RpcDispatcher {
+        let mut peer = scoped_dispatcher(ctx, uid).await;
+        peer.access_policy = RpcAccessPolicy::RemoteSessionOwner;
+        peer.set_tui_id_for_test(Some("restore-tui".into()));
+        peer
+    }
+
+    fn revoke_remote_chat_restore(ctx: &Arc<RpcContext>) {
+        let mut config = ctx.config_authority.snapshot_config();
+        config
+            .permission_profiles
+            .get_mut("member")
+            .unwrap()
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Sessions,
+                vec![zeroclaw_api::grants::Verb::Read],
+            );
+        ctx.auth.refresh_from_config(&config).unwrap();
+        ctx.config_authority.publish_for_test(config);
+    }
+
+    #[tokio::test]
+    async fn remote_chat_restore_reopens_owned_nonempty_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (alice_history, bob_history) = {
+            let (fixture, _, _, _) = make_persistence_test_dispatcher(config.clone(), &data_dir);
+            let alice = seed_remote_chat_restore(&fixture.ctx, 4242, "restore-alice").await;
+            let bob = seed_remote_chat_restore(&fixture.ctx, 4343, "restore-bob").await;
+            (alice, bob)
+        };
+        // A new context and empty live store, backed by the existing SQLite file.
+        let (fixture, sessions, backend, _) = make_persistence_test_dispatcher(config, &data_dir);
+        assert!(sessions.list_ids().await.is_empty());
+        let alice = remote_chat_restore_peer(&fixture.ctx, 4242).await;
+        let bob = remote_chat_restore_peer(&fixture.ctx, 4343).await;
+        for (peer, own, foreign, expected) in [
+            (&alice, "restore-alice", "restore-bob", alice_history),
+            (&bob, "restore-bob", "restore-alice", bob_history),
+        ] {
+            let denied = peer
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent", "session_id": foreign, "keep_siblings": true,
+                }))
+                .await
+                .expect_err("foreign recovery must be refused");
+            assert_eq!(denied.code, FORBIDDEN);
+            peer.handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent", "session_id": own, "keep_siblings": true,
+            }))
+            .await
+            .expect("durable owner restores their Chat session");
+            let actual = peer
+                .handle_session_messages_for_test(&json!({"session_id": own}))
+                .await
+                .unwrap();
+            assert_eq!(actual["messages"], expected["messages"]);
+            assert!(!actual["messages"].as_array().unwrap().is_empty());
+            assert_eq!(
+                sessions.session_owner_tui_id(own).await,
+                Some(Some("restore-tui".into()))
+            );
+            assert_eq!(
+                backend
+                    .get_session_metadata(&format!("rpc_{own}"))
+                    .unwrap()
+                    .principal_id,
+                peer.owner_principal_id()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_chat_restore_refuses_unproven_or_ambiguous_ownership() {
+        for target in [
+            "missing",
+            "unowned",
+            "foreign",
+            "wrong-agent",
+            "ambiguous",
+            "acp",
+            "native",
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = two_user_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (fixture, sessions, backend, _) =
+                make_persistence_test_dispatcher(config, &data_dir);
+            let sid = "restore-denied";
+            let key = format!("rpc_{sid}");
+            if target != "missing" {
+                if target == "unowned" {
+                    fixture
+                        .handle_session_new_for_test(
+                            &json!({"agent_alias":"test-agent", "session_id":sid}),
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    seed_remote_chat_restore(
+                        &fixture.ctx,
+                        if target == "foreign" { 4343 } else { 4242 },
+                        sid,
+                    )
+                    .await;
+                }
+                assert!(sessions.remove(sid).await);
+            }
+            if target == "wrong-agent" {
+                backend
+                    .set_session_agent_alias(&key, "another-agent")
+                    .unwrap();
+            }
+            if target == "ambiguous" {
+                backend
+                    .append(
+                        sid,
+                        &zeroclaw_api::model_provider::ChatMessage::user("foreign alternate key"),
+                    )
+                    .unwrap();
+                backend.set_session_principal(sid, "user:bob").unwrap();
+            }
+            let before = backend.try_load(&key).unwrap();
+            let mut remote = remote_chat_restore_peer(&fixture.ctx, 4242).await;
+            if target == "native" {
+                remote.auth = None;
+            }
+            let error = remote
+                .handle_session_new_for_test(&json!({
+                    "agent_alias":"test-agent", "session_id":sid,
+                    "chat_mode": if target == "acp" {"acp"} else {"chat"},
+                }))
+                .await
+                .expect_err(target);
+            assert!(
+                matches!(error.code, SESSION_NOT_OWNED | FORBIDDEN),
+                "{target}: {error:?}"
+            );
+            assert!(sessions.get_generation(sid).await.is_none(), "{target}");
+            assert_eq!(
+                serde_json::to_value(backend.try_load(&key).unwrap()).unwrap(),
+                serde_json::to_value(before).unwrap(),
+                "{target}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_chat_restore_cannot_take_another_live_tui_binding() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, _, _) = make_persistence_test_dispatcher(config, &data_dir);
+        seed_remote_chat_restore(&fixture.ctx, 4242, "live-owner").await;
+        sessions
+            .resume_existing(
+                "live-owner",
+                "test-agent",
+                &ChatMode::Chat,
+                Some("other-tui".into()),
+                Some("user:alice"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let generation = sessions.get_generation("live-owner").await;
+        let mut remote = remote_chat_restore_peer(&fixture.ctx, 4242).await;
+        let params = json!({"agent_alias":"test-agent", "session_id":"live-owner"});
+        assert_eq!(
+            remote
+                .handle_session_new_for_test(&params)
+                .await
+                .unwrap_err()
+                .code,
+            SESSION_NOT_OWNED
+        );
+        assert_eq!(sessions.get_generation("live-owner").await, generation);
+        assert_eq!(
+            sessions.session_owner_tui_id("live-owner").await,
+            Some(Some("other-tui".into()))
+        );
+        remote.set_tui_id_for_test(Some("other-tui".into()));
+        remote
+            .handle_session_new_for_test(&params)
+            .await
+            .expect("unchanged live owner still reconnects");
+        assert_eq!(sessions.get_generation("live-owner").await, generation);
+    }
+
+    #[tokio::test]
+    async fn remote_chat_restore_rechecks_admission_and_publication() {
+        for boundary in ["admission", "publication", "restore-publish"] {
+            for change in ["unchanged", "revoke", "owner", "delete"] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let config = two_user_config(&tmp);
+                let data_dir = config.data_dir.clone();
+                let (fixture, sessions, backend, _) =
+                    make_persistence_test_dispatcher(config, &data_dir);
+                let sid = "restore-race";
+                let key = format!("rpc_{sid}");
+                seed_remote_chat_restore(&fixture.ctx, 4242, sid).await;
+                sessions.remove(sid).await;
+                let remote = remote_chat_restore_peer(&fixture.ctx, 4242).await;
+                let (entered, release) = if boundary == "restore-publish" {
+                    sessions.set_test_effect_pause("restore-publish")
+                } else {
+                    (
+                        Arc::new(tokio::sync::Notify::new()),
+                        Arc::new(tokio::sync::Notify::new()),
+                    )
+                };
+                let admission = if boundary == "admission" {
+                    Some(sessions.session_queue.acquire(sid).await.unwrap())
+                } else if boundary == "publication" {
+                    *sessions.test_construction_publication_pause.lock().unwrap() =
+                        Some((entered.clone(), release.clone()));
+                    None
+                } else {
+                    None
+                };
+                let request = zeroclaw_spawn::spawn!(async move {
+                    remote
+                        .handle_session_new_for_test(
+                            &json!({"agent_alias":"test-agent", "session_id":sid}),
+                        )
+                        .await
+                });
+                if boundary == "admission" {
+                    wait_for_session_admission_waiter(&fixture.ctx, sid).await;
+                } else {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+                        .await
+                        .unwrap();
+                }
+                match change {
+                    "revoke" => revoke_remote_chat_restore(&fixture.ctx),
+                    "owner" => backend.set_session_principal(&key, "user:bob").unwrap(),
+                    "delete" => {
+                        backend.delete_session(&key).unwrap();
+                    }
+                    _ => {}
+                }
+                let before = backend.try_load(&key).unwrap();
+                drop(admission);
+                release.notify_one();
+                let result = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    result.is_ok(),
+                    change == "unchanged",
+                    "{boundary}/{change}: {result:?}"
+                );
+                assert_eq!(
+                    sessions.get_generation(sid).await.is_some(),
+                    change == "unchanged",
+                    "{boundary}/{change}"
+                );
+                assert_eq!(
+                    serde_json::to_value(backend.try_load(&key).unwrap()).unwrap(),
+                    serde_json::to_value(before).unwrap(),
+                    "{boundary}/{change}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn scoped_principals_sessions_are_isolated() {
         let tmp = tempfile::TempDir::new().unwrap();
