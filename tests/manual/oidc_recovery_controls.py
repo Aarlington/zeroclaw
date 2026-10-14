@@ -12,9 +12,9 @@ SOURCE = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(
 original = {name: Path(name).read_bytes() for name in FILES}
 
 
-def rejected(label, test):
-    name = 'rpc::dispatch::tests::' + test
-    result = subprocess.run(['cargo', 'test', '--locked', '-p', 'zeroclaw-runtime', '--lib', name, '--', '--exact'], capture_output=True, text=True)
+def rejected(label, test, package='zeroclaw-runtime', prefix='rpc::dispatch::tests::'):
+    name = prefix + test
+    result = subprocess.run(['cargo', 'test', '--locked', '-p', package, '--lib', name, '--', '--exact'], capture_output=True, text=True)
     output = result.stdout + result.stderr
     (ROOT / (label + '.log')).write_text(output)
     summaries = re.findall(r'^test result:.*$', output, re.M)
@@ -25,6 +25,10 @@ def rejected(label, test):
         and len(summaries) == 1
         and summaries[0].startswith('test result: FAILED. 0 passed; 1 failed; 0 ignored;')
     )
+    if label == 'recovery-old-code':
+        # A different refusal code on the foreign negative control is not
+        # evidence that owner recovery fails. Require the owner-positive error.
+        verified = verified and 'durable owner restores their Chat session' in output and 'code: -32003' in output
     record = {'source': SOURCE, 'test': name, 'exit': result.returncode, 'expected_failure_verified': verified}
     (ROOT / (label + '.json')).write_text(json.dumps(record, indent=2))
     print(json.dumps({'control': label, **record}), flush=True)
@@ -42,6 +46,15 @@ try:
             before = b'Some("other-tui".into()),\n                Some("user:alice"),'
             assert baseline.count(before) == 1
             baseline = baseline.replace(before, b'Some("other-tui".into()),\n                None,')
+            # Accept either opaque refusal code before reaching the owner
+            # positive control; the old production behavior is unchanged.
+            a = baseline.index(b'    async fn remote_chat_restore_reopens_owned_nonempty_history(')
+            b = baseline.index(b'    async fn remote_chat_restore_refuses_unproven_or_ambiguous_ownership(', a)
+            test = baseline[a:b]
+            before = b'assert_eq!(denied.code, FORBIDDEN);'
+            assert test.count(before) == 1
+            test = test.replace(before, b'assert!(matches!(denied.code, FORBIDDEN | SESSION_NOT_OWNED));')
+            baseline = baseline[:a] + test + baseline[b:]
         Path(name).write_bytes(baseline)
     rejected('recovery-old-code', 'remote_chat_restore_reopens_owned_nonempty_history')
 finally:
@@ -88,3 +101,22 @@ finally:
 
 assert all(Path(name).read_bytes() == contents for name, contents in original.items())
 print('Recovery controls restored the exact source bytes.', flush=True)
+
+sqlite = Path('crates/zeroclaw-infra/src/session_sqlite.rs')
+original_sqlite = sqlite.read_bytes()
+try:
+    source = original_sqlite.decode()
+    start = source.index('    fn with_session_owner(')
+    end = source.index('    fn delete_session_authorized(', start)
+    method = source[start:end]
+    a = method.index('        let mut conn = self.conn.lock();')
+    b = method.index('        let owner: Option<String> = tx', a)
+    method = method[:a] + '        let conn = self.conn.lock();\n' + method[b:].replace('let owner: Option<String> = tx', 'let owner: Option<String> = conn', 1)
+    sqlite.write_text(source[:start] + method + source[end:])
+    rejected('recovery-mutant-connection-local-owner',
+             'with_session_owner_blocks_other_connections_until_effect_finishes',
+             package='zeroclaw-infra', prefix='session_sqlite::tests::')
+finally:
+    sqlite.write_bytes(original_sqlite)
+assert sqlite.read_bytes() == original_sqlite
+print('SQLite owner boundary control restored the exact source bytes.', flush=True)

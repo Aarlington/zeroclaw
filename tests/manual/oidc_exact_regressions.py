@@ -6,6 +6,7 @@ import subprocess
 from oidc_acceptance_contract import exact_cargo_pass
 
 TESTS = [
+    'session_sqlite::tests::with_session_owner_blocks_other_connections_until_effect_finishes',
     'rpc::session::tests::session_mode_replacement_rejects_owner_change_without_generation_change',
     'rpc::session::tests::session_mode_replacement_publication_is_capacity_neutral_and_fenced',
     'rpc::dispatch::tests::remote_chat_restore_trim_rechecks_owner_and_authority_before_writing',
@@ -31,7 +32,8 @@ evidence = Path('regression-evidence')
 evidence.mkdir(exist_ok=True)
 source = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
 for index, name in enumerate(TESTS):
-    result = subprocess.run(['cargo', 'test', '--locked', '-p', 'zeroclaw-runtime', '--lib', name, '--', '--exact'],
+    package = 'zeroclaw-infra' if name.startswith('session_sqlite::') else 'zeroclaw-runtime'
+    result = subprocess.run(['cargo', 'test', '--locked', '-p', package, '--lib', name, '--', '--exact'],
                             capture_output=True, text=True)
     output = result.stdout + result.stderr
     (evidence / f'current-{index}.log').write_text(output)

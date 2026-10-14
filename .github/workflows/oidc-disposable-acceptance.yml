@@ -39,13 +39,13 @@ jobs:
           shared-key: oidc-disposable-acceptance
       - name: Install linker
         run: bash scripts/ci/apt_install.sh mold
-      - name: Verify current regressions and build shipped CLI
+      - name: Verify production source, formatting and harness
         shell: bash
         run: |
           mkdir -p web/dist
           touch web/dist/.gitkeep
           # Acceptance-only files must be the entire delta from the reviewed PR.
-          git diff --exit-code 60bd0a042336df8a33e5e072f5b9886c0075c713 -- . \
+          git diff --exit-code 85af504800c9062b18bf6c34e1d4cb33562c025d -- . \
             ':(exclude).github/workflows/oidc-disposable-acceptance.yml' \
             ':(exclude)tests/manual/oidc_baseline_regressions.py' \
             ':(exclude)tests/manual/oidc_enrollment_baseline.py' \
@@ -56,14 +56,20 @@ jobs:
             ':(exclude)tests/manual/oidc_recovery_controls.py'
           cargo fmt --all -- --check
           python3 -m unittest discover -s tests/manual -p test_oidc_acceptance.py -v
-          python3 tests/manual/oidc_exact_regressions.py
-          python3 tests/manual/oidc_recovery_controls.py
-          cargo clippy --locked -p zeroclaw-runtime -p zeroclaw-infra --lib --tests -- -D warnings
+      - name: Run exact Rust regressions
+        run: python3 tests/manual/oidc_exact_regressions.py
+      - name: Verify old-code and guard mutation controls
+        run: python3 tests/manual/oidc_recovery_controls.py
+      - name: Lint changed crates
+        run: cargo clippy --locked -p zeroclaw-runtime -p zeroclaw-infra --lib --tests -- -D warnings
+      - name: Build shipped CLI
+        shell: bash
+        run: |
           cargo build --locked -p zeroclaw --bin zeroclaw
           mkdir -p acceptance-build
           cp target/debug/zeroclaw acceptance-build/zeroclaw
           git rev-parse HEAD > acceptance-build/source-sha.txt
-          echo 60bd0a042336df8a33e5e072f5b9886c0075c713 > acceptance-build/production-source-sha.txt
+          echo 85af504800c9062b18bf6c34e1d4cb33562c025d > acceptance-build/production-source-sha.txt
           sha256sum acceptance-build/zeroclaw > acceptance-build/binary-sha256.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
