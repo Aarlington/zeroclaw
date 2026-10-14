@@ -17083,7 +17083,8 @@ mod tests {
         let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
             config.sop.clone(),
         )));
-        let (mut fixture, _) = make_acp_test_dispatcher(config);
+        let data_dir = config.data_dir.clone();
+        let (mut fixture, _, _, _) = make_persistence_test_dispatcher(config, &data_dir);
         let ctx = Arc::get_mut(&mut fixture.ctx).expect("fixture context is not yet shared");
         ctx.sop_engine = Some(Arc::clone(&engine));
         ctx.sop_audit = Some(Arc::new(crate::sop::SopAuditLogger::new(Arc::new(
