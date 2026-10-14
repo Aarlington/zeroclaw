@@ -4,7 +4,7 @@ from pathlib import Path
 import re
 import subprocess
 
-PRODUCTION = 'd8bbd14ffea9e1c48fc4621a9df9ba1321a1ec1f'
+PRODUCTION = '754cbb2a859efff35371300899e019c789703cc6'
 BASELINE = 'c2ad7a8e62d22accbe13387927b8f6869ed46baa'
 WORKSHOP = Path('crates/zeroclaw-runtime/src/tools/sop_workshop.rs')
 ALIAS = Path('crates/zeroclaw-runtime/src/tools/skill_tool.rs')

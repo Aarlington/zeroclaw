@@ -42,7 +42,7 @@ jobs:
         run: |
           mkdir -p web/dist
           touch web/dist/.gitkeep
-          git diff --exit-code d8bbd14ffea9e1c48fc4621a9df9ba1321a1ec1f -- . \
+          git diff --exit-code 754cbb2a859efff35371300899e019c789703cc6 -- . \
             ':(exclude).github/workflows/oidc-workshop-validation.yml' \
             ':(exclude)tests/manual/oidc_workshop_regressions.py'
           cargo fmt --all -- --check
