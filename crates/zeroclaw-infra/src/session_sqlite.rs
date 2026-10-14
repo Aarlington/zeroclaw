@@ -1027,6 +1027,38 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(true)
     }
 
+    fn replace_conversation_state_authorized(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        breadcrumb_present: bool,
+        expected_owner: &str,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?
+            .flatten();
+        let _authority = authorize(owner.as_deref())?;
+        if owner.as_deref() != Some(expected_owner) {
+            return Ok(false);
+        }
+        Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
+        Self::set_session_trim_breadcrumb_on(&tx, session_key, breadcrumb_present)
+            .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(true)
+    }
+
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
         let conn = self.conn.lock();
 
