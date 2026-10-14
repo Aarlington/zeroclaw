@@ -548,6 +548,13 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         # safely recognized by a JWT-shaped redactor.
         return 'RPC code ' + (str(code) if type(code) is int else 'absent')
 
+    def session_denial(self, response, expected_code):
+        require(expected_code in (-32003, -32012), 'invalid session denial expectation')
+        code = response.get('error', {}).get('code')
+        require('result' not in response and type(code) is int and code == expected_code,
+                'foreign persisted session did not receive the expected refusal: ' + self.error_detail(response))
+        return code
+
     def principal_boundaries(self, browser):
         try:
             return self.check_principal_boundaries(browser)
@@ -841,7 +848,7 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
         try:
             tokens = [self.enroll('human', browser, username=user)
                       for user in ['acceptance-user', 'acceptance-peer']]
-            principals, sessions, transcripts = [], [], []
+            principals, sessions, transcripts, denials = [], [], [], []
             continuity = None
             key = 'restart-private-' + secrets.token_hex(8)
             markers = ['restart alpha sentinel', 'restart beta sentinel']
@@ -897,8 +904,15 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                     ('session/delete', {'session_id': foreign}),
                 ]:
                     response = self.call(ws, method, params)
-                    require(response.get('error', {}).get('code') == -32012,
-                            method + ' foreign persisted session not forbidden')
+                    # On the first iteration the foreign session has not been
+                    # restored. The unchanged remote transport gate rejects
+                    # messages/append/delete before durable-owner dispatch.
+                    # session/new reaches the durable owner gate; after both
+                    # owners restore, all four methods reach that owner gate.
+                    expected_code = -32003 if index == 0 and method != 'session/new' else -32012
+                    code = self.session_denial(response, expected_code)
+                    denials.append({'method': method, 'foreign_live': index == 1,
+                                    'code': code, 'has_result': 'result' in response})
                 ws.close()
             # Re-read both owners after every attempted foreign mutation.
             for index, token in enumerate(tokens):
@@ -911,7 +925,8 @@ paired_tokens = [''' + q(hashlib.sha256(self.native.encode()).hexdigest()) + '''
                 success(ws, 'memory/delete', {'key': key})
                 ws.close()
             return {'before_restart': before, 'after_restart': self.same_daemon(after),
-                    'owners': 2, 'nonempty_transcripts_restored': 2}
+                    'owners': 2, 'nonempty_transcripts_restored': 2,
+                    'foreign_session_denials': denials}
         finally:
             for ws in connections:
                 ws.close()

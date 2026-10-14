@@ -64,6 +64,26 @@ class FixtureTests(unittest.TestCase):
         (root / 'production-source-sha.txt').write_text('b' * 40)
         self.fixture = Fixture('keycloak', self.binary, root, root / 'evidence')
 
+    def test_session_denial_requires_the_exact_expected_refusal(self):
+        for code in [-32003, -32012]:
+            with self.subTest(code=code):
+                self.assertEqual(self.fixture.session_denial({'error': {'code': code}}, code), code)
+
+    def test_session_denial_rejects_success_wrong_code_and_malformed_frames(self):
+        for expected in [-32003, -32012]:
+            for response in [
+                {'result': {}},
+                {'result': None, 'error': {'code': expected}},
+                {'error': {'code': -32010}},
+                {'error': {'code': -32012 if expected == -32003 else -32003}},
+                {'error': {'code': str(expected)}},
+                {'error': {}},
+                {},
+            ]:
+                with self.subTest(expected=expected, response=response):
+                    with self.assertRaises(CheckError):
+                        self.fixture.session_denial(response, expected)
+
     def test_restart_is_detected_even_when_pid_is_reused(self):
         old = {'pid': 10, 'start_ticks': 20, 'starts': 1}
         for changed in [{'pid': 10, 'start_ticks': 21, 'starts': 1},
