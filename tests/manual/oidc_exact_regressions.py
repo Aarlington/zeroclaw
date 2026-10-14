@@ -6,6 +6,7 @@ import subprocess
 from oidc_acceptance_contract import exact_cargo_pass
 
 TESTS = [
+    'rpc::dispatch::tests::remote_chat_restore_administrator_still_needs_durable_ownership',
     'rpc::dispatch::tests::remote_chat_restore_reopens_owned_nonempty_history',
     'rpc::dispatch::tests::remote_chat_restore_refuses_unproven_or_ambiguous_ownership',
     'rpc::dispatch::tests::remote_chat_restore_cannot_take_another_live_tui_binding',

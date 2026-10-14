@@ -31,6 +31,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.98.0
+          components: rustfmt, clippy
       - uses: ./.github/actions/rust-cache
         with:
           use-blacksmith: 'false'
@@ -44,7 +45,7 @@ jobs:
           mkdir -p web/dist
           touch web/dist/.gitkeep
           # Acceptance-only files must be the entire delta from the reviewed PR.
-          git diff --exit-code 646d069307ef1e8ff0aae27193c3ffadfbe7062c -- . \
+          git diff --exit-code f4dd87bbbb9c07906365e2294f40e3742cd8f216 -- . \
             ':(exclude).github/workflows/oidc-disposable-acceptance.yml' \
             ':(exclude)tests/manual/oidc_baseline_regressions.py' \
             ':(exclude)tests/manual/oidc_enrollment_baseline.py' \
@@ -62,7 +63,7 @@ jobs:
           mkdir -p acceptance-build
           cp target/debug/zeroclaw acceptance-build/zeroclaw
           git rev-parse HEAD > acceptance-build/source-sha.txt
-          echo 646d069307ef1e8ff0aae27193c3ffadfbe7062c > acceptance-build/production-source-sha.txt
+          echo f4dd87bbbb9c07906365e2294f40e3742cd8f216 > acceptance-build/production-source-sha.txt
           sha256sum acceptance-build/zeroclaw > acceptance-build/binary-sha256.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
