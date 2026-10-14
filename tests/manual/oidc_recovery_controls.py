@@ -35,7 +35,14 @@ def rejected(label, test):
 
 try:
     for name in FILES:
-        Path(name).write_bytes(subprocess.check_output(['git', 'show', BASELINE + ':' + name]))
+        baseline = subprocess.check_output(['git', 'show', BASELINE + ':' + name])
+        if name == FILES[0]:
+            # Correct the test-only fixture's obsolete access-fence argument;
+            # production code remains exactly the old implementation.
+            before = b'Some("other-tui".into()),\n                Some("user:alice"),'
+            assert baseline.count(before) == 1
+            baseline = baseline.replace(before, b'Some("other-tui".into()),\n                None,')
+        Path(name).write_bytes(baseline)
     rejected('recovery-old-code', 'remote_chat_restore_reopens_owned_nonempty_history')
 finally:
     for name, contents in original.items():
@@ -60,6 +67,24 @@ for mutation in ['durable-owner', 'current-authority']:
     finally:
         for name, contents in original.items():
             Path(name).write_bytes(contents)
+
+assert all(Path(name).read_bytes() == contents for name, contents in original.items())
+
+try:
+    source = original[FILES[0]].decode()
+    start = source.index('let replaced = backend.replace_conversation_state_authorized(')
+    end = source.index('if !replaced {', start)
+    # Restore the old unguarded write, keeping the deterministic pause so the
+    # revoked caller reaches the durable effect before final publication denial.
+    source = source[:start] + '''let replaced = backend.replace_conversation_state_if_exists(
+        &session_key, &durable, agent.history_has_trim_breadcrumb(),
+    ).unwrap();
+    ''' + source[end:]
+    Path(FILES[0]).write_text(source)
+    rejected('recovery-mutant-unguarded-trim', 'remote_chat_restore_trim_rechecks_owner_and_authority_before_writing')
+finally:
+    for name, contents in original.items():
+        Path(name).write_bytes(contents)
 
 assert all(Path(name).read_bytes() == contents for name, contents in original.items())
 print('Recovery controls restored the exact source bytes.', flush=True)

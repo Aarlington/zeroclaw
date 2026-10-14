@@ -45,7 +45,7 @@ jobs:
           mkdir -p web/dist
           touch web/dist/.gitkeep
           # Acceptance-only files must be the entire delta from the reviewed PR.
-          git diff --exit-code f4dd87bbbb9c07906365e2294f40e3742cd8f216 -- . \
+          git diff --exit-code 60bd0a042336df8a33e5e072f5b9886c0075c713 -- . \
             ':(exclude).github/workflows/oidc-disposable-acceptance.yml' \
             ':(exclude)tests/manual/oidc_baseline_regressions.py' \
             ':(exclude)tests/manual/oidc_enrollment_baseline.py' \
@@ -58,12 +58,12 @@ jobs:
           python3 -m unittest discover -s tests/manual -p test_oidc_acceptance.py -v
           python3 tests/manual/oidc_exact_regressions.py
           python3 tests/manual/oidc_recovery_controls.py
-          cargo clippy --locked -p zeroclaw-runtime --lib --tests -- -D warnings
+          cargo clippy --locked -p zeroclaw-runtime -p zeroclaw-infra --lib --tests -- -D warnings
           cargo build --locked -p zeroclaw --bin zeroclaw
           mkdir -p acceptance-build
           cp target/debug/zeroclaw acceptance-build/zeroclaw
           git rev-parse HEAD > acceptance-build/source-sha.txt
-          echo f4dd87bbbb9c07906365e2294f40e3742cd8f216 > acceptance-build/production-source-sha.txt
+          echo 60bd0a042336df8a33e5e072f5b9886c0075c713 > acceptance-build/production-source-sha.txt
           sha256sum acceptance-build/zeroclaw > acceptance-build/binary-sha256.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
