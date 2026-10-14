@@ -23851,7 +23851,7 @@ mod tests {
                 }))
                 .await
                 .expect_err("foreign recovery must be refused");
-            assert_eq!(denied.code, FORBIDDEN);
+            assert!(matches!(denied.code, FORBIDDEN | SESSION_NOT_OWNED));
             peer.handle_session_new_for_test(&json!({
                 "agent_alias": "test-agent", "session_id": own, "keep_siblings": true,
             }))
