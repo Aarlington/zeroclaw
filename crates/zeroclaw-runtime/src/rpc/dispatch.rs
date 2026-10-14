@@ -5623,7 +5623,28 @@ impl RpcDispatcher {
                                         let durable = zeroclaw_providers::durable_chat_messages(
                                             agent.history(),
                                         );
-                                        if !replace_rpc_chat_conversation_state(
+                                        if remote_chat_restore {
+                                            self.ctx.sessions.wait_test_effect_pause("restore-trim").await;
+                                            let candidate = unpublished.as_ref().expect("remote restore remains unpublished");
+                                            let owner = candidate.owner_principal_id.as_deref().ok_or_else(|| rpc_err(SESSION_NOT_OWNED, "Caller does not own this session"))?;
+                                            let replaced = backend.replace_conversation_state_authorized(
+                                                &session_key,
+                                                &durable,
+                                                agent.history_has_trim_breadcrumb(),
+                                                owner,
+                                                &|actual| {
+                                                    if actual != Some(owner) {
+                                                        return Err(session_effect_io_error(SessionEffectDenied(rpc_err(FORBIDDEN, "Session not found or not owned by this principal")).into()));
+                                                    }
+                                                    self.live_effect_lease(Method::SessionNew, candidate)
+                                                        .map(|lease| Box::new(lease) as Box<dyn zeroclaw_infra::session_backend::SessionEffectGuard>)
+                                                        .map_err(|error| session_effect_io_error(SessionEffectDenied(error).into()))
+                                                },
+                                            ).map_err(|error| session_effect_error(error.into(), "Failed to persist Chat restore trim"))?;
+                                            if !replaced {
+                                                return Err(rpc_err(SESSION_NOT_OWNED, "Caller does not own this session"));
+                                            }
+                                        } else if !replace_rpc_chat_conversation_state(
                                             backend.as_ref(),
                                             &session_id,
                                             &session_key,
@@ -23944,7 +23965,7 @@ mod tests {
                 "test-agent",
                 &ChatMode::Chat,
                 Some("other-tui".into()),
-                Some("user:alice"),
+                None,
             )
             .await
             .unwrap()
@@ -24019,6 +24040,104 @@ mod tests {
                 .as_deref(),
             Some("user:alice")
         );
+    }
+
+    #[tokio::test]
+    async fn remote_chat_restore_trim_rechecks_owner_and_authority_before_writing() {
+        for change in ["unchanged", "revoke", "owner", "delete"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = two_user_config(&tmp);
+            config.agents.get_mut("test-agent").unwrap().runtime_profile = "default".into();
+            config.runtime_profiles.insert(
+                "default".into(),
+                zeroclaw_config::schema::RuntimeProfileConfig {
+                    max_history_messages: Some(2),
+                    ..Default::default()
+                },
+            );
+            let data_dir = config.data_dir.clone();
+            let (fixture, sessions, backend, _) =
+                make_persistence_test_dispatcher(config, &data_dir);
+            let sid = "restore-trim-race";
+            let key = format!("rpc_{sid}");
+            seed_remote_chat_restore(&fixture.ctx, 4242, sid).await;
+            let over_cap = vec![
+                ChatMessage::user("first request"),
+                ChatMessage::assistant("first answer"),
+                ChatMessage::user("second request"),
+                ChatMessage::assistant("second answer"),
+                ChatMessage::user("third request"),
+                ChatMessage::assistant("third answer"),
+            ];
+            backend
+                .replace_conversation_state(&key, &over_cap, false)
+                .unwrap();
+            sessions.remove(sid).await;
+            let remote = remote_chat_restore_peer(&fixture.ctx, 4242).await;
+            let (entered, release) = sessions.set_test_effect_pause("restore-trim");
+            let request = zeroclaw_spawn::spawn!(async move {
+                remote
+                    .handle_session_new_for_test(&json!({
+                        "agent_alias":"test-agent", "session_id":sid,
+                    }))
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            match change {
+                "revoke" => revoke_remote_chat_restore(&fixture.ctx),
+                "owner" => backend.set_session_principal(&key, "user:bob").unwrap(),
+                "delete" => {
+                    backend.delete_session(&key).unwrap();
+                }
+                _ => {}
+            }
+            let before = backend.try_load(&key).unwrap();
+            let breadcrumb = backend.get_session_trim_breadcrumb(&key).unwrap();
+            release.notify_one();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                result.is_ok(),
+                change == "unchanged",
+                "{change}: {result:?}"
+            );
+            assert_eq!(
+                sessions.get_generation(sid).await.is_some(),
+                change == "unchanged",
+                "{change}"
+            );
+            let after = backend.try_load(&key).unwrap();
+            if change == "unchanged" {
+                assert!(
+                    after.len() < over_cap.len(),
+                    "allowed restore must persist its trim"
+                );
+                assert!(
+                    !after
+                        .iter()
+                        .any(|message| message.content == "first request")
+                );
+                assert_eq!(
+                    backend.get_session_trim_breadcrumb(&key).unwrap(),
+                    Some(true)
+                );
+            } else {
+                assert_eq!(
+                    serde_json::to_value(after).unwrap(),
+                    serde_json::to_value(before).unwrap(),
+                    "{change}"
+                );
+                assert_eq!(
+                    backend.get_session_trim_breadcrumb(&key).unwrap(),
+                    breadcrumb,
+                    "{change}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
