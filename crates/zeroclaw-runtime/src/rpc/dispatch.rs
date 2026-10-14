@@ -23974,6 +23974,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_chat_restore_administrator_still_needs_durable_ownership() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config_with_administrator_alice(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, backend, _) = make_persistence_test_dispatcher(config, &data_dir);
+        seed_remote_chat_restore(&fixture.ctx, 4242, "admin-owned").await;
+        seed_remote_chat_restore(&fixture.ctx, 4343, "member-owned").await;
+        for sid in ["admin-owned", "member-owned"] {
+            sessions.remove(sid).await;
+        }
+        let admin = remote_chat_restore_peer(&fixture.ctx, 4242).await;
+        assert!(admin.stamped_grants().unwrap().admin);
+        assert_eq!(
+            admin
+                .handle_session_new_for_test(&json!({
+                    "agent_alias":"test-agent", "session_id":"member-owned",
+                }))
+                .await
+                .unwrap_err()
+                .code,
+            FORBIDDEN
+        );
+        assert!(sessions.get_generation("member-owned").await.is_none());
+        admin
+            .handle_session_new_for_test(&json!({
+                "agent_alias":"test-agent", "session_id":"admin-owned",
+            }))
+            .await
+            .expect("an administrator can recover their own durable session");
+        assert_eq!(
+            backend
+                .get_session_metadata("rpc_member-owned")
+                .unwrap()
+                .principal_id
+                .as_deref(),
+            Some("user:bob")
+        );
+        assert_eq!(
+            backend
+                .get_session_metadata("rpc_admin-owned")
+                .unwrap()
+                .principal_id
+                .as_deref(),
+            Some("user:alice")
+        );
+    }
+
+    #[tokio::test]
     async fn remote_chat_restore_rechecks_admission_and_publication() {
         for boundary in ["admission", "publication", "restore-publish"] {
             for change in ["unchanged", "revoke", "owner", "delete"] {
