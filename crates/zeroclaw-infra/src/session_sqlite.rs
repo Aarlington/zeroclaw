@@ -1282,8 +1282,14 @@ impl SessionBackend for SqliteSessionBackend {
         session_key: &str,
         effect: &mut dyn FnMut(Option<&str>) -> std::io::Result<()>,
     ) -> std::io::Result<()> {
-        let conn = self.conn.lock();
-        let owner: Option<String> = conn
+        // RPC and gateway backends may use different connections to this
+        // database. Reserve the writer boundary as well as the local mutex,
+        // so another connection cannot re-own/delete the row during effect.
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let owner: Option<String> = tx
             .query_row(
                 "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
                 params![session_key],
@@ -3266,6 +3272,38 @@ mod tests {
         let keys: Vec<&str> = running.iter().map(|m| m.key.as_str()).collect();
         assert!(keys.contains(&"s1"));
         assert!(keys.contains(&"s2"));
+    }
+
+    #[test]
+    fn with_session_owner_blocks_other_connections_until_effect_finishes() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .append("owned", &ChatMessage::user("private"))
+            .unwrap();
+        backend
+            .set_session_principal("owned", "user:alice")
+            .unwrap();
+        let competing = Connection::open(tmp.path().join("sessions/sessions.db")).unwrap();
+        competing.busy_timeout(std::time::Duration::ZERO).unwrap();
+        backend.with_session_owner("owned", &mut |owner| {
+            assert_eq!(owner, Some("user:alice"));
+            for sql in [
+                "UPDATE session_metadata SET principal_id = 'user:bob' WHERE session_key = 'owned'",
+                "DELETE FROM session_metadata WHERE session_key = 'owned'",
+            ] {
+                let error = competing.execute(sql, []).expect_err("competing writer must wait for the guarded effect");
+                assert!(matches!(error, rusqlite::Error::SqliteFailure(ref error, _) if error.code == rusqlite::ErrorCode::DatabaseBusy), "{error:?}");
+            }
+            Ok(())
+        }).unwrap();
+        assert_eq!(competing.execute("UPDATE session_metadata SET principal_id = 'user:bob' WHERE session_key = 'owned'", []).unwrap(), 1);
+        backend
+            .with_session_owner("owned", &mut |owner| {
+                assert_eq!(owner, Some("user:bob"));
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
