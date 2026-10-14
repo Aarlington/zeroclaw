@@ -6,6 +6,16 @@ import subprocess
 from oidc_acceptance_contract import exact_cargo_pass
 
 TESTS = [
+    'rpc::dispatch::tests::remote_chat_restore_reopens_owned_nonempty_history',
+    'rpc::dispatch::tests::remote_chat_restore_refuses_unproven_or_ambiguous_ownership',
+    'rpc::dispatch::tests::remote_chat_restore_cannot_take_another_live_tui_binding',
+    'rpc::dispatch::tests::remote_chat_restore_rechecks_admission_and_publication',
+    'rpc::dispatch::tests::remote_resume_admission_wait_uses_current_principal',
+    'rpc::dispatch::tests::fast_remote_resume_rejects_owner_changed_after_authorization',
+    'rpc::dispatch::tests::remote_cross_mode_resume_preserves_a_rehydrated_successor',
+    'rpc::dispatch::tests::forwarded_environment_remote_resume_and_prompt_are_refused_without_mutation',
+    'rpc::dispatch::tests::remote_resume_rechecks_channels_at_final_agent_install',
+
     'security::auth_provider::enrollment::tests::enrollment_basic_credentials_round_trip_on_every_endpoint',
     'rpc::tui_identity::tests::config_signing_key_is_used_when_runtime_data_lives_elsewhere',
     'rpc::dispatch::tests::scoped_principals_sessions_are_isolated',
