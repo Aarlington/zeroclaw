@@ -2886,6 +2886,103 @@ impl RpcDispatcher {
         self.capture_session_access(session_id).await.map(|_| ())
     }
 
+    /// A missing live TUI binding is recoverable only from an owned RPC Chat
+    /// row. A principal identity is required even for administrators: the
+    /// operator bypass cannot prove ownership of a retired transport binding.
+    async fn authorize_remote_chat_restore(
+        &self,
+        session_id: &str,
+        agent_alias: &str,
+        chat_mode: &ChatMode,
+    ) -> Result<(), JsonRpcError> {
+        let denied = || rpc_err(SESSION_NOT_OWNED, "Caller does not own this session");
+        let owner = self.owner_principal_id().ok_or_else(denied)?;
+        if *chat_mode != ChatMode::Chat || self.tui_id.is_none() {
+            return Err(denied());
+        }
+        let record = self
+            .authorize_session_owner_for_mode(
+                session_id,
+                Method::SessionNew,
+                Some(chat_mode),
+                Some(&owner),
+            )
+            .await?
+            .ok_or_else(denied)?;
+        let key = format!("rpc_{session_id}");
+        if record.live_generation.is_some()
+            || record.durable != Some(DurableSession::Chat { key: key.clone() })
+        {
+            return Err(denied());
+        }
+        let metadata = self
+            .ctx
+            .session_backend
+            .as_ref()
+            .and_then(|backend| backend.get_session_metadata(&key))
+            .ok_or_else(denied)?;
+        if metadata.principal_id.as_deref() != Some(owner.as_str())
+            || metadata.agent_alias.as_deref() != Some(agent_alias)
+        {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
+    async fn publish_remote_chat_restore(
+        &self,
+        session_id: &str,
+        candidate: crate::rpc::session::RpcSession,
+    ) -> Result<(), JsonRpcError> {
+        let backend = self
+            .ctx
+            .session_backend
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+        self.ctx
+            .sessions
+            .publish_prepared_with_effect(
+                session_id.to_owned(),
+                candidate,
+                None,
+                None,
+                |candidate, publish| {
+                    let mut candidate = Some(candidate);
+                    backend
+                        .with_session_owner(&format!("rpc_{session_id}"), &mut |actual| {
+                            let candidate = candidate.take().ok_or_else(|| {
+                                std::io::Error::other("duplicate restore publication")
+                            })?;
+                            if actual.is_none() || actual != candidate.owner_principal_id.as_deref()
+                            {
+                                return Err(session_effect_io_error(
+                                    SessionEffectDenied(rpc_err(
+                                        FORBIDDEN,
+                                        "Session not found or not owned by this principal",
+                                    ))
+                                    .into(),
+                                ));
+                            }
+                            let _authority = self
+                                .live_effect_lease(Method::SessionNew, &candidate)
+                                .map_err(|error| {
+                                    session_effect_io_error(SessionEffectDenied(error).into())
+                                })?;
+                            publish(candidate);
+                            Ok(())
+                        })
+                        .map_err(|error| {
+                            session_effect_error(
+                                error.into(),
+                                "Failed to authorize session restore",
+                            )
+                        })
+                },
+                |_| self.stale_session_incarnation_error(),
+            )
+            .await
+    }
+
     async fn ensure_session_incarnation(
         &self,
         session_id: &str,
@@ -4628,14 +4725,24 @@ impl RpcDispatcher {
         create_only: Option<&parking_lot::Mutex<Option<u64>>>,
     ) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
+        let chat_mode = req.chat_mode.clone().unwrap_or(ChatMode::Chat);
+        let mut remote_chat_restore = false;
         let expected_generation = match req.session_id.as_deref() {
             Some(session_id) if create_only.is_none() => {
-                self.capture_session_access(session_id).await?
+                if self.access_policy == RpcAccessPolicy::RemoteSessionOwner
+                    && self.ctx.sessions.get_generation(session_id).await.is_none()
+                {
+                    self.authorize_remote_chat_restore(session_id, &req.agent_alias, &chat_mode)
+                        .await?;
+                    remote_chat_restore = true;
+                    None
+                } else {
+                    self.capture_session_access(session_id).await?
+                }
             }
             _ => None,
         };
         self.selector_session_agent(Method::SessionNew, &req.agent_alias)?;
-        let chat_mode = req.chat_mode.clone().unwrap_or(ChatMode::Chat);
         let resuming = req.session_id.is_some() && create_only.is_none();
         let mut authorized_resume = None;
         // Check the selected existing session's owner before admission. The
@@ -4707,7 +4814,7 @@ impl RpcDispatcher {
         // under that lock, so a stamp that still carries a revoked
         // administrator bypass cannot rebind another principal's session.
         let mut retained_remote_admission = None;
-        if resuming && create_only.is_none() {
+        if resuming && !remote_chat_restore && create_only.is_none() {
             let non_local = self.access_policy == RpcAccessPolicy::RemoteSessionOwner;
             if non_local {
                 let guard = self
@@ -4857,7 +4964,12 @@ impl RpcDispatcher {
         // Re-read under the permit so concurrent replacements cannot remove a
         // newly installed same-mode canonical session based on stale state.
         let expected_generation = if self.access_policy == RpcAccessPolicy::RemoteSessionOwner {
-            if resuming {
+            if remote_chat_restore {
+                // Never turn a queued restore into a rebind of a session that
+                // appeared meanwhile, even when it has the same principal.
+                self.authorize_remote_chat_restore(&session_id, &req.agent_alias, &chat_mode)
+                    .await?;
+            } else if resuming {
                 self.ensure_session_incarnation(&session_id, expected_generation)
                     .await?;
             }
@@ -5258,6 +5370,10 @@ impl RpcDispatcher {
         // History trimming and publication must use the checked construction
         // config. Keep the original incarnation until preparation succeeds.
         self.wait_test_session_publication_pause().await;
+        if remote_chat_restore {
+            self.authorize_remote_chat_restore(&session_id, &req.agent_alias, &chat_mode)
+                .await?;
+        }
         let candidate = self
             .lifecycle_session_candidate(
                 agent,
@@ -5275,7 +5391,7 @@ impl RpcDispatcher {
         // A client-supplied id may replace its live entry: the resume
         // ownership check above already authorized this caller for the
         // session, so that is reattachment, not a takeover.
-        let unpublished = if expected_generation.is_none() {
+        let unpublished = if expected_generation.is_none() && !remote_chat_restore {
             self.ctx
                 .sessions
                 .insert_admitted_if_absent(&_admission, session_id.clone(), candidate)
@@ -5449,7 +5565,9 @@ impl RpcDispatcher {
                 crate::rpc::types::ChatMode::Chat => {
                     if let Some(ref backend) = self.ctx.session_backend {
                         let session_key = format!("rpc_{session_id}");
-                        let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
+                        if !remote_chat_restore {
+                            let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
+                        }
                         // Fail closed: an unreadable transcript must not become
                         // an empty history that a later turn authoritatively
                         // persists over the existing durable session.
@@ -5567,23 +5685,32 @@ impl RpcDispatcher {
 
         if let Some(mut candidate) = unpublished {
             candidate.plan = plan;
-            self.ctx
-                .sessions
-                .publish_prepared_authorized(
-                    session_id.clone(),
-                    candidate,
-                    expected_generation,
-                    self.resume_access_fence(expected_generation),
-                    |candidate| self.live_effect_lease(Method::SessionNew, candidate),
-                    |message| {
-                        if self.access_policy == RpcAccessPolicy::RemoteSessionOwner {
-                            self.stale_session_incarnation_error()
-                        } else {
-                            rpc_err(SESSION_BUSY, message)
-                        }
-                    },
-                )
-                .await?;
+            if remote_chat_restore {
+                self.ctx
+                    .sessions
+                    .wait_test_effect_pause("restore-publish")
+                    .await;
+                self.publish_remote_chat_restore(&session_id, candidate)
+                    .await?;
+            } else {
+                self.ctx
+                    .sessions
+                    .publish_prepared_authorized(
+                        session_id.clone(),
+                        candidate,
+                        expected_generation,
+                        self.resume_access_fence(expected_generation),
+                        |candidate| self.live_effect_lease(Method::SessionNew, candidate),
+                        |message| {
+                            if self.access_policy == RpcAccessPolicy::RemoteSessionOwner {
+                                self.stale_session_incarnation_error()
+                            } else {
+                                rpc_err(SESSION_BUSY, message)
+                            }
+                        },
+                    )
+                    .await?;
+            }
         } else {
             self.ctx.sessions.set_plan(&session_id, plan).await;
         }
@@ -5612,6 +5739,7 @@ impl RpcDispatcher {
         if let (Some(owner), Some(backend)) =
             (effective_owner.clone(), self.ctx.session_backend.as_ref())
             && !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
+            && !remote_chat_restore
             && let Err(error) = backend.set_session_principal(&format!("rpc_{session_id}"), &owner)
         {
             if resume_scope.is_some() {

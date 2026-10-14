@@ -660,10 +660,36 @@ impl SessionStore {
     pub(crate) async fn publish_prepared_authorized<G, E>(
         &self,
         id: String,
-        mut session: RpcSession,
+        session: RpcSession,
         expected_generation: Option<u64>,
         expected_access: Option<(u64, Option<&str>)>,
         authorize: impl FnOnce(&RpcSession) -> Result<G, E>,
+        failure: impl Fn(&'static str) -> E,
+    ) -> Result<(), E> {
+        self.publish_prepared_with_effect(
+            id,
+            session,
+            expected_generation,
+            expected_access,
+            |session, publish| {
+                let _authority = authorize(&session)?;
+                publish(session);
+                Ok(())
+            },
+            failure,
+        )
+        .await
+    }
+
+    /// Keep storage authorization around the publication itself when its
+    /// owner-read lock cannot be returned as an owned guard.
+    pub(crate) async fn publish_prepared_with_effect<E>(
+        &self,
+        id: String,
+        session: RpcSession,
+        expected_generation: Option<u64>,
+        expected_access: Option<(u64, Option<&str>)>,
+        effect: impl FnOnce(RpcSession, &mut dyn FnMut(RpcSession)) -> Result<(), E>,
         failure: impl Fn(&'static str) -> E,
     ) -> Result<(), E> {
         let mut sessions = self.sessions.lock().await;
@@ -684,14 +710,21 @@ impl SessionStore {
         if expected_generation.is_none() && sessions.len() >= self.max_sessions {
             return Err(failure("session limit reached"));
         }
-        let _authority = authorize(&session)?;
-        let generation = self
-            .session_generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            .wrapping_add(1);
-        session.generation = generation;
-        sessions.insert(id, session);
-        Ok(())
+        let mut published = false;
+        effect(session, &mut |mut session| {
+            let generation = self
+                .session_generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .wrapping_add(1);
+            session.generation = generation;
+            sessions.insert(id.clone(), session);
+            published = true;
+        })?;
+        if published {
+            Ok(())
+        } else {
+            Err(failure("session publication was not committed"))
+        }
     }
 
     /// Publish a rehydrated session and bind the admitted prompt's cancel
