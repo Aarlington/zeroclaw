@@ -48,9 +48,9 @@ for mutation in ['durable-owner', 'current-authority']:
         end = source.index('    async fn ensure_session_incarnation(', start)
         method = source[start:end]
         if mutation == 'durable-owner':
-            before = 'if actual.is_none() || actual != candidate.owner_principal_id.as_deref() {'
+            before = 'if actual.is_none() || actual != candidate.owner_principal_id.as_deref()'
             assert method.count(before) == 1
-            method = method.replace(before, 'if false {')
+            method = method.replace(before, 'if false')
         else:
             a = method.index('let _authority = self')
             b = method.index('publish(candidate);', a)
