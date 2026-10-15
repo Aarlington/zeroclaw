@@ -17005,23 +17005,51 @@ command = "echo hi"
             .get_mut("agentic_test")
             .expect("fixture risk profile")
             .allowed_tools
-            .extend(probes.map(String::from));
+            .extend(
+                probes
+                    .into_iter()
+                    .chain(["sop_workshop", "workshop__apply"])
+                    .map(String::from),
+            );
+        let workshop: Arc<dyn Tool> = Arc::new(crate::tools::sop_workshop::SopWorkshopTool::new(
+            Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+                config.sop.clone(),
+            ))),
+            _tmp.path().to_path_buf(),
+        ));
+        let alias = crate::skills::SkillTool {
+            name: "apply".into(),
+            description: "Apply a shared SOP proposal".into(),
+            kind: "builtin".into(),
+            command: String::new(),
+            args: HashMap::new(),
+            target: Some("sop_workshop".into()),
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        };
+        let workshop_alias: Arc<dyn Tool> =
+            Arc::new(crate::tools::skill_tool::SkillBuiltinTool::new(
+                "workshop",
+                &alias,
+                Arc::clone(&workshop),
+                HashMap::new(),
+            ));
+        let parent_tools = probes
+            .into_iter()
+            .map(|name| {
+                Arc::new(ParentToolProbe {
+                    name,
+                    nested: name == "spawn_subagent",
+                }) as Arc<dyn Tool>
+            })
+            .chain([workshop, workshop_alias])
+            .collect();
         let config = Arc::new(config);
         let tool = DelegateTool {
             security: Arc::new(SecurityPolicy::for_agent(&config, "caller").unwrap()),
             risk_profiles: Arc::new(config.risk_profiles.clone()),
             root_config: Some(Arc::clone(&config)),
-            parent_tools: Arc::new(RwLock::new(
-                probes
-                    .into_iter()
-                    .map(|name| {
-                        Arc::new(ParentToolProbe {
-                            name,
-                            nested: name == "spawn_subagent",
-                        }) as Arc<dyn Tool>
-                    })
-                    .collect(),
-            )),
+            parent_tools: Arc::new(RwLock::new(parent_tools)),
             ..tool
         };
 
@@ -17066,7 +17094,12 @@ command = "echo hi"
 
         let requests = server.requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 4, "one provider request per delegation");
-        for name in ["sessions_history", "spawn_subagent"] {
+        for name in [
+            "sessions_history",
+            "spawn_subagent",
+            "sop_workshop",
+            "workshop__apply",
+        ] {
             assert!(
                 offered_tool(&requests[0], name),
                 "control: a child that withholds nothing is offered {name}"
@@ -17075,7 +17108,7 @@ command = "echo hi"
         for (request, path) in requests[1..].iter().zip(["sync", "parallel", "background"]) {
             for name in zeroclaw_tools::PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES
                 .iter()
-                .chain(&["spawn_subagent"])
+                .chain(&["spawn_subagent", "sop_workshop", "workshop__apply"])
             {
                 assert!(
                     !offered_tool(request, name),
