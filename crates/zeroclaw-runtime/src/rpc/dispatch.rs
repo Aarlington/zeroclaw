@@ -2886,6 +2886,103 @@ impl RpcDispatcher {
         self.capture_session_access(session_id).await.map(|_| ())
     }
 
+    /// A missing live TUI binding is recoverable only from an owned RPC Chat
+    /// row. A principal identity is required even for administrators: the
+    /// operator bypass cannot prove ownership of a retired transport binding.
+    async fn authorize_remote_chat_restore(
+        &self,
+        session_id: &str,
+        agent_alias: &str,
+        chat_mode: &ChatMode,
+    ) -> Result<(), JsonRpcError> {
+        let denied = || rpc_err(SESSION_NOT_OWNED, "Caller does not own this session");
+        let owner = self.owner_principal_id().ok_or_else(denied)?;
+        if *chat_mode != ChatMode::Chat || self.tui_id.is_none() {
+            return Err(denied());
+        }
+        let record = self
+            .authorize_session_owner_for_mode(
+                session_id,
+                Method::SessionNew,
+                Some(chat_mode),
+                Some(&owner),
+            )
+            .await?
+            .ok_or_else(denied)?;
+        let key = format!("rpc_{session_id}");
+        if record.live_generation.is_some()
+            || record.durable != Some(DurableSession::Chat { key: key.clone() })
+        {
+            return Err(denied());
+        }
+        let metadata = self
+            .ctx
+            .session_backend
+            .as_ref()
+            .and_then(|backend| backend.get_session_metadata(&key))
+            .ok_or_else(denied)?;
+        if metadata.principal_id.as_deref() != Some(owner.as_str())
+            || metadata.agent_alias.as_deref() != Some(agent_alias)
+        {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
+    async fn publish_remote_chat_restore(
+        &self,
+        session_id: &str,
+        candidate: crate::rpc::session::RpcSession,
+    ) -> Result<(), JsonRpcError> {
+        let backend = self
+            .ctx
+            .session_backend
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+        self.ctx
+            .sessions
+            .publish_prepared_with_effect(
+                session_id.to_owned(),
+                candidate,
+                None,
+                None,
+                |candidate, publish| {
+                    let mut candidate = Some(candidate);
+                    backend
+                        .with_session_owner(&format!("rpc_{session_id}"), &mut |actual| {
+                            let candidate = candidate.take().ok_or_else(|| {
+                                std::io::Error::other("duplicate restore publication")
+                            })?;
+                            if actual.is_none() || actual != candidate.owner_principal_id.as_deref()
+                            {
+                                return Err(session_effect_io_error(
+                                    SessionEffectDenied(rpc_err(
+                                        FORBIDDEN,
+                                        "Session not found or not owned by this principal",
+                                    ))
+                                    .into(),
+                                ));
+                            }
+                            let _authority = self
+                                .live_effect_lease(Method::SessionNew, &candidate)
+                                .map_err(|error| {
+                                    session_effect_io_error(SessionEffectDenied(error).into())
+                                })?;
+                            publish(candidate);
+                            Ok(())
+                        })
+                        .map_err(|error| {
+                            session_effect_error(
+                                error.into(),
+                                "Failed to authorize session restore",
+                            )
+                        })
+                },
+                |_| self.stale_session_incarnation_error(),
+            )
+            .await
+    }
+
     async fn ensure_session_incarnation(
         &self,
         session_id: &str,
@@ -4628,14 +4725,24 @@ impl RpcDispatcher {
         create_only: Option<&parking_lot::Mutex<Option<u64>>>,
     ) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
+        let chat_mode = req.chat_mode.clone().unwrap_or(ChatMode::Chat);
+        let mut remote_chat_restore = false;
         let expected_generation = match req.session_id.as_deref() {
             Some(session_id) if create_only.is_none() => {
-                self.capture_session_access(session_id).await?
+                if self.access_policy == RpcAccessPolicy::RemoteSessionOwner
+                    && self.ctx.sessions.get_generation(session_id).await.is_none()
+                {
+                    self.authorize_remote_chat_restore(session_id, &req.agent_alias, &chat_mode)
+                        .await?;
+                    remote_chat_restore = true;
+                    None
+                } else {
+                    self.capture_session_access(session_id).await?
+                }
             }
             _ => None,
         };
         self.selector_session_agent(Method::SessionNew, &req.agent_alias)?;
-        let chat_mode = req.chat_mode.clone().unwrap_or(ChatMode::Chat);
         let resuming = req.session_id.is_some() && create_only.is_none();
         let mut authorized_resume = None;
         // Check the selected existing session's owner before admission. The
@@ -4707,7 +4814,7 @@ impl RpcDispatcher {
         // under that lock, so a stamp that still carries a revoked
         // administrator bypass cannot rebind another principal's session.
         let mut retained_remote_admission = None;
-        if resuming && create_only.is_none() {
+        if resuming && !remote_chat_restore && create_only.is_none() {
             let non_local = self.access_policy == RpcAccessPolicy::RemoteSessionOwner;
             if non_local {
                 let guard = self
@@ -4857,7 +4964,12 @@ impl RpcDispatcher {
         // Re-read under the permit so concurrent replacements cannot remove a
         // newly installed same-mode canonical session based on stale state.
         let expected_generation = if self.access_policy == RpcAccessPolicy::RemoteSessionOwner {
-            if resuming {
+            if remote_chat_restore {
+                // Never turn a queued restore into a rebind of a session that
+                // appeared meanwhile, even when it has the same principal.
+                self.authorize_remote_chat_restore(&session_id, &req.agent_alias, &chat_mode)
+                    .await?;
+            } else if resuming {
                 self.ensure_session_incarnation(&session_id, expected_generation)
                     .await?;
             }
@@ -5258,6 +5370,10 @@ impl RpcDispatcher {
         // History trimming and publication must use the checked construction
         // config. Keep the original incarnation until preparation succeeds.
         self.wait_test_session_publication_pause().await;
+        if remote_chat_restore {
+            self.authorize_remote_chat_restore(&session_id, &req.agent_alias, &chat_mode)
+                .await?;
+        }
         let candidate = self
             .lifecycle_session_candidate(
                 agent,
@@ -5275,7 +5391,7 @@ impl RpcDispatcher {
         // A client-supplied id may replace its live entry: the resume
         // ownership check above already authorized this caller for the
         // session, so that is reattachment, not a takeover.
-        let unpublished = if expected_generation.is_none() {
+        let unpublished = if expected_generation.is_none() && !remote_chat_restore {
             self.ctx
                 .sessions
                 .insert_admitted_if_absent(&_admission, session_id.clone(), candidate)
@@ -5449,7 +5565,9 @@ impl RpcDispatcher {
                 crate::rpc::types::ChatMode::Chat => {
                     if let Some(ref backend) = self.ctx.session_backend {
                         let session_key = format!("rpc_{session_id}");
-                        let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
+                        if !remote_chat_restore {
+                            let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
+                        }
                         // Fail closed: an unreadable transcript must not become
                         // an empty history that a later turn authoritatively
                         // persists over the existing durable session.
@@ -5505,7 +5623,28 @@ impl RpcDispatcher {
                                         let durable = zeroclaw_providers::durable_chat_messages(
                                             agent.history(),
                                         );
-                                        if !replace_rpc_chat_conversation_state(
+                                        if remote_chat_restore {
+                                            self.ctx.sessions.wait_test_effect_pause("restore-trim").await;
+                                            let candidate = unpublished.as_ref().expect("remote restore remains unpublished");
+                                            let owner = candidate.owner_principal_id.as_deref().ok_or_else(|| rpc_err(SESSION_NOT_OWNED, "Caller does not own this session"))?;
+                                            let replaced = backend.replace_conversation_state_authorized(
+                                                &session_key,
+                                                &durable,
+                                                agent.history_has_trim_breadcrumb(),
+                                                owner,
+                                                &|actual| {
+                                                    if actual != Some(owner) {
+                                                        return Err(session_effect_io_error(SessionEffectDenied(rpc_err(FORBIDDEN, "Session not found or not owned by this principal")).into()));
+                                                    }
+                                                    self.live_effect_lease(Method::SessionNew, candidate)
+                                                        .map(|lease| Box::new(lease) as Box<dyn zeroclaw_infra::session_backend::SessionEffectGuard>)
+                                                        .map_err(|error| session_effect_io_error(SessionEffectDenied(error).into()))
+                                                },
+                                            ).map_err(|error| session_effect_error(error.into(), "Failed to persist Chat restore trim"))?;
+                                            if !replaced {
+                                                return Err(rpc_err(SESSION_NOT_OWNED, "Caller does not own this session"));
+                                            }
+                                        } else if !replace_rpc_chat_conversation_state(
                                             backend.as_ref(),
                                             &session_id,
                                             &session_key,
@@ -5567,23 +5706,32 @@ impl RpcDispatcher {
 
         if let Some(mut candidate) = unpublished {
             candidate.plan = plan;
-            self.ctx
-                .sessions
-                .publish_prepared_authorized(
-                    session_id.clone(),
-                    candidate,
-                    expected_generation,
-                    self.resume_access_fence(expected_generation),
-                    |candidate| self.live_effect_lease(Method::SessionNew, candidate),
-                    |message| {
-                        if self.access_policy == RpcAccessPolicy::RemoteSessionOwner {
-                            self.stale_session_incarnation_error()
-                        } else {
-                            rpc_err(SESSION_BUSY, message)
-                        }
-                    },
-                )
-                .await?;
+            if remote_chat_restore {
+                self.ctx
+                    .sessions
+                    .wait_test_effect_pause("restore-publish")
+                    .await;
+                self.publish_remote_chat_restore(&session_id, candidate)
+                    .await?;
+            } else {
+                self.ctx
+                    .sessions
+                    .publish_prepared_authorized(
+                        session_id.clone(),
+                        candidate,
+                        expected_generation,
+                        self.resume_access_fence(expected_generation),
+                        |candidate| self.live_effect_lease(Method::SessionNew, candidate),
+                        |message| {
+                            if self.access_policy == RpcAccessPolicy::RemoteSessionOwner {
+                                self.stale_session_incarnation_error()
+                            } else {
+                                rpc_err(SESSION_BUSY, message)
+                            }
+                        },
+                    )
+                    .await?;
+            }
         } else {
             self.ctx.sessions.set_plan(&session_id, plan).await;
         }
@@ -5612,6 +5760,7 @@ impl RpcDispatcher {
         if let (Some(owner), Some(backend)) =
             (effective_owner.clone(), self.ctx.session_backend.as_ref())
             && !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
+            && !remote_chat_restore
             && let Err(error) = backend.set_session_principal(&format!("rpc_{session_id}"), &owner)
         {
             if resume_scope.is_some() {
@@ -7976,44 +8125,42 @@ impl RpcDispatcher {
             None
         };
 
+        let update = built_model_provider.map(
+            |(
+                model_provider,
+                model_provider_name,
+                model_name,
+                model_route_resolver,
+                tool_dispatcher,
+                config_generation,
+            )| crate::rpc::session::ModelProviderUpdate {
+                model_provider,
+                model_provider_name,
+                model_name,
+                model_route_resolver,
+                tool_dispatcher,
+                config_generation: Arc::clone(&config_generation),
+                temperature: None,
+                multimodal_config: config_generation.multimodal.clone(),
+            },
+        );
         let merged = self
             .ctx
             .sessions
-            .set_overrides_gated(&req.session_id, session_generation, req.overrides)
-            .await
+            .configure_authorized(
+                &req.session_id,
+                session_generation,
+                merged,
+                update,
+                |session| {
+                    self.session_effect_lease(
+                        Method::SessionConfigure,
+                        session.owner_principal_id.as_deref(),
+                    )
+                },
+            )
+            .await?
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-
-        if let Some((
-            model_provider,
-            model_provider_name,
-            model_name,
-            model_route_resolver,
-            tool_dispatcher,
-            config_generation,
-        )) = built_model_provider
-        {
-            self.ctx
-                .sessions
-                .apply_model_provider(
-                    &req.session_id,
-                    session_generation,
-                    crate::rpc::session::ModelProviderUpdate {
-                        model_provider,
-                        model_provider_name,
-                        model_name,
-                        model_route_resolver,
-                        tool_dispatcher,
-                        config_generation: Arc::clone(&config_generation),
-                        // Temperature is already committed through
-                        // `set_overrides_gated` on this path.
-                        temperature: None,
-                        multimodal_config: config_generation.multimodal.clone(),
-                    },
-                )
-                .await
-                .then_some(())
-                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        }
 
         to_result(SessionConfigureResult {
             session_id: req.session_id,
@@ -12924,15 +13071,35 @@ impl RpcDispatcher {
         ))
     }
 
+    fn sop_run_read_lease(
+        &self,
+        method: Method,
+    ) -> Result<crate::rpc::auth::AuthorityLease<'_>, JsonRpcError> {
+        let lease = self.ctx.auth.hold_authority();
+        if let Some(auth) = self.auth.as_ref() {
+            let grants = current_authority_under(&lease, auth, method)
+                .map_err(|error| rpc_err(error.code, error.message))?;
+            if !grants.admin {
+                return Err(rpc_err(
+                    FORBIDDEN,
+                    crate::i18n::get_required_cli_string("sop-rpc-run-admin-required"),
+                ));
+            }
+        }
+        Ok(lease)
+    }
+
     fn handle_sops_runs(&self, params: &Value) -> RpcResult {
+        drop(self.sop_run_read_lease(Method::SopsRuns)?);
         let req: SopRunsRequest = parse_params(params)?;
         let engine = self
             .ctx
             .sop_engine
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        let runs = crate::sop::run_summaries_for(engine, req.sop.as_deref())
-            .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
+        let runs = crate::sop::run_summaries_for(engine, req.sop.as_deref());
+        let _authority = self.sop_run_read_lease(Method::SopsRuns)?;
+        let runs = runs.map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
         to_result(serde_json::json!({ "runs": runs }))
     }
 
@@ -12956,13 +13123,18 @@ impl RpcDispatcher {
                  authenticated principal to authorize run contents against",
             ));
         }
+        drop(self.sop_run_read_lease(Method::SopsRunDetail)?);
         let req: SopRunDetailRequest = parse_params(params)?;
         let engine = self
             .ctx
             .sop_engine
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        let (run, active) = crate::sop::run_detail_for(engine, &req.run_id).map_err(|e| {
+        let result = crate::sop::run_detail_for(engine, &req.run_id);
+        // Recheck before either success or error projection: a missing-run
+        // response must not become an existence oracle after revocation.
+        let _authority = self.sop_run_read_lease(Method::SopsRunDetail)?;
+        let (run, active) = result.map_err(|e| {
             let msg = e.to_string();
             let code = if msg.contains("not found") {
                 INVALID_PARAMS
@@ -12976,6 +13148,7 @@ impl RpcDispatcher {
     }
 
     fn handle_sops_run_overlay(&self, params: &Value) -> RpcResult {
+        drop(self.sop_run_read_lease(Method::SopsRunOverlay)?);
         let req: SopRunOverlayRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
         let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
@@ -12985,7 +13158,9 @@ impl RpcDispatcher {
             .sop_engine
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        let overlay = crate::sop::run_overlay_for(&sop, engine, &req.run_id).map_err(|e| {
+        let result = crate::sop::run_overlay_for(&sop, engine, &req.run_id);
+        let _authority = self.sop_run_read_lease(Method::SopsRunOverlay)?;
+        let overlay = result.map_err(|e| {
             let msg = e.to_string();
             let code = if msg.contains("not found") {
                 INVALID_PARAMS
@@ -15314,6 +15489,7 @@ mod tests {
             revision: 0,
             revision_base: 0,
             initiating_agent: None,
+            memory_owner: None,
             decided_mode: None,
             decisions: std::collections::BTreeMap::new(),
         };
@@ -20507,6 +20683,137 @@ mod tests {
         ctx.config_authority.publish_for_test(config);
     }
 
+    #[tokio::test]
+    async fn sop_run_reads_recheck_after_contention_for_success_and_missing_results() {
+        for method in ["sops/runs", "sops/run-detail", "sops/run-overlay"] {
+            for missing in [false, true] {
+                for revoke in [false, true] {
+                    let tmp = tempfile::TempDir::new().unwrap();
+                    let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
+                    grant_sop_admin(&ctx);
+                    let run_id = park_sop_run(&engine, "alpha-sop");
+                    let (alice, _) = roster_peer(&ctx, 4242).await;
+                    let (operator, _) = local_operator(&ctx).await;
+                    let requested = if missing {
+                        "absent".to_string()
+                    } else {
+                        run_id
+                    };
+                    let (locked, acquired) = std::sync::mpsc::channel();
+                    let (release, released) = std::sync::mpsc::channel();
+                    let holder = std::thread::spawn(move || {
+                        let _held = engine.lock().unwrap();
+                        locked.send(()).unwrap();
+                        // Dropping the sender also releases the lock if a test
+                        // assertion fails before the ordinary release signal.
+                        let _ = released.recv();
+                    });
+                    acquired
+                        .recv_timeout(std::time::Duration::from_secs(3))
+                        .unwrap();
+                    let (entered, waiting) = std::sync::mpsc::channel();
+                    let worker = std::thread::Builder::new()
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(move || {
+                            crate::sop::notify_run_read_wait_for_test(entered);
+                            let params = json!({"name":"alpha-sop", "run_id":requested});
+                            match method {
+                                "sops/runs" => alice.handle_sops_runs(&params),
+                                "sops/run-detail" => alice.handle_sops_run_detail(&params),
+                                _ => alice.handle_sops_run_overlay(&params),
+                            }
+                        })
+                        .unwrap();
+                    let arrived = waiting.recv_timeout(std::time::Duration::from_secs(3));
+                    if arrived.is_ok() && revoke {
+                        let commit = ctx.begin_config_commit().await.unwrap();
+                        let mut changed = ctx.config.read().clone();
+                        changed
+                            .permission_profiles
+                            .get_mut("cron-alpha")
+                            .unwrap()
+                            .admin = false;
+                        changed.mark_dirty("permission_profiles.cron-alpha");
+                        operator
+                            .save_and_publish_config(
+                                commit,
+                                changed,
+                                RpcConfigCommitEffects::default(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    release.send(()).unwrap();
+                    holder.join().unwrap();
+                    let response = worker.join().unwrap();
+                    arrived
+                        .expect("read must pass initial admission and reach the real engine wait");
+                    if revoke {
+                        let error = response.unwrap_err();
+                        assert_eq!(error.code, FORBIDDEN, "{method}, missing={missing}");
+                        assert_eq!(
+                            error.message,
+                            crate::i18n::get_required_cli_string("sop-rpc-run-admin-required")
+                        );
+                    } else if missing && method != "sops/runs" {
+                        assert_eq!(response.unwrap_err().code, INVALID_PARAMS, "{method}");
+                    } else {
+                        assert!(response.is_ok(), "{method}: {response:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sop_global_run_reads_refuse_roster_users_before_lookup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
+        allow_all_sop_agents(&ctx);
+        let run_id = park_sop_run(&engine, "alpha-sop");
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        for (method, params) in [
+            ("sops/runs", json!({})),
+            ("sops/run-detail", json!({"run_id":run_id})),
+            ("sops/run-detail", json!({"run_id":"missing"})),
+            (
+                "sops/run-overlay",
+                json!({"name":"alpha-sop","run_id":run_id}),
+            ),
+            (
+                "sops/run-overlay",
+                json!({"name":"missing","run_id":"missing"}),
+            ),
+        ] {
+            let response = rpc(&mut alice, &mut rx, 1, method, params).await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(FORBIDDEN),
+                "{method}: {response}"
+            );
+            assert_eq!(
+                response["error"]["message"],
+                json!(crate::i18n::get_required_cli_string(
+                    "sop-rpc-run-admin-required"
+                ))
+            );
+        }
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        let response = rpc(
+            &mut operator,
+            &mut op_rx,
+            2,
+            "sops/run-detail",
+            json!({"run_id":run_id}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["run"]["run_id"],
+            json!(run_id),
+            "{response}"
+        );
+    }
+
     fn grant_sop_admin(ctx: &RpcContext) {
         let mut config = ctx.config_authority.snapshot_config();
         config
@@ -23817,6 +24124,442 @@ mod tests {
         dispatcher
     }
 
+    async fn seed_remote_chat_restore(ctx: &Arc<RpcContext>, uid: u32, sid: &str) -> Value {
+        let owner = scoped_dispatcher(ctx, uid).await;
+        owner
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent", "session_id": sid, "keep_siblings": true,
+            }))
+            .await
+            .unwrap();
+        owner
+            .handle_session_append(
+                &json!({"session_id": sid, "content": format!("private history for {sid}")}),
+            )
+            .await
+            .unwrap();
+        owner
+            .handle_session_messages_for_test(&json!({"session_id": sid}))
+            .await
+            .unwrap()
+    }
+
+    async fn remote_chat_restore_peer(ctx: &Arc<RpcContext>, uid: u32) -> RpcDispatcher {
+        let mut peer = scoped_dispatcher(ctx, uid).await;
+        peer.access_policy = RpcAccessPolicy::RemoteSessionOwner;
+        peer.set_tui_id_for_test(Some("restore-tui".into()));
+        peer
+    }
+
+    fn revoke_remote_chat_restore(ctx: &Arc<RpcContext>) {
+        let mut config = ctx.config_authority.snapshot_config();
+        config
+            .permission_profiles
+            .get_mut("member")
+            .unwrap()
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Sessions,
+                vec![zeroclaw_api::grants::Verb::Read],
+            );
+        ctx.auth.refresh_from_config(&config).unwrap();
+        ctx.config_authority.publish_for_test(config);
+    }
+
+    #[tokio::test]
+    async fn remote_chat_restore_reopens_owned_nonempty_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (alice_history, bob_history) = {
+            let (fixture, _, _, _) = make_persistence_test_dispatcher(config.clone(), &data_dir);
+            let alice = seed_remote_chat_restore(&fixture.ctx, 4242, "restore-alice").await;
+            let bob = seed_remote_chat_restore(&fixture.ctx, 4343, "restore-bob").await;
+            (alice, bob)
+        };
+        // A new context and empty live store, backed by the existing SQLite file.
+        let (fixture, sessions, backend, _) = make_persistence_test_dispatcher(config, &data_dir);
+        assert!(sessions.list_ids().await.is_empty());
+        let alice = remote_chat_restore_peer(&fixture.ctx, 4242).await;
+        let bob = remote_chat_restore_peer(&fixture.ctx, 4343).await;
+        for (peer, own, foreign, expected) in [
+            (&alice, "restore-alice", "restore-bob", alice_history),
+            (&bob, "restore-bob", "restore-alice", bob_history),
+        ] {
+            let denied = peer
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent", "session_id": foreign, "keep_siblings": true,
+                }))
+                .await
+                .expect_err("foreign recovery must be refused");
+            assert!(matches!(denied.code, FORBIDDEN | SESSION_NOT_OWNED));
+            peer.handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent", "session_id": own, "keep_siblings": true,
+            }))
+            .await
+            .expect("durable owner restores their Chat session");
+            let actual = peer
+                .handle_session_messages_for_test(&json!({"session_id": own}))
+                .await
+                .unwrap();
+            assert_eq!(actual["messages"], expected["messages"]);
+            assert!(!actual["messages"].as_array().unwrap().is_empty());
+            assert_eq!(
+                sessions.session_owner_tui_id(own).await,
+                Some(Some("restore-tui".into()))
+            );
+            assert_eq!(
+                backend
+                    .get_session_metadata(&format!("rpc_{own}"))
+                    .unwrap()
+                    .principal_id,
+                peer.owner_principal_id()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_chat_restore_refuses_unproven_or_ambiguous_ownership() {
+        for target in [
+            "missing",
+            "unowned",
+            "foreign",
+            "wrong-agent",
+            "ambiguous",
+            "acp",
+            "native",
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = two_user_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (fixture, sessions, backend, _) =
+                make_persistence_test_dispatcher(config, &data_dir);
+            let sid = "restore-denied";
+            let key = format!("rpc_{sid}");
+            if target != "missing" {
+                if target == "unowned" {
+                    fixture
+                        .handle_session_new_for_test(
+                            &json!({"agent_alias":"test-agent", "session_id":sid}),
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    seed_remote_chat_restore(
+                        &fixture.ctx,
+                        if target == "foreign" { 4343 } else { 4242 },
+                        sid,
+                    )
+                    .await;
+                }
+                assert!(sessions.remove(sid).await);
+            }
+            if target == "wrong-agent" {
+                backend
+                    .set_session_agent_alias(&key, "another-agent")
+                    .unwrap();
+            }
+            if target == "ambiguous" {
+                backend
+                    .append(
+                        sid,
+                        &zeroclaw_api::model_provider::ChatMessage::user("foreign alternate key"),
+                    )
+                    .unwrap();
+                backend.set_session_principal(sid, "user:bob").unwrap();
+            }
+            let before = backend.try_load(&key).unwrap();
+            let mut remote = remote_chat_restore_peer(&fixture.ctx, 4242).await;
+            if target == "native" {
+                remote.auth = None;
+            }
+            let error = remote
+                .handle_session_new_for_test(&json!({
+                    "agent_alias":"test-agent", "session_id":sid,
+                    "chat_mode": if target == "acp" {"acp"} else {"chat"},
+                }))
+                .await
+                .expect_err(target);
+            assert!(
+                matches!(error.code, SESSION_NOT_OWNED | FORBIDDEN),
+                "{target}: {error:?}"
+            );
+            assert!(sessions.get_generation(sid).await.is_none(), "{target}");
+            assert_eq!(
+                serde_json::to_value(backend.try_load(&key).unwrap()).unwrap(),
+                serde_json::to_value(before).unwrap(),
+                "{target}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_chat_restore_cannot_take_another_live_tui_binding() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, _, _) = make_persistence_test_dispatcher(config, &data_dir);
+        seed_remote_chat_restore(&fixture.ctx, 4242, "live-owner").await;
+        sessions
+            .resume_existing(
+                "live-owner",
+                "test-agent",
+                &ChatMode::Chat,
+                Some("other-tui".into()),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let generation = sessions.get_generation("live-owner").await;
+        let mut remote = remote_chat_restore_peer(&fixture.ctx, 4242).await;
+        let params = json!({"agent_alias":"test-agent", "session_id":"live-owner"});
+        assert_eq!(
+            remote
+                .handle_session_new_for_test(&params)
+                .await
+                .unwrap_err()
+                .code,
+            SESSION_NOT_OWNED
+        );
+        assert_eq!(sessions.get_generation("live-owner").await, generation);
+        assert_eq!(
+            sessions.session_owner_tui_id("live-owner").await,
+            Some(Some("other-tui".into()))
+        );
+        remote.set_tui_id_for_test(Some("other-tui".into()));
+        remote
+            .handle_session_new_for_test(&params)
+            .await
+            .expect("unchanged live owner still reconnects");
+        assert_eq!(sessions.get_generation("live-owner").await, generation);
+    }
+
+    #[tokio::test]
+    async fn remote_chat_restore_administrator_still_needs_durable_ownership() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config_with_administrator_alice(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, backend, _) = make_persistence_test_dispatcher(config, &data_dir);
+        seed_remote_chat_restore(&fixture.ctx, 4242, "admin-owned").await;
+        seed_remote_chat_restore(&fixture.ctx, 4343, "member-owned").await;
+        for sid in ["admin-owned", "member-owned"] {
+            sessions.remove(sid).await;
+        }
+        let admin = remote_chat_restore_peer(&fixture.ctx, 4242).await;
+        assert!(admin.stamped_grants().unwrap().admin);
+        assert_eq!(
+            admin
+                .handle_session_new_for_test(&json!({
+                    "agent_alias":"test-agent", "session_id":"member-owned",
+                }))
+                .await
+                .unwrap_err()
+                .code,
+            FORBIDDEN
+        );
+        assert!(sessions.get_generation("member-owned").await.is_none());
+        admin
+            .handle_session_new_for_test(&json!({
+                "agent_alias":"test-agent", "session_id":"admin-owned",
+            }))
+            .await
+            .expect("an administrator can recover their own durable session");
+        assert_eq!(
+            backend
+                .get_session_metadata("rpc_member-owned")
+                .unwrap()
+                .principal_id
+                .as_deref(),
+            Some("user:bob")
+        );
+        assert_eq!(
+            backend
+                .get_session_metadata("rpc_admin-owned")
+                .unwrap()
+                .principal_id
+                .as_deref(),
+            Some("user:alice")
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_chat_restore_trim_rechecks_owner_and_authority_before_writing() {
+        for change in ["unchanged", "revoke", "owner", "delete"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = two_user_config(&tmp);
+            config.agents.get_mut("test-agent").unwrap().runtime_profile = "default".into();
+            config.runtime_profiles.insert(
+                "default".into(),
+                zeroclaw_config::schema::RuntimeProfileConfig {
+                    max_history_messages: Some(2),
+                    ..Default::default()
+                },
+            );
+            let data_dir = config.data_dir.clone();
+            let (fixture, sessions, backend, _) =
+                make_persistence_test_dispatcher(config, &data_dir);
+            let sid = "restore-trim-race";
+            let key = format!("rpc_{sid}");
+            seed_remote_chat_restore(&fixture.ctx, 4242, sid).await;
+            let over_cap = vec![
+                ChatMessage::user("first request"),
+                ChatMessage::assistant("first answer"),
+                ChatMessage::user("second request"),
+                ChatMessage::assistant("second answer"),
+                ChatMessage::user("third request"),
+                ChatMessage::assistant("third answer"),
+            ];
+            backend
+                .replace_conversation_state(&key, &over_cap, false)
+                .unwrap();
+            sessions.remove(sid).await;
+            let remote = remote_chat_restore_peer(&fixture.ctx, 4242).await;
+            let (entered, release) = sessions.set_test_effect_pause("restore-trim");
+            let request = zeroclaw_spawn::spawn!(async move {
+                remote
+                    .handle_session_new_for_test(&json!({
+                        "agent_alias":"test-agent", "session_id":sid,
+                    }))
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            match change {
+                "revoke" => revoke_remote_chat_restore(&fixture.ctx),
+                "owner" => backend.set_session_principal(&key, "user:bob").unwrap(),
+                "delete" => {
+                    backend.delete_session(&key).unwrap();
+                }
+                _ => {}
+            }
+            let before = backend.try_load(&key).unwrap();
+            let breadcrumb = backend.get_session_trim_breadcrumb(&key).unwrap();
+            release.notify_one();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                result.is_ok(),
+                change == "unchanged",
+                "{change}: {result:?}"
+            );
+            assert_eq!(
+                sessions.get_generation(sid).await.is_some(),
+                change == "unchanged",
+                "{change}"
+            );
+            let after = backend.try_load(&key).unwrap();
+            if change == "unchanged" {
+                assert!(
+                    after.len() < over_cap.len(),
+                    "allowed restore must persist its trim"
+                );
+                assert!(
+                    !after
+                        .iter()
+                        .any(|message| message.content == "first request")
+                );
+                assert_eq!(
+                    backend.get_session_trim_breadcrumb(&key).unwrap(),
+                    Some(true)
+                );
+            } else {
+                assert_eq!(
+                    serde_json::to_value(after).unwrap(),
+                    serde_json::to_value(before).unwrap(),
+                    "{change}"
+                );
+                assert_eq!(
+                    backend.get_session_trim_breadcrumb(&key).unwrap(),
+                    breadcrumb,
+                    "{change}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_chat_restore_rechecks_admission_and_publication() {
+        for boundary in ["admission", "publication", "restore-publish"] {
+            for change in ["unchanged", "revoke", "owner", "delete"] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let config = two_user_config(&tmp);
+                let data_dir = config.data_dir.clone();
+                let (fixture, sessions, backend, _) =
+                    make_persistence_test_dispatcher(config, &data_dir);
+                let sid = "restore-race";
+                let key = format!("rpc_{sid}");
+                seed_remote_chat_restore(&fixture.ctx, 4242, sid).await;
+                sessions.remove(sid).await;
+                let remote = remote_chat_restore_peer(&fixture.ctx, 4242).await;
+                let (entered, release) = if boundary == "restore-publish" {
+                    sessions.set_test_effect_pause("restore-publish")
+                } else {
+                    (
+                        Arc::new(tokio::sync::Notify::new()),
+                        Arc::new(tokio::sync::Notify::new()),
+                    )
+                };
+                let admission = if boundary == "admission" {
+                    Some(sessions.session_queue.acquire(sid).await.unwrap())
+                } else if boundary == "publication" {
+                    *sessions.test_construction_publication_pause.lock().unwrap() =
+                        Some((entered.clone(), release.clone()));
+                    None
+                } else {
+                    None
+                };
+                let request = zeroclaw_spawn::spawn!(async move {
+                    remote
+                        .handle_session_new_for_test(
+                            &json!({"agent_alias":"test-agent", "session_id":sid}),
+                        )
+                        .await
+                });
+                if boundary == "admission" {
+                    wait_for_session_admission_waiter(&fixture.ctx, sid).await;
+                } else {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+                        .await
+                        .unwrap();
+                }
+                match change {
+                    "revoke" => revoke_remote_chat_restore(&fixture.ctx),
+                    "owner" => backend.set_session_principal(&key, "user:bob").unwrap(),
+                    "delete" => {
+                        backend.delete_session(&key).unwrap();
+                    }
+                    _ => {}
+                }
+                let before = backend.try_load(&key).unwrap();
+                drop(admission);
+                release.notify_one();
+                let result = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    result.is_ok(),
+                    change == "unchanged",
+                    "{boundary}/{change}: {result:?}"
+                );
+                assert_eq!(
+                    sessions.get_generation(sid).await.is_some(),
+                    change == "unchanged",
+                    "{boundary}/{change}"
+                );
+                assert_eq!(
+                    serde_json::to_value(backend.try_load(&key).unwrap()).unwrap(),
+                    serde_json::to_value(before).unwrap(),
+                    "{boundary}/{change}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn scoped_principals_sessions_are_isolated() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -25404,48 +26147,73 @@ mod tests {
     #[tokio::test]
     async fn configure_refuses_an_incarnation_replaced_under_the_lock() {
         use crate::rpc::types::ChatMode;
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = two_user_config(&tmp);
-        let data_dir = config.data_dir.clone();
-        let (fixture, sessions, _chat_backend, _acp_store) =
-            make_persistence_test_dispatcher(config, &data_dir);
-        let ctx = Arc::clone(&fixture.ctx);
-        install_live_session_owned_by(&sessions, "cfg", Some("user:alice"), ChatMode::Chat).await;
-        let alice = scoped_dispatcher(&ctx, 4242).await;
-        let lock = sessions
-            .lock_model_provider_update("cfg")
-            .await
-            .expect("the live session has an update lock");
-        let params = json!({"session_id": "cfg", "overrides": {"temperature": 0.2}});
-        let waiting = sessions.model_provider_update_waiting();
-        let operation = alice.handle_session_configure(&params);
-        let replace = async {
-            // Replace only once configure is parked on the update lock, after
-            // its generation capture; a fixed delay cannot promise that under
-            // parallel test load.
-            tokio::time::timeout(std::time::Duration::from_secs(5), waiting.notified())
+        for (owner, replace_session) in [
+            ("user:alice", false),
+            ("user:alice", true),
+            ("user:bob", true),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = two_user_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (fixture, sessions, _chat_backend, _acp_store) =
+                make_persistence_test_dispatcher(config, &data_dir);
+            let ctx = Arc::clone(&fixture.ctx);
+            install_live_session_owned_by(&sessions, "cfg", Some("user:alice"), ChatMode::Chat)
+                .await;
+            let alice = scoped_dispatcher(&ctx, 4242).await;
+            let lock = sessions
+                .lock_model_provider_update("cfg")
                 .await
-                .expect("configure must reach the provider update lock");
-            assert!(sessions.remove("cfg").await);
-            let successor =
-                install_live_session_owned_by(&sessions, "cfg", Some("user:bob"), ChatMode::Chat)
-                    .await;
-            drop(lock);
-            successor
-        };
-        let (result, successor) = tokio::join!(operation, replace);
-        let err = result.expect_err("a replaced session cannot be configured by the old owner");
-        assert_eq!(err.code, SESSION_NOT_FOUND, "{}", err.message);
-        assert!(err.message.contains("Session changed while queued"));
-        assert_eq!(sessions.get_generation("cfg").await, Some(successor));
-        assert_eq!(
-            sessions
-                .get_overrides("cfg")
-                .await
-                .and_then(|o| o.temperature),
-            None,
-            "bob's successor keeps its own overrides"
-        );
+                .expect("the live session has an update lock");
+            let params = json!({"session_id": "cfg", "overrides": {"temperature": 0.2}});
+            let operation = alice.handle_session_configure(&params);
+            let waiting = sessions.model_provider_update_waiting();
+            let replace = async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), waiting.notified())
+                    .await
+                    .expect("configure must wait at the provider-update lock");
+                let successor = if replace_session {
+                    assert!(sessions.remove("cfg").await);
+                    install_live_session_owned_by(&sessions, "cfg", Some(owner), ChatMode::Chat)
+                        .await
+                } else {
+                    sessions.get_generation("cfg").await.unwrap()
+                };
+                drop(lock);
+                successor
+            };
+            let (result, successor) = tokio::join!(operation, replace);
+            if !replace_session {
+                result.expect("the unchanged owner's configure must succeed after the same wait");
+            } else {
+                let err =
+                    result.expect_err("a replaced session cannot be configured by the old owner");
+                // The original incarnation was captured before the proven
+                // lock wait. Either replacement must first fail its generation
+                // fence, regardless of who owns the successor.
+                assert_eq!(err.code, SESSION_NOT_FOUND, "{}", err.message);
+                assert_eq!(err.message, "Session changed while queued");
+                if owner != "user:alice" {
+                    // A fresh request has not captured the old incarnation:
+                    // admission must instead hide the foreign session.
+                    let fresh = alice.handle_session_configure(&params).await.unwrap_err();
+                    assert_eq!(fresh.code, FORBIDDEN, "{}", fresh.message);
+                    assert_eq!(
+                        fresh.message,
+                        "Session not found or not owned by this principal"
+                    );
+                }
+            }
+            assert_eq!(sessions.get_generation("cfg").await, Some(successor));
+            assert_eq!(
+                sessions
+                    .get_overrides("cfg")
+                    .await
+                    .and_then(|o| o.temperature),
+                if replace_session { None } else { Some(0.2) },
+                "a successor keeps its own overrides; the unchanged owner's update succeeds"
+            );
+        }
     }
 
     /// The waits between configure's ownership check and its generation
@@ -46719,6 +47487,87 @@ mod tests {
     /// generation, enters the gated method, then the session is removed and
     /// recreation starts while the stale configure is paused. The stale work must be
     /// rejected and the successor must remain untouched.
+    #[tokio::test]
+    async fn session_configure_revoked_at_commit_changes_neither_overrides_nor_agent() {
+        for model_change in [false, true] {
+            for revoke in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let mut config = make_model_refresh_test_config(&tmp);
+                config.gateway.paired_tokens = vec!["zc_configure_test".into()];
+                let mut dispatcher = make_config_set_test_dispatcher(config);
+                dispatcher
+                    .handle_initialize(&json!({"auth_token":"zc_configure_test"}))
+                    .await
+                    .unwrap();
+                let sid = create_model_refresh_test_session(&dispatcher, &tmp).await;
+                let sessions = Arc::clone(&dispatcher.ctx.sessions);
+                let before_overrides = sessions
+                    .preview_overrides(&sid, &Default::default())
+                    .await
+                    .unwrap();
+                let before_model = model_name_for_session(&dispatcher, &sid).await;
+                let before_temperature = temperature_for_session(&dispatcher, &sid).await;
+                let (entered, release, _) = sessions.set_test_gated_op_pause();
+                let mut overrides = json!({"temperature":0.99});
+                if model_change {
+                    overrides["model_provider"] = json!("openai.test-provider");
+                    overrides["model"] = json!("configured-model");
+                }
+                let params = json!({"session_id":sid,"overrides":overrides});
+                let request = dispatcher.handle_session_configure(&params);
+                let change = async {
+                    entered.notified().await;
+                    if revoke {
+                        assert!(
+                            dispatcher
+                                .ctx
+                                .auth
+                                .pairing()
+                                .revoke_token("zc_configure_test")
+                        );
+                    }
+                    release.notify_one();
+                };
+                let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(request, change)
+                })
+                .await
+                .expect("configure reaches and leaves its final commit boundary");
+                sessions.clear_test_gated_op_pause();
+                if revoke {
+                    assert_eq!(result.unwrap_err().code, AUTH_REQUIRED);
+                    let after = sessions
+                        .preview_overrides(&sid, &Default::default())
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(after).unwrap(),
+                        serde_json::to_value(before_overrides).unwrap()
+                    );
+                    assert_eq!(
+                        model_name_for_session(&dispatcher, &sid).await,
+                        before_model
+                    );
+                    assert_eq!(
+                        temperature_for_session(&dispatcher, &sid).await,
+                        before_temperature
+                    );
+                } else {
+                    assert!(result.is_ok(), "{result:?}");
+                    assert_eq!(temperature_for_session(&dispatcher, &sid).await, Some(0.99));
+                    assert_eq!(
+                        model_name_for_session(&dispatcher, &sid).await,
+                        if model_change {
+                            "configured-model"
+                        } else {
+                            before_model.as_str()
+                        }
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn session_configure_stale_gen_replaced_during_provider_build() {
         let tmp = tempfile::TempDir::new().unwrap();

@@ -34,6 +34,21 @@ pub(crate) struct ModelProviderUpdate {
     pub multimodal_config: zeroclaw_config::schema::MultimodalConfig,
 }
 
+impl ModelProviderUpdate {
+    fn apply_to(self, agent: &mut Agent) {
+        agent.set_model_provider(self.model_provider);
+        agent.set_model_provider_name(self.model_provider_name);
+        agent.set_model_name(self.model_name);
+        agent.set_model_route_resolver(self.model_route_resolver);
+        agent.set_tool_dispatcher(self.tool_dispatcher);
+        agent.set_multimodal_config(self.multimodal_config);
+        agent.set_config_generation(self.config_generation);
+        if let Some(temperature) = self.temperature {
+            agent.set_temperature(temperature);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelCause {
@@ -645,10 +660,36 @@ impl SessionStore {
     pub(crate) async fn publish_prepared_authorized<G, E>(
         &self,
         id: String,
-        mut session: RpcSession,
+        session: RpcSession,
         expected_generation: Option<u64>,
         expected_access: Option<(u64, Option<&str>)>,
         authorize: impl FnOnce(&RpcSession) -> Result<G, E>,
+        failure: impl Fn(&'static str) -> E,
+    ) -> Result<(), E> {
+        self.publish_prepared_with_effect(
+            id,
+            session,
+            expected_generation,
+            expected_access,
+            |session, publish| {
+                let _authority = authorize(&session)?;
+                publish(session);
+                Ok(())
+            },
+            failure,
+        )
+        .await
+    }
+
+    /// Keep storage authorization around the publication itself when its
+    /// owner-read lock cannot be returned as an owned guard.
+    pub(crate) async fn publish_prepared_with_effect<E>(
+        &self,
+        id: String,
+        session: RpcSession,
+        expected_generation: Option<u64>,
+        expected_access: Option<(u64, Option<&str>)>,
+        effect: impl FnOnce(RpcSession, &mut dyn FnMut(RpcSession)) -> Result<(), E>,
         failure: impl Fn(&'static str) -> E,
     ) -> Result<(), E> {
         let mut sessions = self.sessions.lock().await;
@@ -669,14 +710,21 @@ impl SessionStore {
         if expected_generation.is_none() && sessions.len() >= self.max_sessions {
             return Err(failure("session limit reached"));
         }
-        let _authority = authorize(&session)?;
-        let generation = self
-            .session_generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            .wrapping_add(1);
-        session.generation = generation;
-        sessions.insert(id, session);
-        Ok(())
+        let mut published = false;
+        effect(session, &mut |mut session| {
+            let generation = self
+                .session_generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .wrapping_add(1);
+            session.generation = generation;
+            sessions.insert(id.clone(), session);
+            published = true;
+        })?;
+        if published {
+            Ok(())
+        } else {
+            Err(failure("session publication was not committed"))
+        }
     }
 
     /// Publish a rehydrated session and bind the admitted prompt's cancel
@@ -1449,6 +1497,51 @@ impl SessionStore {
         Some(overrides)
     }
 
+    /// Commit a prepared configure operation after the Agent and canonical
+    /// incarnation are locked. The caller's authority guard spans every
+    /// mutation; no await separates the override and provider publications.
+    pub(crate) async fn configure_authorized<G, E>(
+        &self,
+        id: &str,
+        generation: u64,
+        merged: SessionOverrides,
+        update: Option<ModelProviderUpdate>,
+        authorize: impl FnOnce(&RpcSession) -> Result<G, E>,
+    ) -> Result<Option<SessionOverrides>, E> {
+        let done = self.wait_test_gate().await;
+        let result = async {
+            let Some(agent) = self.get_agent(id).await else {
+                return Ok(None);
+            };
+            // Agent -> session map matches the other live effect boundaries.
+            let mut guard = agent.lock().await;
+            self.with_session_effect(id, |session| {
+                let Some(session) = session else {
+                    return Ok(None);
+                };
+                if session.generation != generation || !Arc::ptr_eq(&agent, &session.agent) {
+                    return Ok(None);
+                }
+                let _authority = authorize(session)?;
+                session.overrides = merged.clone();
+                if let Some(model) = &merged.model {
+                    guard.set_model_name(model.clone());
+                }
+                if merged.temperature.is_some() {
+                    guard.set_temperature(merged.temperature);
+                }
+                if let Some(update) = update {
+                    update.apply_to(&mut guard);
+                }
+                Ok(Some(merged))
+            })
+            .await
+        }
+        .await;
+        self.signal_test_gate_done(done);
+        result
+    }
+
     pub async fn preview_overrides(
         &self,
         id: &str,
@@ -1532,16 +1625,7 @@ impl SessionStore {
             }
         };
         let mut guard = agent.lock().await;
-        guard.set_model_provider(update.model_provider);
-        guard.set_model_provider_name(update.model_provider_name);
-        guard.set_model_name(update.model_name);
-        guard.set_model_route_resolver(update.model_route_resolver);
-        guard.set_tool_dispatcher(update.tool_dispatcher);
-        guard.set_multimodal_config(update.multimodal_config);
-        guard.set_config_generation(update.config_generation);
-        if let Some(t) = update.temperature {
-            guard.set_temperature(t);
-        }
+        update.apply_to(&mut guard);
         self.signal_test_gate_done(done);
         true
     }

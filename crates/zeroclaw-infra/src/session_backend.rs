@@ -348,6 +348,23 @@ pub trait SessionBackend: Send + Sync {
         Ok(true)
     }
 
+    /// Replace an existing transcript under its durable owner and current
+    /// authority guards. Unsupported stores must not fall back to an
+    /// unguarded rewrite when restoring an authenticated remote session.
+    fn replace_conversation_state_authorized(
+        &self,
+        _session_key: &str,
+        _messages: &[ChatMessage],
+        _breadcrumb_present: bool,
+        _expected_owner: &str,
+        _authorize: &SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<bool> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded conversation replacement unsupported",
+        ))
+    }
+
     fn set_session_context(
         &self,
         _session_key: &str,

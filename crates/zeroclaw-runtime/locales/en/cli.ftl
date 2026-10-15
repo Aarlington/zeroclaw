@@ -1459,7 +1459,11 @@ delegate-owned-background-unavailable = Background delegation and task managemen
 rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
 rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
+
+cli-sop-run-unavailable = SOP run unavailable in this session.
 rpc-cron-agent-principal-required = Agent cron jobs do not carry principal restrictions; only administrators may modify or trigger them.
+
+sop-rpc-run-admin-required = Global procedure run data requires an administrator; use the session-scoped SOP status tool for your own runs.
 cron-rpc-requested-agent-forbidden = The principal is not entitled to the requested agent.
 sop-store-busy = SOP storage is busy or unavailable; retry the request.
 sop-store-nonblocking-unavailable = SOP storage cannot provide immediate access; this request was refused.
