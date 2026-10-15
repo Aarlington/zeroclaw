@@ -4,7 +4,7 @@ from pathlib import Path
 import re
 import subprocess
 
-PRODUCTION = '754cbb2a859efff35371300899e019c789703cc6'
+PRODUCTION = '0494b14bd9a25471ae5c2d0c27ee224554a59524'
 BASELINE = 'c2ad7a8e62d22accbe13387927b8f6869ed46baa'
 WORKSHOP = Path('crates/zeroclaw-runtime/src/tools/sop_workshop.rs')
 ALIAS = Path('crates/zeroclaw-runtime/src/tools/skill_tool.rs')
@@ -23,12 +23,35 @@ TESTS = [
     'tools::delegate::tests::withheld_session_tools_do_not_reach_an_independent_grandchild',
     'rpc::dispatch::tests::principal_native_history_uses_final_admission_and_monotonic_withholding',
     'rpc::dispatch::tests::demoted_principal_loses_session_data_tools_at_its_next_prompt',
+    'session_sqlite::tests::with_session_owner_blocks_other_connections_until_effect_finishes',
+    'rpc::session::tests::session_mode_replacement_rejects_owner_change_without_generation_change',
+    'rpc::session::tests::session_mode_replacement_publication_is_capacity_neutral_and_fenced',
+    'rpc::dispatch::tests::remote_chat_restore_trim_rechecks_owner_and_authority_before_writing',
+    'rpc::dispatch::tests::session_new_persists_a_restore_time_trim_before_going_live_for_chat_mode',
+    'rpc::dispatch::tests::remote_chat_restore_administrator_still_needs_durable_ownership',
+    'rpc::dispatch::tests::remote_chat_restore_reopens_owned_nonempty_history',
+    'rpc::dispatch::tests::remote_chat_restore_refuses_unproven_or_ambiguous_ownership',
+    'rpc::dispatch::tests::remote_chat_restore_cannot_take_another_live_tui_binding',
+    'rpc::dispatch::tests::remote_chat_restore_rechecks_admission_and_publication',
+    'rpc::dispatch::tests::remote_resume_admission_wait_uses_current_principal',
+    'rpc::dispatch::tests::fast_remote_resume_rejects_owner_changed_after_authorization',
+    'rpc::dispatch::tests::remote_cross_mode_resume_preserves_a_rehydrated_successor',
+    'rpc::dispatch::tests::forwarded_environment_remote_resume_and_prompt_are_refused_without_mutation',
+    'rpc::dispatch::tests::remote_resume_rechecks_channels_at_final_agent_install',
+    'security::auth_provider::enrollment::tests::enrollment_basic_credentials_round_trip_on_every_endpoint',
+    'rpc::tui_identity::tests::config_signing_key_is_used_when_runtime_data_lives_elsewhere',
+    'rpc::dispatch::tests::scoped_principals_sessions_are_isolated',
+    'rpc::dispatch::tests::session_configure_revoked_at_commit_changes_neither_overrides_nor_agent',
+    'tools::delegate::tests::factory_delegate_inherits_private_memory_owner_before_any_action',
+    'rpc::dispatch::tests::cron_patch_rechecks_authority_and_row_after_sqlite_writer_wait',
+    'rpc::dispatch::tests::sop_run_and_decide_are_refused_after_admin_demotion',
 ]
 
 
 def run(label, test, failure=None):
+    package = 'zeroclaw-infra' if test.startswith('session_sqlite::') else 'zeroclaw-runtime'
     result = subprocess.run(
-        ['cargo', 'test', '--locked', '-p', 'zeroclaw-runtime', '--lib', test, '--', '--exact'],
+        ['cargo', 'test', '--locked', '-p', package, '--lib', test, '--', '--exact'],
         capture_output=True, text=True, timeout=1800,
     )
     output = result.stdout + result.stderr

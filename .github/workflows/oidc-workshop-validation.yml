@@ -42,14 +42,14 @@ jobs:
         run: |
           mkdir -p web/dist
           touch web/dist/.gitkeep
-          git diff --exit-code 754cbb2a859efff35371300899e019c789703cc6 -- . \
+          git diff --exit-code 0494b14bd9a25471ae5c2d0c27ee224554a59524 -- . \
             ':(exclude).github/workflows/oidc-workshop-validation.yml' \
             ':(exclude)tests/manual/oidc_workshop_regressions.py'
           cargo fmt --all -- --check
       - name: Require old-code and alias failures then exact regression passes
         run: python3 tests/manual/oidc_workshop_regressions.py
-      - name: Strict runtime Clippy
-        run: cargo clippy --locked -p zeroclaw-runtime --lib --tests -- -D warnings
+      - name: Strict runtime and storage Clippy
+        run: cargo clippy --locked -p zeroclaw-runtime -p zeroclaw-infra --lib --tests -- -D warnings
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
