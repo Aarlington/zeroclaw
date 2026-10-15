@@ -1,6 +1,7 @@
 name: OIDC SOP workshop permission validation
 
 on:
+  workflow_dispatch:
   push:
     branches: [codex/oidc-sop-workshop-validation-20261014]
 
