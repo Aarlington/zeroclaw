@@ -8861,6 +8861,13 @@ impl RpcDispatcher {
                                 "Session not found or not owned by this principal",
                             ));
                         }
+                        // A trusted-local resume rebinds the TUI owner without a
+                        // new generation, so the remote owner is rechecked here too.
+                        if self.access_policy == RpcAccessPolicy::RemoteSessionOwner
+                            && live.is_none_or(|s| s.owner_tui_id != self.tui_id)
+                        {
+                            return Err(self.stale_session_incarnation_error());
+                        }
                         let owner = record.as_ref().and_then(|r| r.owner.as_deref());
                         let mut commit = |actual: Option<&str>| -> anyhow::Result<()> {
                             let _authority =
