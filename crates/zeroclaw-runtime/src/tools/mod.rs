@@ -6069,4 +6069,32 @@ mod wrapper_spec_forwarding_tests {
              schema survives; the trait default deep-clones it every call"
         );
     }
+
+    #[test]
+    fn arc_delegating_tool_forwards_builtin_target_identity() {
+        let spec: crate::skills::SkillTool = serde_json::from_value(serde_json::json!({
+            "name": "use", "description": "fixture", "kind": "builtin",
+            "target": "arc_schema_tool"
+        }))
+        .unwrap();
+        let alias: Arc<dyn Tool> = Arc::new(SkillBuiltinTool::new(
+            "bridge",
+            &spec,
+            Arc::new(ArcSchemaTool::new()),
+            HashMap::new(),
+        ));
+        let boxed = ArcDelegatingTool::boxed(Arc::clone(&alias));
+
+        assert_eq!(
+            boxed.builtin_target_name(),
+            Some("arc_schema_tool"),
+            "memory routing finds aliases by their builtin target, so the \
+             wrapper must report the alias's target"
+        );
+        let rebuilt = boxed
+            .with_builtin_target(Arc::new(ArcSchemaTool::new()))
+            .expect("the wrapper must let routing rebuild the alias");
+        assert_eq!(rebuilt.name(), alias.name());
+        assert_eq!(rebuilt.builtin_target_name(), Some("arc_schema_tool"));
+    }
 }
