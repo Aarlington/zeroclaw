@@ -2184,7 +2184,8 @@ mod tests {
         assert!(assembled.registry.hidden_builtin_names().is_empty());
         assembled
             .registry
-            .rebind_memory_tools(Arc::clone(&current), Arc::clone(&security));
+            .rebind_memory_tools(Arc::clone(&current), Arc::clone(&security))
+            .unwrap();
         assert!(assembled.registry.hidden_builtin_names().is_empty());
         assert!(
             assembled
