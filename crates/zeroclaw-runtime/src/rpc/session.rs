@@ -44,6 +44,9 @@ pub enum CancelCause {
     ClientRpc,
     /// Explicit `session/kill` from the dashboard or admin RPC.
     AdminKill,
+    /// `session/abort` from an operator connection that need not own the
+    /// session's client.
+    OperatorAbort,
     /// The session was explicitly removed/torn down while a turn was live.
     SessionRemoved,
     /// A channel configuration generation was retired while a turn was live.
@@ -59,11 +62,22 @@ impl CancelCause {
         match self {
             CancelCause::ClientRpc => "client_rpc",
             CancelCause::AdminKill => "admin_kill",
+            CancelCause::OperatorAbort => "operator_abort",
             CancelCause::SessionRemoved => "session_removed",
             CancelCause::ChannelGeneration => "channel_generation",
             CancelCause::ConnectionClosed => "connection_closed",
         }
     }
+}
+
+/// Result of [`SessionStore::steer_session_for_generation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteerOutcome {
+    Accepted,
+    /// The running turn's steering queue is full.
+    QueueFull,
+    /// No turn is running, or it stopped accepting steering.
+    NoActiveTurn,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -91,6 +105,9 @@ pub struct RpcSession {
     /// The same immutable map the Agent's shell tool executes with. Sharing
     /// it lets admission inspect the incarnation without locking an active turn.
     forwarded_environment: Option<crate::tools::ForwardedEnvironment>,
+    /// Share the Agent's canonical channel map so steering can recheck live
+    /// capabilities without acquiring the Agent mutex held by its turn.
+    reaction_channels: crate::tools::PerToolChannelHandle,
     /// Orders provider refreshes and configuration within this session.
     model_provider_update: Arc<Mutex<()>>,
     pub created_at: Instant,
@@ -207,6 +224,7 @@ impl RpcSession {
     ) -> Self {
         Self {
             forwarded_environment: agent.forwarded_environment(),
+            reaction_channels: Arc::clone(&agent.channel_handles().reaction),
             agent: Arc::new(Mutex::new(agent)),
             lifecycle_lease: None,
             model_provider_update: Arc::new(Mutex::new(())),
@@ -291,14 +309,22 @@ type CancelTokenEntry = (u64, Option<u64>, tokio_util::sync::CancellationToken);
 type RehydrateSeedPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
 pub struct SessionStore {
-    #[cfg(test)]
-    test_effect_pauses: std::sync::Mutex<HashMap<&'static str, RehydrateSeedPause>>,
     sessions: Mutex<HashMap<String, RpcSession>>,
     #[cfg(test)]
     model_provider_update_waiting: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    agent_lock_waiting: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    pending_generation_waiting: Arc<tokio::sync::Notify>,
     cancel_tokens: std::sync::Mutex<HashMap<String, CancelTokenEntry>>,
     cancel_generation: std::sync::atomic::AtomicU64,
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
+    /// Steering sender of each session's running turn, keyed by the same
+    /// generation as its cancel token so the turn's exit removes exactly its
+    /// own entry.
+    steering: std::sync::Mutex<
+        HashMap<String, (u64, tokio::sync::mpsc::Sender<crate::agent::SteeringInput>)>,
+    >,
     cancel_tokens_changed: Arc<tokio::sync::Notify>,
     max_sessions: usize,
     pub session_queue: Arc<SessionActorQueue>,
@@ -311,12 +337,20 @@ pub struct SessionStore {
     /// `release`, then signal `done` on exit, letting a regression test
     /// atomically replace the session and wait for completion.
     #[cfg(test)]
+    test_effect_pauses: std::sync::Mutex<HashMap<&'static str, RehydrateSeedPause>>,
+    #[cfg(test)]
     test_gated_op_pause: std::sync::Mutex<Option<GatedOpPause>>,
     /// Test-only pause immediately after a prompt registers its cancellation
     /// token. Removal-race tests use this to issue close/kill/delete while the
     /// prompt owns admission but before any fallible setup or provider work.
     #[cfg(test)]
     test_prompt_registration_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    #[cfg(test)]
+    test_prompt_execution_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    /// Test-only pause right after `session/steer` or `session/abort` has
+    /// taken its identity snapshot and before it acts. Fires once.
+    #[cfg(test)]
+    test_control_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
     #[cfg(test)]
     pub(crate) rehydration_publication_waiting: tokio::sync::Notify,
     #[cfg(test)]
@@ -395,17 +429,28 @@ impl SessionStore {
             sessions: Mutex::new(HashMap::new()),
             #[cfg(test)]
             model_provider_update_waiting: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            agent_lock_waiting: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            pending_generation_waiting: Arc::new(tokio::sync::Notify::new()),
             cancel_tokens: std::sync::Mutex::new(HashMap::new()),
             cancel_generation: std::sync::atomic::AtomicU64::new(0),
             cancel_causes: std::sync::Mutex::new(HashMap::new()),
+            steering: std::sync::Mutex::new(HashMap::new()),
             cancel_tokens_changed: Arc::new(tokio::sync::Notify::new()),
             max_sessions,
             session_queue,
             session_generation: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
+            test_effect_pauses: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
             test_gated_op_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_registration_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_prompt_execution_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_control_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             rehydration_publication_waiting: tokio::sync::Notify::new(),
             #[cfg(test)]
@@ -418,8 +463,6 @@ impl SessionStore {
             test_removal_signal_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_admission_hook: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            test_effect_pauses: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             test_rehydrate_seed_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -556,28 +599,49 @@ impl SessionStore {
     pub(crate) async fn publish_prepared_with_access(
         &self,
         id: String,
-        mut session: RpcSession,
+        session: RpcSession,
         expected_generation: Option<u64>,
         expected_access: Option<(u64, Option<&str>)>,
     ) -> Result<(), &'static str> {
+        self.publish_prepared_authorized(
+            id,
+            session,
+            expected_generation,
+            expected_access,
+            |_| Ok(()),
+            |message| message,
+        )
+        .await
+    }
+
+    pub(crate) async fn publish_prepared_authorized<G, E>(
+        &self,
+        id: String,
+        mut session: RpcSession,
+        expected_generation: Option<u64>,
+        expected_access: Option<(u64, Option<&str>)>,
+        authorize: impl FnOnce(&RpcSession) -> Result<G, E>,
+        failure: impl Fn(&'static str) -> E,
+    ) -> Result<(), E> {
         let mut sessions = self.sessions.lock().await;
         if let Some((generation, owner)) = expected_access
             && !sessions.get(&id).is_some_and(|current| {
                 current.generation == generation && current.owner_tui_id.as_deref() == owner
             })
         {
-            return Err("session changed during preparation");
+            return Err(failure("session changed during preparation"));
         }
         if sessions.get(&id).map(|s| s.generation) != expected_generation {
-            return Err(if expected_generation.is_some() {
+            return Err(failure(if expected_generation.is_some() {
                 "session changed during preparation"
             } else {
                 "session already exists"
-            });
+            }));
         }
         if expected_generation.is_none() && sessions.len() >= self.max_sessions {
-            return Err("session limit reached");
+            return Err(failure("session limit reached"));
         }
+        let _authority = authorize(&session)?;
         let generation = self
             .session_generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -592,25 +656,48 @@ impl SessionStore {
     pub async fn insert_for_prompt(
         &self,
         id: String,
-        mut session: RpcSession,
+        session: RpcSession,
         cancel_generation: u64,
     ) -> Result<(), &'static str> {
+        self.insert_for_prompt_authorized(
+            id,
+            session,
+            cancel_generation,
+            |_| Ok(()),
+            |message| message,
+        )
+        .await
+    }
+
+    pub async fn insert_for_prompt_authorized<G, E>(
+        &self,
+        id: String,
+        mut session: RpcSession,
+        cancel_generation: u64,
+        authorize: impl FnOnce(&RpcSession) -> Result<G, E>,
+        failure: impl Fn(&'static str) -> E,
+    ) -> Result<(), E> {
         let mut sessions = self.sessions.lock().await;
         if sessions.len() >= self.max_sessions {
-            return Err("session limit reached");
+            return Err(failure("session limit reached"));
         }
+        if sessions.contains_key(&id) {
+            return Err(failure("session already exists"));
+        }
+        let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((registered_generation, registered_session_generation, _)) = tokens.get_mut(&id)
+        else {
+            return Err(failure("prompt cancellation registration missing"));
+        };
+        if *registered_generation != cancel_generation {
+            return Err(failure("prompt cancellation registration changed"));
+        }
+        let _authority = authorize(&session)?;
         let session_generation = self
             .session_generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             .wrapping_add(1);
-        let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((registered_generation, registered_session_generation, _)) = tokens.get_mut(&id)
-        else {
-            return Err("prompt cancellation registration missing");
-        };
-        if *registered_generation != cancel_generation {
-            return Err("prompt cancellation registration changed");
-        }
+
         *registered_session_generation = Some(session_generation);
         session.generation = session_generation;
         sessions.insert(id, session);
@@ -659,13 +746,15 @@ impl SessionStore {
     /// be adopted. A scoped mismatch is reported as absent, never as a
     /// distinguishable denial.
     ///
-    /// `authorize` then judges the record's agent alias, workspace and
-    /// forwarded environment before
-    /// anything changes, under the same lock that guards the claim, so a
-    /// caller it refuses neither takes ownership nor observes a session that
-    /// was swapped in after the check. Its refusal comes back as `Ok(Some(Err))`.
-    /// Ownership and binding are both required: one says the session is the
-    /// caller's, the other that the caller may still run it.
+    /// `authorize` then judges the record's agent alias, workspace, forwarded
+    /// environment and owning principal before anything changes, under the
+    /// same lock that guards the claim, so a caller it refuses neither takes
+    /// ownership nor observes a session that was swapped in after the check.
+    /// Its refusal comes back as `Ok(Some(Err))`. Ownership and binding are
+    /// both required: one says the session is the caller's, the other that
+    /// the caller may still run it. Receiving the owner lets a caller that
+    /// resolves its authority inside `authorize` judge ownership by that same
+    /// resolution, not only by an `expected_owner` computed before the lock.
     pub(crate) async fn resume_existing_authorized<E, G>(
         &self,
         id: &str,
@@ -751,6 +840,29 @@ impl SessionStore {
         })
     }
 
+    /// Read execution facts and its live channel map from the authorized incarnation,
+    /// without acquiring the Agent mutex held by its running turn.
+    pub(crate) async fn steering_binding_for_generation(
+        &self,
+        id: &str,
+        generation: u64,
+        owner: Option<&str>,
+    ) -> Option<(String, String, bool, crate::tools::PerToolChannelHandle)> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions
+            .get(id)
+            .filter(|s| s.generation == generation && s.owner_principal_id.as_deref() == owner)?;
+        Some((
+            session.agent_alias.clone(),
+            session.workspace_dir.clone(),
+            session
+                .forwarded_environment
+                .as_ref()
+                .is_some_and(|env| !env.is_empty()),
+            Arc::clone(&session.reaction_channels),
+        ))
+    }
+
     pub(crate) async fn lock_model_provider_update(
         &self,
         id: &str,
@@ -789,6 +901,51 @@ impl SessionStore {
     #[cfg(test)]
     pub(crate) fn model_provider_update_waiting(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.model_provider_update_waiting)
+    }
+
+    /// Lock a session's Agent for a prompt's final authorization.
+    #[cfg(not(test))]
+    pub(crate) async fn lock_agent_for_prompt<'a>(
+        &self,
+        agent: &'a Mutex<Agent>,
+    ) -> tokio::sync::MutexGuard<'a, Agent> {
+        agent.lock().await
+    }
+
+    /// Lock a session's Agent for a prompt's final authorization. The first
+    /// time the lock is contended it notifies [`Self::agent_lock_waiting`],
+    /// so a test can change policy while the prompt waits here.
+    #[cfg(test)]
+    pub(crate) async fn lock_agent_for_prompt<'a>(
+        &self,
+        agent: &'a Mutex<Agent>,
+    ) -> tokio::sync::MutexGuard<'a, Agent> {
+        let waiting = Arc::clone(&self.agent_lock_waiting);
+        let mut lock = std::pin::pin!(agent.lock());
+        let mut notified = false;
+        std::future::poll_fn(
+            move |cx| match std::future::Future::poll(lock.as_mut(), cx) {
+                std::task::Poll::Pending => {
+                    if !notified {
+                        waiting.notify_one();
+                        notified = true;
+                    }
+                    std::task::Poll::Pending
+                }
+                ready => ready,
+            },
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_lock_waiting(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.agent_lock_waiting)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_generation_waiting(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.pending_generation_waiting)
     }
 
     /// Await confirmation of a session's provisional binding, waiting at most
@@ -849,6 +1006,8 @@ impl SessionStore {
             Some(_) => {}
         }
         drop(current);
+        #[cfg(test)]
+        self.pending_generation_waiting.notify_one();
         tokio::time::timeout(timeout, notified)
             .await
             .map_err(|_| WaitForProviderUpdateError::Timeout)?;
@@ -934,29 +1093,14 @@ impl SessionStore {
             .map_err(|_| WaitForProviderUpdateError::Timeout)
     }
 
-    /// Acquire Agent before map, then refuse a replaced incarnation.
-    /// Never retain the map while waiting for an Agent needed by admission.
-    async fn with_current_agent<R>(
-        &self,
-        id: &str,
-        effect: impl FnOnce(&mut Agent) -> R,
-    ) -> Option<R> {
-        let (generation, agent) = {
-            let sessions = self.sessions.lock().await;
-            let session = sessions.get(id)?;
-            (session.generation, Arc::clone(&session.agent))
-        };
-        let mut guard = agent.lock().await;
-        let sessions = self.sessions.lock().await;
-        let session = sessions.get(id)?;
-        if session.generation != generation || !Arc::ptr_eq(&session.agent, &agent) {
-            return None;
-        }
-        Some(effect(&mut guard))
-    }
-
-    /// Hold the canonical incarnation for a synchronous effect. Acquire Agent
-    /// first; the callback must not await or recursively acquire the map.
+    /// Return the current generation for the session with `id`, or `None` if
+    /// the session is absent. Provider-refresh callers capture this value
+    /// before building a provider box and thread it through
+    /// `apply_model_provider` so stale work targeting a replaced session
+    /// becomes a no-op.
+    /// Run a short synchronous effect while the canonical incarnation is held.
+    /// Acquire Agent locks before entering; the callback must not await or
+    /// recursively acquire the session map.
     pub(crate) async fn with_session_effect<R>(
         &self,
         id: &str,
@@ -966,66 +1110,6 @@ impl SessionStore {
         effect(sessions.get_mut(id))
     }
 
-    pub(crate) async fn remove_generation_authorized<G, E>(
-        &self,
-        id: &str,
-        generation: u64,
-        authorize: impl FnOnce(Option<&str>) -> Result<G, E>,
-    ) -> Result<bool, E> {
-        let mut sessions = self.sessions.lock().await;
-        let Some(session) = sessions.get(id).filter(|s| s.generation == generation) else {
-            return Ok(false);
-        };
-        let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
-        let mut causes = self.cancel_causes.lock().unwrap_or_else(|e| e.into_inner());
-        let _authority = authorize(session.owner_principal_id.as_deref())?;
-        if tokens
-            .get(id)
-            .is_some_and(|(_, bound, _)| *bound == Some(generation))
-            && let Some((_, _, token)) = tokens.remove(id)
-        {
-            causes.insert(id.to_string(), CancelCause::SessionRemoved);
-            token.cancel();
-        }
-        let pending = sessions
-            .remove(id)
-            .and_then(|session| session.pending_generation);
-        if let Some(notify) = pending {
-            notify.notify_waiters();
-        }
-        Ok(true)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_test_effect_pause(&self, boundary: &'static str) -> RehydrateSeedPause {
-        let pause = (
-            Arc::new(tokio::sync::Notify::new()),
-            Arc::new(tokio::sync::Notify::new()),
-        );
-        self.test_effect_pauses
-            .lock()
-            .unwrap()
-            .insert(boundary, pause.clone());
-        pause
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn wait_test_effect_pause(&self, boundary: &'static str) {
-        let pause = self.test_effect_pauses.lock().unwrap().remove(boundary);
-        if let Some((arrived, release)) = pause {
-            arrived.notify_one();
-            release.notified().await;
-        }
-    }
-
-    #[cfg(not(test))]
-    pub(crate) async fn wait_test_effect_pause(&self, _boundary: &'static str) {}
-
-    /// Return the current generation for the session with `id`, or `None` if
-    /// the session is absent. Provider-refresh callers capture this value
-    /// before building a provider box and thread it through
-    /// `apply_model_provider` so stale work targeting a replaced session
-    /// becomes a no-op.
     pub async fn get_generation(&self, id: &str) -> Option<u64> {
         self.sessions.lock().await.get(id).map(|s| s.generation)
     }
@@ -1161,6 +1245,31 @@ impl SessionStore {
     #[inline(always)]
     pub(crate) async fn wait_test_rehydrate_seed_pause(&self) {}
 
+    #[cfg(test)]
+    pub(crate) fn set_test_effect_pause(&self, boundary: &'static str) -> RehydrateSeedPause {
+        let pause = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        self.test_effect_pauses
+            .lock()
+            .unwrap()
+            .insert(boundary, pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_test_effect_pause(&self, boundary: &'static str) {
+        let pause = self.test_effect_pauses.lock().unwrap().remove(boundary);
+        if let Some((arrived, release)) = pause {
+            arrived.notify_one();
+            release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    pub(crate) async fn wait_test_effect_pause(&self, _boundary: &'static str) {}
+
     /// Arm a test-only pause for the next incarnation-bound upload commit,
     /// before it takes the session map. Returns `(arrived, release)`.
     #[cfg(test)]
@@ -1236,6 +1345,7 @@ impl SessionStore {
         id: &str,
         patch: SessionOverrides,
     ) -> Option<SessionOverrides> {
+        let explicit_model_selection = patch.model.is_some() || patch.model_provider.is_some();
         let merged = self.preview_overrides(id, &patch).await?;
         let mut sessions = self.sessions.lock().await;
         let session = sessions.get_mut(id)?;
@@ -1247,6 +1357,9 @@ impl SessionStore {
         let mut guard = agent.lock().await;
         if let Some(ref m) = overrides.model {
             guard.set_model_name(m.clone());
+        }
+        if explicit_model_selection {
+            guard.disable_automatic_model_routing();
         }
         if overrides.temperature.is_some() {
             guard.set_temperature(overrides.temperature);
@@ -1264,6 +1377,7 @@ impl SessionStore {
         generation: u64,
         patch: SessionOverrides,
     ) -> Option<SessionOverrides> {
+        let explicit_model_selection = patch.model.is_some() || patch.model_provider.is_some();
         let done = self.wait_test_gate().await;
         let merged = match self.preview_overrides(id, &patch).await {
             Some(merged) => merged,
@@ -1292,6 +1406,9 @@ impl SessionStore {
         let mut guard = agent.lock().await;
         if let Some(ref m) = overrides.model {
             guard.set_model_name(m.clone());
+        }
+        if explicit_model_selection {
+            guard.disable_automatic_model_routing();
         }
         if overrides.temperature.is_some() {
             guard.set_temperature(overrides.temperature);
@@ -1515,17 +1632,35 @@ impl SessionStore {
         let _ = self.seed_history_with_event(id, msgs).await;
     }
 
-    /// Whether the session's in-memory agent currently believes its history
-    /// starts with the synthetic trim breadcrumb. `None` if the session is
-    /// unknown. Callers persist this alongside the transcript so a later
-    /// restore never has to infer provenance from message text.
+    /// Acquire the Agent before the map, then verify the captured incarnation.
+    /// Never retain the map while waiting for an Agent: prompt admission and
+    /// deferred channel installation need that same map while holding the Agent.
+    async fn with_current_agent<R>(
+        &self,
+        id: &str,
+        effect: impl FnOnce(&mut Agent) -> R,
+    ) -> Option<R> {
+        let (generation, agent) = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(id)?;
+            (session.generation, Arc::clone(&session.agent))
+        };
+        let mut guard = agent.lock().await;
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(id)?;
+        if session.generation != generation || !Arc::ptr_eq(&session.agent, &agent) {
+            return None;
+        }
+        Some(effect(&mut guard))
+    }
+
+    /// Whether the current incarnation starts with the synthetic trim breadcrumb.
     pub async fn history_has_trim_breadcrumb(&self, id: &str) -> Option<bool> {
         self.with_current_agent(id, |agent| agent.history_has_trim_breadcrumb())
             .await
     }
 
-    /// Restore the session's own canonical breadcrumb-provenance record onto
-    /// its in-memory agent. No-op if the session is unknown.
+    /// Restore canonical breadcrumb provenance, unless the incarnation changed.
     pub async fn set_history_has_trim_breadcrumb(&self, id: &str, present: bool) {
         self.with_current_agent(id, |agent| agent.set_history_has_trim_breadcrumb(present))
             .await;
@@ -1626,32 +1761,43 @@ impl SessionStore {
     /// caller authorized its predecessor is left untouched, and the caller
     /// learns the removal did not happen.
     pub async fn remove_generation(&self, id: &str, generation: u64) -> bool {
-        let mut sessions = self.sessions.lock().await;
-        if sessions.get(id).is_none_or(|s| s.generation != generation) {
-            return false;
+        match self
+            .remove_generation_authorized(id, generation, |_| Ok::<_, std::convert::Infallible>(()))
+            .await
+        {
+            Ok(result) => result,
+            Err(never) => match never {},
         }
+    }
+
+    pub(crate) async fn remove_generation_authorized<G, E>(
+        &self,
+        id: &str,
+        generation: u64,
+        authorize: impl FnOnce(Option<&str>) -> Result<G, E>,
+    ) -> Result<bool, E> {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get(id).filter(|s| s.generation == generation) else {
+            return Ok(false);
+        };
         let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
-        let token = if tokens
+        let mut causes = self.cancel_causes.lock().unwrap_or_else(|e| e.into_inner());
+        let _authority = authorize(session.owner_principal_id.as_deref())?;
+        if tokens
             .get(id)
             .is_some_and(|(_, bound, _)| *bound == Some(generation))
+            && let Some((_, _, token)) = tokens.remove(id)
         {
-            tokens.remove(id).map(|(_, _, token)| token)
-        } else {
-            None
-        };
-        drop(tokens);
-        if let Some(token) = token {
-            self.record_cancel_cause(id, CancelCause::SessionRemoved);
+            causes.insert(id.to_string(), CancelCause::SessionRemoved);
             token.cancel();
         }
         let pending = sessions
             .remove(id)
             .and_then(|session| session.pending_generation);
-        drop(sessions);
         if let Some(notify) = pending {
             notify.notify_waiters();
         }
-        true
+        Ok(true)
     }
 
     pub async fn evict_same_mode_sibling(
@@ -1725,6 +1871,16 @@ impl SessionStore {
 
     pub async fn list_ids(&self) -> Vec<String> {
         self.sessions.lock().await.keys().cloned().collect()
+    }
+
+    /// Keep incarnation retirement and its ledger projection under the same
+    /// map guard. The closure must not await or acquire this map again.
+    pub(crate) async fn with_current_sessions<R>(
+        &self,
+        read: impl FnOnce(&HashMap<String, RpcSession>) -> R,
+    ) -> R {
+        let sessions = self.sessions.lock().await;
+        read(&sessions)
     }
 
     pub async fn list_ids_for_owner(&self, owner_tui_id: &str) -> Vec<String> {
@@ -1843,6 +1999,31 @@ impl SessionStore {
     #[inline(always)]
     pub(crate) async fn wait_test_prompt_registration_pause(&self) {}
 
+    /// Park a prompt once, right after its final authorization under the
+    /// Agent lock and before any effect it gates: the running state, an ACP
+    /// turn checkpoint, and the hand-off to the execution task.
+    #[cfg(test)]
+    pub(crate) async fn wait_test_prompt_execution_pause(&self) {
+        let pause = self.test_prompt_execution_pause.lock().unwrap().take();
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_prompt_execution_pause(&self) {}
+
+    #[cfg(test)]
+    pub(crate) fn set_test_prompt_execution_pause(&self) -> PromptRegistrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_prompt_execution_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_test_prompt_registration_pause(&self) -> PromptRegistrationPause {
         let entered = Arc::new(tokio::sync::Notify::new());
@@ -1919,6 +2100,28 @@ impl SessionStore {
     #[inline(always)]
     pub(crate) fn notify_test_removal_signal_attempted(&self) {}
 
+    #[cfg(test)]
+    pub(crate) async fn wait_test_control_pause(&self) {
+        let Some((entered, release)) = self.test_control_pause.lock().unwrap().take() else {
+            return;
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_control_pause(&self) {}
+
+    #[cfg(test)]
+    pub(crate) fn set_test_control_pause(&self) -> PromptRegistrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_control_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
     pub fn remove_cancel_token(&self, id: &str, generation: u64) {
         let removed = {
             let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
@@ -1932,6 +2135,12 @@ impl SessionStore {
         };
         if !removed {
             return;
+        }
+        {
+            let mut steering = self.steering.lock().unwrap_or_else(|e| e.into_inner());
+            if steering.get(id).is_some_and(|(g, _)| *g == generation) {
+                steering.remove(id);
+            }
         }
         self.cancel_causes
             .lock()
@@ -1972,6 +2181,19 @@ impl SessionStore {
 
     pub fn cancel_session(&self, id: &str) -> bool {
         self.signal_cancellation(id, CancelCause::ClientRpc)
+    }
+
+    /// Interrupt the session's running turn on an operator's behalf. Unlike
+    /// [`Self::cancel_session`] it is not tied to the owning client.
+    pub fn abort_session(&self, id: &str) -> bool {
+        self.signal_cancellation(id, CancelCause::OperatorAbort)
+    }
+
+    /// [`Self::abort_session`] bound to the live session incarnation the
+    /// caller was authorized against: a turn belonging to any other
+    /// incarnation under the same id (a same-id successor) is left running.
+    pub fn abort_session_for_generation(&self, id: &str, session_generation: Option<u64>) -> bool {
+        self.signal_cancellation_for_generation(id, session_generation, CancelCause::OperatorAbort)
     }
 
     /// Signal only the session incarnation observed by the caller.
@@ -2050,6 +2272,42 @@ impl SessionStore {
             .unwrap_or(false)
     }
 
+    /// Authorize cancellation after the incarnation and cancellation locks.
+    pub(crate) async fn signal_cancellation_authorized<G, E>(
+        &self,
+        id: &str,
+        generation: Option<u64>,
+        expected_access: Option<(u64, Option<&str>)>,
+        cause: CancelCause,
+        authorize: impl FnOnce(Option<&str>) -> Result<G, E>,
+    ) -> Result<Option<bool>, E> {
+        let sessions = self.sessions.lock().await;
+        let current = sessions.get(id);
+        if current.map(|session| session.generation) != generation
+            || expected_access.is_some_and(|(expected_generation, owner)| {
+                !current.is_some_and(|session| {
+                    session.generation == expected_generation
+                        && session.owner_tui_id.as_deref() == owner
+                })
+            })
+        {
+            return Ok(None);
+        }
+        let Some(session) = current else {
+            return Ok(Some(false));
+        };
+        let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let mut causes = self.cancel_causes.lock().unwrap_or_else(|e| e.into_inner());
+        let _authority = authorize(session.owner_principal_id.as_deref())?;
+        let Some((_, _, token)) = tokens.get(id).filter(|(_, bound, _)| *bound == generation)
+        else {
+            return Ok(Some(false));
+        };
+        causes.insert(id.to_string(), cause);
+        token.cancel();
+        Ok(Some(true))
+    }
+
     /// Signal an in-flight turn before an administrative kill waits for the
     /// session admission permit.
     pub fn signal_session_kill(&self, id: &str) -> bool {
@@ -2066,6 +2324,57 @@ impl SessionStore {
                 true
             })
             .unwrap_or(false)
+    }
+
+    /// Accept steering for the turn registered under `generation`. Removed
+    /// with that generation's cancel token.
+    pub(crate) fn register_steering(
+        &self,
+        id: &str,
+        generation: u64,
+        sender: tokio::sync::mpsc::Sender<crate::agent::SteeringInput>,
+    ) {
+        self.steering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), (generation, sender));
+    }
+
+    /// Queue a steering message for the session's running turn, but only if
+    /// that turn belongs to the live session incarnation the caller was
+    /// authorized against. The turn's registration (which records the
+    /// incarnation it runs in) and its steering sender are read and the
+    /// message is queued in one critical section, so a same-id successor that
+    /// replaced the authorized incarnation never receives it.
+    pub fn steer_session_for_generation(
+        &self,
+        id: &str,
+        session_generation: Option<u64>,
+        input: crate::agent::SteeringInput,
+    ) -> SteerOutcome {
+        let Some(session_generation) = session_generation else {
+            return SteerOutcome::NoActiveTurn;
+        };
+        // Lock order: cancel tokens, then steering (the only nesting).
+        let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((turn_generation, _, _)) = tokens
+            .get(id)
+            .filter(|(_, registered, _)| *registered == Some(session_generation))
+        else {
+            return SteerOutcome::NoActiveTurn;
+        };
+        let steering = self.steering.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((_, sender)) = steering
+            .get(id)
+            .filter(|(generation, _)| generation == turn_generation)
+        else {
+            return SteerOutcome::NoActiveTurn;
+        };
+        match sender.try_send(input) {
+            Ok(()) => SteerOutcome::Accepted,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => SteerOutcome::QueueFull,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => SteerOutcome::NoActiveTurn,
+        }
     }
 
     /// Returns true if a cancel token is registered — i.e. a turn is in flight.
@@ -2112,32 +2421,45 @@ impl SessionStore {
     /// [`Self::kill_session`] bound to one incarnation: kills only if the
     /// live record under `id` still carries `generation`.
     pub async fn kill_session_generation(&self, id: &str, generation: u64) -> bool {
-        let mut sessions = self.sessions.lock().await;
-        if sessions.get(id).is_none_or(|s| s.generation != generation) {
-            return false;
+        match self
+            .kill_session_generation_authorized(id, generation, |_| {
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(never) => match never {},
         }
+    }
+
+    pub(crate) async fn kill_session_generation_authorized<G, E>(
+        &self,
+        id: &str,
+        generation: u64,
+        authorize: impl FnOnce(Option<&str>) -> Result<G, E>,
+    ) -> Result<bool, E> {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get(id).filter(|s| s.generation == generation) else {
+            return Ok(false);
+        };
         let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
-        let token = if tokens
+        let mut causes = self.cancel_causes.lock().unwrap_or_else(|e| e.into_inner());
+        let _authority = authorize(session.owner_principal_id.as_deref())?;
+        if tokens
             .get(id)
             .is_some_and(|(_, bound, _)| *bound == Some(generation))
+            && let Some((_, _, token)) = tokens.remove(id)
         {
-            tokens.remove(id).map(|(_, _, token)| token)
-        } else {
-            None
-        };
-        drop(tokens);
-        if let Some(token) = token {
-            self.record_cancel_cause(id, CancelCause::AdminKill);
+            causes.insert(id.to_string(), CancelCause::AdminKill);
             token.cancel();
         }
         let pending = sessions
             .remove(id)
             .and_then(|session| session.pending_generation);
-        drop(sessions);
         if let Some(notify) = pending {
             notify.notify_waiters();
         }
-        true
+        Ok(true)
     }
 
     /// Record the cause for an imminent cancel-token fire. Call immediately
@@ -2190,6 +2512,10 @@ impl SessionStore {
 mod tests {
     use super::*;
 
+    fn make_store(max: usize) -> SessionStore {
+        SessionStore::new(max, Arc::new(SessionActorQueue::new(4, 10, 60)))
+    }
+
     #[tokio::test]
     async fn history_wait_releases_map_and_refuses_replaced_incarnation() {
         let store = make_store(4);
@@ -2239,10 +2565,6 @@ mod tests {
         assert_eq!(store.history_len("s").await, Some(0));
     }
 
-    fn make_store(max: usize) -> SessionStore {
-        SessionStore::new(max, Arc::new(SessionActorQueue::new(4, 10, 60)))
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn prompt_admission_registers_before_concurrent_cancellation() {
         const DEADLOCK_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
@@ -2250,6 +2572,7 @@ mod tests {
             CancelCause::ClientRpc,
             CancelCause::SessionRemoved,
             CancelCause::AdminKill,
+            CancelCause::OperatorAbort,
         ] {
             let store = Arc::new(make_store(4));
             let entered = Arc::new(tokio::sync::Notify::new());
@@ -2295,6 +2618,7 @@ mod tests {
                     CancelCause::ClientRpc => signal_store.cancel_session("s"),
                     CancelCause::SessionRemoved => signal_store.signal_session_removal("s"),
                     CancelCause::AdminKill => signal_store.signal_session_kill("s"),
+                    CancelCause::OperatorAbort => signal_store.abort_session("s"),
                     CancelCause::ConnectionClosed | CancelCause::ChannelGeneration => {
                         unreachable!("this test only exercises session-scoped RPC signals")
                     }

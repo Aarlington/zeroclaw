@@ -407,12 +407,25 @@ after storage contention. A refused admission does not call the provider or
 persist a terminal turn. This is a turn-admission boundary, not continuous
 revocation of a turn that is already running.
 
-The withholding does not reach runs that execute later under the agent's
-own identity with the agent's configured tools: agent jobs created with
-`cron_add`, or given a new prompt with `cron_update` and started with
-`cron_run` (the same holds for RPC cron grants), SOP runs, and the turns
-`send_message_to_peer` starts in another agent. Those runs can still call
-the session-data tools, and a job's output comes back through `cron_runs`.
+The model-facing tools `cron_add`, `cron_update`, `cron_run`, `cron_list`,
+`cron_runs`, `cron_remove`, `schedule`, and `send_message_to_peer` are also
+withheld from every non-admin principal, including their skill aliases and
+copies in delegated registries. Scheduled and peer turns do not carry the
+calling principal's restrictions, and cron rows and run output are shared by
+agent rather than owned by the calling principal. The same creation,
+rehydration, and prompt-admission checks apply; administrator and shared
+operator sessions keep their configured tools. Existing jobs keep running.
+
+RPC `cron/patch` and `cron/trigger` also refuse agent jobs for non-admins,
+including wildcard selectors. These jobs cannot carry the caller's session
+restrictions; the check uses current authority after looking up the job.
+Shell jobs retain their existing grant and command-policy checks. Cron reads,
+deletion, and jobs already scheduled by an operator are unchanged.
+
+SOP execution and authoring remain separate routes that can start runs under
+the agent's own identity with its configured tools, including the session-data
+tools. The SOP containment change must be integrated separately; this change
+does not claim that all principal-unaware execution paths are closed.
 Until the tools check ownership, an operator who lets non-admin principals
 reach these routes can list `sessions_list`, `sessions_history`, and
 `sessions_send`, plus any skill tool that targets them, in `excluded_tools`
@@ -430,6 +443,16 @@ holding cron grants can create a shell job for its agent, or give an
 existing agent job a new prompt and trigger it, and one holding SOP create
 or update grants can save a procedure whose trigger runs it later. Treat
 cron and SOP authoring grants as grants of the agent's tools.
+
+Principal-owned sessions may use synchronous and parallel delegation when
+their grants allow it. Background delegation and its `check_result`,
+`list_results`, `cancel_task`, and `await_sessions` actions are refused,
+including calls through skill aliases and nested delegates. Those task rows
+and result files currently use agent-alias visibility, which cannot protect
+one principal's private output from another principal using the same agent.
+This refusal includes administrator-owned sessions; their private memory is
+still private. Shared operator delegation remains available. Existing shared
+result artifacts are not migrated or removed by this restriction.
 
 ## Breaking change: remote WSS requires authentication
 
