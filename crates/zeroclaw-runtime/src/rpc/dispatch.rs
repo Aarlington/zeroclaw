@@ -16892,7 +16892,7 @@ mod tests {
                 if arrival.is_ok() {
                     match scenario {
                         "agent-demotion" | "shell-revocation" => {
-                            let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+                            let commit = ctx.begin_config_commit().await.unwrap();
                             let mut changed = ctx.config.read().clone();
                             let profile =
                                 changed.permission_profiles.get_mut("cron-alpha").unwrap();
@@ -16906,7 +16906,11 @@ mod tests {
                             }
                             changed.mark_dirty("permission_profiles.cron-alpha");
                             operator
-                                .save_and_swap_config(changed, &guard)
+                                .save_and_publish_config(
+                                    commit,
+                                    changed,
+                                    RpcConfigCommitEffects::default(),
+                                )
                                 .await
                                 .unwrap();
                         }
@@ -32140,6 +32144,9 @@ mod tests {
     async fn scoped_principals_cannot_reach_session_data_tools_even_with_wildcard_selectors() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = two_user_config(&tmp);
+        // The shared fixture selects a minimal built-in set; select
+        // spawn_subagent so the operator control arm constructs it.
+        config.tools.optional.push("spawn_subagent".into());
         // Hold the coarse `tools:execute` grant so the wildcard tool selector
         // is in force instead of narrowing every tool away.
         config
@@ -32235,6 +32242,9 @@ mod tests {
     async fn demoted_principal_loses_session_data_tools_at_its_next_prompt() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = principal_test_config(&tmp, &["*"], &["*"]);
+        // The shared fixture selects a minimal built-in set; select
+        // spawn_subagent so the administrator control arm constructs it.
+        config.tools.optional.push("spawn_subagent".into());
         config
             .risk_profiles
             .get_mut("test-profile")
@@ -32275,12 +32285,13 @@ mod tests {
         }
 
         {
-            let mut cfg = dispatcher.ctx.config.write();
+            let mut cfg = dispatcher.ctx.config_authority.snapshot_config();
             cfg.permission_profiles
                 .get_mut("principal-test")
                 .unwrap()
                 .admin = false;
             dispatcher.ctx.auth.refresh_from_config(&cfg).unwrap();
+            dispatcher.ctx.config_authority.publish_for_test(cfg);
         }
         let current = dispatcher.current_prompt_authority().unwrap();
         let grants = current

@@ -19,9 +19,10 @@ async fn principal_cron_rpc_refuses_agent_jobs_but_keeps_shell_jobs() {
         let patch = json!({"id": job.id, "agent": "alpha", "prompt": "read foreign history"});
         if posture == "demoted" {
             {
-                let mut cfg = ctx.config.write();
+                let mut cfg = ctx.config_authority.snapshot_config();
                 cfg.permission_profiles.get_mut("cron-alpha").unwrap().admin = false;
                 ctx.auth.refresh_from_config(&cfg).unwrap();
+                ctx.config_authority.publish_for_test(cfg);
             }
             assert!(
                 caller.has_admin_grants(),
@@ -215,6 +216,9 @@ async fn principal_sessions_refuse_headless_tools_and_captured_aliases() {
     for initially_admin in [false, true] {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = principal_test_config(&tmp, &["*"], &["*"]);
+        // The shared fixture selects a minimal built-in set; select the
+        // headless tools so the admin control arm constructs them.
+        config.tools.optional.extend(TARGETS.map(str::to_owned));
         let profile = config.risk_profiles.get_mut("test-profile").unwrap();
         profile.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
         profile.allowed_tools = TARGETS
@@ -311,12 +315,13 @@ async fn principal_sessions_refuse_headless_tools_and_captured_aliases() {
                 control.output
             );
             drop(guard);
-            let mut cfg = operator.ctx.config.write();
+            let mut cfg = operator.ctx.config_authority.snapshot_config();
             cfg.permission_profiles
                 .get_mut("principal-test")
                 .unwrap()
                 .admin = false;
             operator.ctx.auth.refresh_from_config(&cfg).unwrap();
+            operator.ctx.config_authority.publish_for_test(cfg);
         }
         let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
         agent
