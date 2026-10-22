@@ -285,6 +285,14 @@ impl ::zeroclaw_api::attribution::Attributable for ArcDelegatingTool {
 
 #[async_trait]
 impl Tool for ArcDelegatingTool {
+    fn builtin_target_name(&self) -> Option<&str> {
+        self.inner.builtin_target_name()
+    }
+
+    fn with_builtin_target(&self, target: Arc<dyn Tool>) -> Option<Arc<dyn Tool>> {
+        self.inner.with_builtin_target(target)
+    }
+
     fn requires_unrestricted_principal(&self) -> bool {
         self.inner.requires_unrestricted_principal()
     }

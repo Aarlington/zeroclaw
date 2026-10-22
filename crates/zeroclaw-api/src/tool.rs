@@ -386,7 +386,9 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
     fn parameters_schema(&self) -> serde_json::Value;
 
     /// Concrete builtin captured by an alias wrapper, if any. Memory routing
-    /// uses this identity rather than the alias's advertised name.
+    /// uses this identity rather than the alias's advertised name. A wrapper
+    /// that forwards to another tool must forward this method and
+    /// `with_builtin_target`, or routing cannot rebind the alias it wraps.
     fn builtin_target_name(&self) -> Option<&str> {
         None
     }
