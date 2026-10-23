@@ -2075,6 +2075,18 @@ impl Agent {
         self.disable_principal_unaware_nested_tools();
     }
 
+    /// Apply fresh principal grants through the same monotonic tool posture
+    /// for prompt admission and steering, including its post-write recheck.
+    pub(crate) fn apply_principal_tool_posture(&mut self, posture: crate::agent::SteeringPosture) {
+        self.narrow_to_principal_tools(posture.tool_ceiling.as_deref());
+        if posture.disable_principal_unaware_nested_tools {
+            self.disable_principal_unaware_nested_tools();
+        }
+        if posture.withhold_principal_unaware_session_tools {
+            self.withhold_principal_unaware_session_tools();
+        }
+    }
+
     /// Judge one steering message's sender now. A refused message is logged
     /// and must be dropped. An admitted one applies its sender's current tool
     /// posture at once, so the round it steers runs with no more than that
@@ -2097,12 +2109,7 @@ impl Agent {
                 false
             }
             crate::agent::SteeringAdmission::Admitted(posture) => {
-                if posture.tool_ceiling.is_some() {
-                    self.narrow_to_principal_tools(posture.tool_ceiling.as_deref());
-                }
-                if posture.disable_principal_unaware_nested_tools {
-                    self.disable_principal_unaware_nested_tools();
-                }
+                self.apply_principal_tool_posture(posture);
                 true
             }
         }
@@ -2217,7 +2224,7 @@ impl Agent {
                     &withheld,
                 )
         });
-        // This runs before every prompt; rebuild the prompt only when the
+        // This runs at prompt and steering admission; rebuild only when the
         // tool set it lists actually changed.
         if self.tools.len() != held {
             self.refresh_system_prompt();
@@ -2227,6 +2234,12 @@ impl Agent {
     #[cfg(test)]
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.iter().map(|t| t.name()).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_auto_save_memory_for_test(&mut self, memory: Arc<dyn Memory>) {
+        self.memory = memory;
+        self.auto_save = true;
     }
 
     #[cfg(test)]
@@ -15887,6 +15900,7 @@ mod tests {
                         crate::agent::SteeringAdmission::Admitted(crate::agent::SteeringPosture {
                             tool_ceiling: Some(Vec::new()),
                             disable_principal_unaware_nested_tools: false,
+                            withhold_principal_unaware_session_tools: false,
                         })
                     }),
                 )

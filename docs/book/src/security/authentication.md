@@ -395,8 +395,9 @@ skill aliases), whose nested runs would hold them again. A retained
 `delegate` withholds the same tools from every bounded, independent,
 background, and parallel child it builds. `sessions_current`, which reports
 only the caller's own session, stays. The withholding is applied at session
-creation, at rehydration, and before every prompt, so an administrator
-demoted mid-session loses the tools at the next prompt. Like selector
+creation, at rehydration, before every prompt, and when accepted steering is
+consumed, including its recheck after memory writes. An administrator demoted
+mid-session loses the tools at the next prompt or accepted steering. Like selector
 narrowing, it never gives them back to a live session. Admin principals and
 the shared operator keep them.
 
@@ -413,7 +414,7 @@ withheld from every non-admin principal, including their skill aliases and
 copies in delegated registries. Scheduled and peer turns do not carry the
 calling principal's restrictions, and cron rows and run output are shared by
 agent rather than owned by the calling principal. The same creation,
-rehydration, and prompt-admission checks apply; administrator and shared
+rehydration, prompt-admission, and steering-consumption checks apply; administrator and shared
 operator sessions keep their configured tools. Existing jobs keep running.
 
 RPC `cron/patch` and `cron/trigger` also refuse agent jobs for non-admins,

@@ -618,6 +618,23 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
     Some(grants.allowed_tools.clone())
 }
 
+/// Project freshly resolved grants into the complete posture used by both
+/// prompts and steering. A wildcard tool selector does not grant ownership
+/// of other sessions or authority to start principal-unaware headless turns.
+fn principal_tool_posture(
+    grants: &zeroclaw_api::grants::ResolvedGrants,
+) -> crate::agent::SteeringPosture {
+    crate::agent::SteeringPosture {
+        tool_ceiling: principal_tool_ceiling(grants),
+        disable_principal_unaware_nested_tools: !grants.admin
+            && !grants
+                .allowed_agents
+                .iter()
+                .any(|alias| alias.as_str() == zeroclaw_api::grants::WILDCARD),
+        withhold_principal_unaware_session_tools: !grants.admin,
+    }
+}
+
 fn not_yet_implemented(method: Method) -> RpcResult {
     Err(rpc_err(
         INTERNAL_ERROR,
@@ -2381,31 +2398,7 @@ impl RpcDispatcher {
         grants: &zeroclaw_api::grants::ResolvedGrants,
         agent: &mut crate::agent::agent::Agent,
     ) {
-        // Derive the ceiling from the SAME rule creation uses
-        // (`principal_tool_ceiling`): admin -> coarse `tools:execute` ->
-        // selector, in that order. Computing it from `admin || wildcard`
-        // alone omitted the coarse-grant check, so a non-admin who revoked
-        // only `tools:execute` while keeping a wildcard (or any named
-        // selector) yielded `None` here — and `narrow_to_principal_tools(None)`
-        // prunes nothing, leaving previously available static/activated tools
-        // executable under a session that has lost the right to run tools at
-        // all. Sharing one function closes that gap across creation,
-        // rehydration, and subsequent prompts.
-        let narrowing = principal_tool_ceiling(grants);
-        agent.narrow_to_principal_tools(narrowing.as_deref());
-        if !grants.admin
-            && !grants
-                .allowed_agents
-                .iter()
-                .any(|alias| alias.as_str() == zeroclaw_api::grants::WILDCARD)
-        {
-            agent.disable_principal_unaware_nested_tools();
-        }
-        // Wildcard selectors included: a tool grant is not a grant over every
-        // principal's session records.
-        if !grants.admin {
-            agent.withhold_principal_unaware_session_tools();
-        }
+        agent.apply_principal_tool_posture(principal_tool_posture(grants));
     }
 
     /// Queued prompts must not execute with the transport-time grants clone.
@@ -8389,14 +8382,7 @@ impl RpcDispatcher {
             ) {
                 return refuse(denied.message);
             }
-            SteeringAdmission::Admitted(SteeringPosture {
-                tool_ceiling: principal_tool_ceiling(&grants),
-                disable_principal_unaware_nested_tools: !grants.admin
-                    && !grants
-                        .allowed_agents
-                        .iter()
-                        .any(|alias| alias.as_str() == zeroclaw_api::grants::WILDCARD),
-            })
+            SteeringAdmission::Admitted(principal_tool_posture(&grants))
         })))
     }
 
@@ -14770,6 +14756,7 @@ pub(crate) mod connection_test_support {
 #[cfg(test)]
 mod tests {
     mod principal_headless;
+    mod steering_posture;
 
     use zeroclaw_api::model_provider::ChatMessage;
 
