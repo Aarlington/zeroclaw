@@ -564,6 +564,8 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// prove a contradiction; the caller still applies its conflict policy.
     /// Implementations must retain their ordinary shared-read visibility rules.
     /// Scoped wrappers must not delegate outside their scope.
+    /// The current agent- and principal-scoped wrappers keep the empty default;
+    /// enabling supersession in configuration does not enable it on those handles.
     ///
     /// Default: no candidates, so backends without this evidence fail closed.
     async fn recall_for_supersession(
