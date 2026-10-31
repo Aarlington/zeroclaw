@@ -1,0 +1,11 @@
+{
+  "base": "1c1cd118ac536a1dd1bc79b9cce69cbdc04e4f29",
+  "branch": "codex/oidc-enrollment-binding-12050",
+  "patch_sha256": "945c228cff4dd8bf0a046630f7df1a22d3a14b34e6981eb64290d1e3fc9d55a9",
+  "files": {
+    "crates/zeroclaw-gateway/Cargo.toml": "d92d4049beea96228cc6af5fd22d12683555c76359e9b5592db94fffd76d85bd",
+    "crates/zeroclaw-gateway/src/api_oidc.rs": "491da25d0dd7014b3ff59ce5bacbfa0dbe1e8217b8ae33f57591d135c7a527c8",
+    "docs/book/src/security/authentication.md": "c60e151b1cc339b1a7656283fc529c870031c5d4e824946dda6c795f295b0b8b",
+    "docs/security/oidc-browser-pkce-design-8289.md": "5b746ef910572bc49c3417255c4399d3f697c11ea2662d4f185ce16df6b01f6e"
+  }
+}

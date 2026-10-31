@@ -1,0 +1,101 @@
+{
+  "timestamp": "2026-10-31T08:53:24.804Z",
+  "source_head": "759ae4a5f1e4dffaa5d995503b222fc863e863d8",
+  "base": "1c1cd118ac536a1dd1bc79b9cce69cbdc04e4f29",
+  "runner": "standard Ubuntu 24.04",
+  "rust": "1.98.0",
+  "source_files_sha256": {
+    "crates/zeroclaw-gateway/Cargo.toml": "d92d4049beea96228cc6af5fd22d12683555c76359e9b5592db94fffd76d85bd",
+    "crates/zeroclaw-gateway/src/api_oidc.rs": "491da25d0dd7014b3ff59ce5bacbfa0dbe1e8217b8ae33f57591d135c7a527c8",
+    "docs/book/src/security/authentication.md": "c60e151b1cc339b1a7656283fc529c870031c5d4e824946dda6c795f295b0b8b",
+    "docs/security/oidc-browser-pkce-design-8289.md": "5b746ef910572bc49c3417255c4399d3f697c11ea2662d4f185ce16df6b01f6e"
+  },
+  "patch_sha256": "945c228cff4dd8bf0a046630f7df1a22d3a14b34e6981eb64290d1e3fc9d55a9",
+  "commands": [
+    {
+      "name": "apply-check",
+      "exit": 0,
+      "seconds": 0.0
+    },
+    {
+      "name": "apply",
+      "exit": 0,
+      "seconds": 0.01
+    },
+    {
+      "name": "toolchain",
+      "exit": 0,
+      "seconds": 0.02
+    },
+    {
+      "name": "format",
+      "exit": 0,
+      "seconds": 13.4
+    },
+    {
+      "name": "whitespace",
+      "exit": 0,
+      "seconds": 0.02
+    },
+    {
+      "name": "oidc-positive",
+      "exit": 0,
+      "seconds": 365.73
+    },
+    {
+      "name": "clippy",
+      "exit": 0,
+      "seconds": 184.94
+    },
+    {
+      "name": "binding-negative-control",
+      "exit": 101,
+      "seconds": 36.78
+    },
+    {
+      "name": "oidc-restored",
+      "exit": 0,
+      "seconds": 42.44
+    },
+    {
+      "name": "browser",
+      "exit": 0,
+      "seconds": 4.3
+    },
+    {
+      "name": "oidc-final",
+      "exit": 0,
+      "seconds": 42.83
+    },
+    {
+      "name": "final-whitespace",
+      "exit": 0,
+      "seconds": 0.02
+    }
+  ],
+  "oidc_positive": "32 passed; 0 failed",
+  "negative_control": "guard removal: missing-cookie callback returns 200 instead of required 400; selected regression fails",
+  "oidc_restored": "32 passed; 0 failed",
+  "oidc_final": "32 passed; 0 failed",
+  "source_restoration_verified": true,
+  "browser": {
+    "timestamp": "2026-10-31T08:53:24.804Z",
+    "browser": "Chrome/156.0.8078.47",
+    "protocol": "1.3",
+    "checks": [
+      "same browser: cross-site IdP return and prefixed callback succeed; one exchange",
+      "HttpOnly/Lax/root cookie accepted by Chromium and cleared on success",
+      "different browser context: copied callback refused; zero extra exchanges",
+      "original browser: replay after foreign-context refusal also refused",
+      "two concurrent tabs: both flows finish; each exchanges once"
+    ],
+    "passed": 5,
+    "transport": "loopback HTTP; gateway localhost, mock IdP 127.0.0.1; no production accounts"
+  },
+  "limits": [
+    "mock IdP",
+    "loopback HTTP only",
+    "production enrollment routes and security headers, not the complete daemon",
+    "no native TLS, popup or live-provider acceptance"
+  ]
+}
