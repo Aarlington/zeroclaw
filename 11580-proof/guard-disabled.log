@@ -1,0 +1,48 @@
+test_default_accepts_through_limit_without_stale_warnings (__main__.BinarySizeGateTests.test_default_accepts_through_limit_without_stale_warnings) ... ok
+test_default_rejects_one_byte_over (__main__.BinarySizeGateTests.test_default_rejects_one_byte_over) ... FAIL
+test_missing_binary_fails (__main__.BinarySizeGateTests.test_missing_binary_fails) ... ok
+test_release_override_keeps_exact_boundary (__main__.BinarySizeGateTests.test_release_override_keeps_exact_boundary) ... 
+  test_release_override_keeps_exact_boundary (__main__.BinarySizeGateTests.test_release_override_keeps_exact_boundary) (size=83886081) ... FAIL
+test_smaller_override_is_enforced (__main__.BinarySizeGateTests.test_smaller_override_is_enforced) ... FAIL
+test_summary_records_exact_bytes_even_on_rejection (__main__.BinarySizeGateTests.test_summary_records_exact_bytes_even_on_rejection) ... 
+  test_summary_records_exact_bytes_even_on_rejection (__main__.BinarySizeGateTests.test_summary_records_exact_bytes_even_on_rejection) (size=20971521) ... FAIL
+test_summary_without_label_is_not_written (__main__.BinarySizeGateTests.test_summary_without_label_is_not_written) ... ok
+
+======================================================================
+FAIL: test_default_rejects_one_byte_over (__main__.BinarySizeGateTests.test_default_rejects_one_byte_over)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<control-fixture>/guard-disabled/check_binary_size_test.py", line 49, in test_default_rejects_one_byte_over
+    self.assertEqual(result.returncode, 1)
+AssertionError: 0 != 1
+
+======================================================================
+FAIL: test_release_override_keeps_exact_boundary (__main__.BinarySizeGateTests.test_release_override_keeps_exact_boundary) (size=83886081)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<control-fixture>/guard-disabled/check_binary_size_test.py", line 56, in test_release_override_keeps_exact_boundary
+    self.assertEqual(result.returncode, int(size > 80 * MIB), result.stdout + result.stderr)
+AssertionError: 0 != 1 : Binary size: 80MB (83886081 bytes)
+Binary size within safeguard.
+
+
+======================================================================
+FAIL: test_smaller_override_is_enforced (__main__.BinarySizeGateTests.test_smaller_override_is_enforced)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<control-fixture>/guard-disabled/check_binary_size_test.py", line 63, in test_smaller_override_is_enforced
+    self.assertEqual(result.returncode, 1)
+AssertionError: 0 != 1
+
+======================================================================
+FAIL: test_summary_records_exact_bytes_even_on_rejection (__main__.BinarySizeGateTests.test_summary_records_exact_bytes_even_on_rejection) (size=20971521)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<control-fixture>/guard-disabled/check_binary_size_test.py", line 76, in test_summary_records_exact_bytes_even_on_rejection
+    self.assertEqual(result.returncode, int(size > 20 * MIB))
+AssertionError: 0 != 1
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.161s
+
+FAILED (failures=4)

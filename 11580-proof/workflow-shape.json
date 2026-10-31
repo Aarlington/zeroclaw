@@ -1,0 +1,6 @@
+{
+  "yaml_parse": "PASS",
+  "only_new_step": true,
+  "required_gate_consumes_job": true,
+  "release_workflow_unchanged": true
+}

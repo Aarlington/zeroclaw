@@ -1,0 +1,12 @@
+test_default_accepts_through_limit_without_stale_warnings (__main__.BinarySizeGateTests.test_default_accepts_through_limit_without_stale_warnings) ... ok
+test_default_rejects_one_byte_over (__main__.BinarySizeGateTests.test_default_rejects_one_byte_over) ... ok
+test_missing_binary_fails (__main__.BinarySizeGateTests.test_missing_binary_fails) ... ok
+test_release_override_keeps_exact_boundary (__main__.BinarySizeGateTests.test_release_override_keeps_exact_boundary) ... ok
+test_smaller_override_is_enforced (__main__.BinarySizeGateTests.test_smaller_override_is_enforced) ... ok
+test_summary_records_exact_bytes_even_on_rejection (__main__.BinarySizeGateTests.test_summary_records_exact_bytes_even_on_rejection) ... ok
+test_summary_without_label_is_not_written (__main__.BinarySizeGateTests.test_summary_without_label_is_not_written) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.313s
+
+OK

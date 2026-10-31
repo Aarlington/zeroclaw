@@ -1,0 +1,21 @@
+{
+  "results": [
+    {
+      "fixture": "glibc-with-musl-probe",
+      "target": "x86_64-unknown-linux-gnu",
+      "exit": 0
+    },
+    {
+      "fixture": "glibc-ldd-only",
+      "target": "x86_64-unknown-linux-gnu",
+      "exit": 0
+    },
+    {
+      "fixture": "Alpine-musl",
+      "target": "x86_64-unknown-linux-musl",
+      "exit": 0
+    }
+  ],
+  "network": false,
+  "real_install": false
+}

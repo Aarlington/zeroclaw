@@ -1,0 +1,27 @@
+[
+  {
+    "issue": 12153,
+    "branch": "codex/install-libc-12153",
+    "head": "7903940a4e3d8049237ede38976334a4867e54c0",
+    "base": "1c1cd118ac536a1dd1bc79b9cce69cbdc04e4f29",
+    "title": "fix(install): prefer system glibc over an installed musl loader",
+    "files": {
+      "install.sh": "9a8ba27585a3d0b7d462dd6f96a7b228531720fd55440863dacf335ae93a73c9",
+      "scripts/ci/install_target_triple_test.sh": "d2ca58af66e7556e2ebf3e35cddde8962e6e072aaa4bbf050193d82686c438ae"
+    },
+    "numstat": "6\t1\tinstall.sh\n75\t0\tscripts/ci/install_target_triple_test.sh"
+  },
+  {
+    "issue": 11580,
+    "branch": "codex/size-advisories-11580",
+    "head": "340a7d5a57826098b7f489aa910b86e3623f67e3",
+    "base": "1c1cd118ac536a1dd1bc79b9cce69cbdc04e4f29",
+    "title": "ci(release): remove obsolete binary-size advisory warnings",
+    "files": {
+      ".github/workflows/ci.yml": "c793f86a85b1037eafe0734ac73ce889af05c8e98fc48cd2a866f760d0736178",
+      "scripts/ci/check_binary_size.sh": "f4378c25cd042aa71bdba1c824300db79ff738edb84e5bfaa62dba154672e19c",
+      "scripts/ci/check_binary_size_test.py": "4241d7d294dbe11f370ece4e4f1929940de7541aa36b666cbd1aaaa25d88336b"
+    },
+    "numstat": "3\t0\t.github/workflows/ci.yml\n6\t10\tscripts/ci/check_binary_size.sh\n87\t0\tscripts/ci/check_binary_size_test.py"
+  }
+]

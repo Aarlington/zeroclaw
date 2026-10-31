@@ -1,0 +1,17 @@
+{
+  "controls": [
+    {
+      "control": "guard-disabled",
+      "exit": 1,
+      "assertion_failure_confirmed": true
+    },
+    {
+      "control": "equal-cap-rejected",
+      "exit": 1,
+      "assertion_failure_confirmed": true
+    }
+  ],
+  "final_suite": "7 tests PASS",
+  "source_sha256": "f4378c25cd042aa71bdba1c824300db79ff738edb84e5bfaa62dba154672e19c",
+  "source_unchanged": true
+}

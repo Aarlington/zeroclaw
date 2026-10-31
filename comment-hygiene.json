@@ -1,0 +1,25 @@
+{
+  "method": "Repository Python comment filter with explicit changed-source file list; WSL rg is unavailable",
+  "results": [
+    {
+      "issue": 12153,
+      "head": "7903940a4e3d8049237ede38976334a4867e54c0",
+      "paths": [
+        "install.sh",
+        "scripts/ci/install_target_triple_test.sh"
+      ],
+      "exit": 0,
+      "output": "Comment hygiene gate passed."
+    },
+    {
+      "issue": 11580,
+      "head": "340a7d5a57826098b7f489aa910b86e3623f67e3",
+      "paths": [
+        "scripts/ci/check_binary_size.sh",
+        "scripts/ci/check_binary_size_test.py"
+      ],
+      "exit": 0,
+      "output": "Comment hygiene gate passed."
+    }
+  ]
+}

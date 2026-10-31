@@ -1,0 +1,23 @@
+
+Installing ZeroClaw v0.8.7 (pre-built)
+  ✓ Platform: x86_64-unknown-linux-gnu
+  ✓ Source:   https://github.com/zeroclaw-labs/zeroclaw/releases/download/v0.8.7/zeroclaw-x86_64-unknown-linux-gnu.tar.gz
+  ✓ Channels: pre-built binaries ship the standard distribution channel set; availability is target-specific.
+  ✓ Run 'zeroclaw channel list' to inspect this binary. For other channels such as Slack, build from source with --preset full.
+
+  ✓ [dry-run] Would download https://github.com/zeroclaw-labs/zeroclaw/releases/download/v0.8.7/zeroclaw-x86_64-unknown-linux-gnu.tar.gz
+  ✓ [dry-run] Would install to <isolated-fixture>/glibc-ldd-only/.cargo/bin/zeroclaw
+  ✓ [dry-run] Would install zerocode to <isolated-fixture>/glibc-ldd-only/.cargo/bin/zerocode (if in tarball)
+  ✓ [dry-run] Would install web dashboard to <isolated-fixture>/glibc-ldd-only/.local/share/zeroclaw/web/dist
+
+  Add to your shell profile (<isolated-fixture>/glibc-ldd-only/.bashrc):
+
+    export PATH="<isolated-fixture>/glibc-ldd-only/.cargo/bin:$PATH"
+
+  Then reload:
+
+    source <isolated-fixture>/glibc-ldd-only/.bashrc
+
+
+  ✓ Done. Run zeroclaw agent to start chatting.
+
